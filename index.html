@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>تحليل صيد الشاطئ - تونس</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        :root {
+            --bg: #0b0e14;
+            --card: #151922;
+            --border: #252b3b;
+            --text: #e2e8f0;
+            --sub: #94a3b8;
+            --accent: #3b82f6;
+            --green: #10b981;
+            --yellow: #eab308;
+            --orange: #f97316;
+            --red: #ef4444;
+            --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans Arabic', sans-serif;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            background: var(--bg); color: var(--text); font-family: var(--font); 
+            padding: 12px; padding-bottom: 40px; line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: 640px; margin: 0 auto; }
+        
+        /* Header */
+        header { text-align: center; margin-bottom: 16px; padding: 16px; background: var(--card); border-radius: 16px; border: 1px solid var(--border); }
+        header h1 { font-size: 1.3rem; margin-bottom: 4px; color: var(--accent); letter-spacing: 0.5px; }
+        header p { font-size: 0.85rem; color: var(--sub); }
+
+        /* Map */
+        #map { height: 38vh; border-radius: 14px; border: 1px solid var(--border); margin-bottom: 16px; z-index: 10; background: #1a202c; }
+
+        /* Controls */
+        .controls { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 16px; }
+        select, button { 
+            background: var(--card); color: var(--text); border: 1px solid var(--border); 
+            padding: 12px; border-radius: 10px; font-size: 0.95rem; cursor: pointer; 
+            transition: all 0.2s; font-family: inherit;
+        }
+        select:focus, button:focus { outline: 2px solid var(--accent); }
+        button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
+        button:active { transform: scale(0.98); opacity: 0.9; }
+        .btn-secondary { background: #1e293b; border: 1px solid var(--border); }
+        /* Loading */
+        .loading { text-align: center; color: var(--sub); padding: 14px; font-size: 0.9rem; display: none; }
+        .loading.active { display: block; }
+
+        /* Verdict Card */
+        .verdict-card { background: var(--card); padding: 18px; border-radius: 14px; margin-bottom: 16px; border-right: 5px solid var(--sub); box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+        .verdict-title { font-size: 1.6rem; font-weight: 800; margin-bottom: 8px; }
+        .verdict-text { font-size: 0.95rem; color: var(--sub); margin-bottom: 12px; line-height: 1.6; }
+        .sinker-tag { display: inline-flex; align-items: center; gap: 6px; background: #1e293b; padding: 6px 12px; border-radius: 8px; font-size: 0.9rem; color: var(--accent); font-weight: 700; border: 1px solid #334155; }
+
+        /* Risk Meters */
+        .risk-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+        .risk-box { background: var(--card); padding: 14px 8px; border-radius: 12px; text-align: center; border: 1px solid var(--border); }
+        .risk-label { font-size: 0.78rem; color: var(--sub); margin-bottom: 8px; font-weight: 500; }
+        .progress-track { height: 10px; background: #1e293b; border-radius: 5px; overflow: hidden; margin-bottom: 6px; }
+        .progress-fill { height: 100%; width: 0%; border-radius: 5px; transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+        .risk-val { font-size: 0.85rem; font-weight: 700; }
+
+        /* Action Buttons */
+        .actions { display: flex; gap: 10px; margin-bottom: 20px; }
+        .actions button { flex: 1; }
+        .btn-fav { background: var(--green) !important; color: #fff !important; }
+
+        /* Best Spots List */
+        .best-spots-section { background: var(--card); padding: 16px; border-radius: 14px; border: 1px solid var(--border); margin-top: 8px; display: none; }
+        .best-spots-section.active { display: block; }
+        .section-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+        .spot-row { 
+            display: flex; justify-content: space-between; align-items: center; 
+            padding: 12px; background: #1e293b; border-radius: 10px; margin-bottom: 8px; 
+            cursor: pointer; transition: background 0.2s; border: 1px solid transparent;
+        }
+        .spot-row:hover { border-color: var(--accent); background: #242d3f; }
+        .spot-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 4px; }
+        .spot-meta { font-size: 0.8rem; color: var(--sub); }
+        .spot-score { background: #0f172a; padding: 6px 10px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; min-width: 50px; text-align: center; border: 1px solid #334155; }
+
+        /* Utility Colors */
+        .fill-green { background: var(--green); }
+        .fill-yellow { background: var(--yellow); }
+        .fill-orange { background: var(--orange); }
+        .fill-red { background: var(--red); }
+        .text-green { color: var(--green); }
+        .text-yellow { color: var(--yellow); }
+        .text-orange { color: var(--orange); }
+        .text-red { color: var(--red); }
+        .text-sub { color: var(--sub); }
+
+        /* Leaflet Popup Dark Mode */
+        .leaflet-popup-content-wrapper { background: #1e293b; color: #e2e8f0; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }        .leaflet-popup-tip { background: #1e293b; }
+        .leaflet-popup-close-button { color: #94a3b8 !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎣 محلل صيد الشاطئ تونس</h1>
+            <p>تقييم ذكي للمخاطر والأرصاد البحرية</p>
+        </header>
+
+        <div id="map"></div>
+
+        <div class="controls">
+            <select id="spotSelector">
+                <option value="">📍 اختر شاطئاً أو اضغط على الخريطة</option>
+                <option value="predefined">الشواطئ المبرمجة</option>
+                <option value="favorites">❤️ المفضلات المحفوظة</option>
+            </select>
+            <button onclick="analyzeSelection()">تحليل</button>
+        </div>
+
+        <div id="loading" class="loading">⏳ جاري جلب البيانات وتحليل المخاطر...</div>
+
+        <div id="results" style="display: none;">
+            <div class="verdict-card" id="verdictCard">
+                <div class="verdict-title" id="vTitle">--</div>
+                <div class="verdict-text" id="vText">--</div>
+                <div class="sinker-tag" id="vSinker">🔩 وزن الرصاص: --</div>
+            </div>
+
+            <div class="risk-grid">
+                <div class="risk-box">
+                    <div class="risk-label">طحالب وحطام</div>
+                    <div class="progress-track"><div class="progress-fill" id="mSeaweed"></div></div>
+                    <div class="risk-val" id="rSeaweed">--</div>
+                </div>
+                <div class="risk-box">
+                    <div class="risk-label">تيارات السحب</div>
+                    <div class="progress-track"><div class="progress-fill" id="mRip"></div></div>
+                    <div class="risk-val" id="rRip">--</div>
+                </div>
+                <div class="risk-box">
+                    <div class="risk-label">خطر الرياح</div>
+                    <div class="progress-track"><div class="progress-fill" id="mWind"></div></div>
+                    <div class="risk-val" id="rWind">--</div>
+                </div>
+            </div>
+
+            <div class="actions">                <button onclick="loadBestSpots()">🏆 أفضل الشواطئ حالياً</button>
+                <button class="btn-fav" onclick="saveToFavorites()">💾 حفظ كمفضل</button>
+            </div>
+        </div>
+
+        <div id="bestListContainer" class="best-spots-section">
+            <div class="section-title">📊 ترتيب الشواطئ حسب الظروف الحالية</div>
+            <div id="bestList"></div>
+        </div>
+    </div>
+
+    <script>
+        // ⚙️ الإعدادات: غيّر هذا الرابط إلى رابط Render الخاص بك بعد النشر
+        const API_BASE_URL = "https://surfcast-api-azny.onrender.com";
+
+        // 🌍 خريطة Leaflet
+        const map = L.map('map', { zoomControl: false, attributionControl: false }).setView([36.8, 10.2], 8);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+        let currentSpot = null;
+        let currentBeachDir = 'N';
+        let currentAnalysis = null;
+        let favorites = JSON.parse(localStorage.getItem('surfcasting_fav') || '[]');
+        let markers = {};
+
+        const PREDEFINED = [
+            {n:"قلعة الأندلس (تونس)", lat:36.9150, lon:10.1550, d:"N"},
+            {n:"شاطئ رواد (تونس)", lat:36.9380, lon:10.2150, d:"NE"},
+            {n:"الهوارية (نابل)", lat:37.0500, lon:11.0150, d:"N"},
+            {n:"قليبية (نابل)", lat:36.8500, lon:11.1000, d:"E"},
+            {n:"حمام الغزاز (نابل)", lat:36.8850, lon:11.1150, d:"NE"},
+            {n:"كاب سيرات (بنزرت)", lat:37.2300, lon:9.2100, d:"NW"},
+            {n:"سيدي مشرق (بنزرت)", lat:37.1600, lon:9.1200, d:"N"},
+            {n:"الرمال (بنزرت)", lat:37.2750, lon:9.9150, d:"NW"},
+            {n:"شط مريم (سوسة)", lat:35.9350, lon:10.5600, d:"E"},
+            {n:"هرقلة (سوسة)", lat:36.0300, lon:10.5100, d:"NE"}
+        ];
+
+        // رسم المفضلات عند التحميل
+        favorites.forEach(f => addMarker(f.lat, f.lon, f.name, "#10b981"));
+        PREDEFINED.forEach(s => addMarker(s.lat, s.lon, s.n, "#3b82f6"));
+
+        function addMarker(lat, lon, title, color) {
+            const key = `${lat.toFixed(4)}_${lon.toFixed(4)}`;
+            if (markers[key]) map.removeLayer(markers[key]);
+            markers[key] = L.circleMarker([lat, lon], { radius: 7, fillColor: color, color: "#fff", fillOpacity: 0.85, weight: 2 }).addTo(map);
+            markers[key].bindPopup(`<b>${title}</b>`).openPopup();
+            map.setView([lat, lon], 12, { animate: true, duration: 0.5 });
+        }
+        // التفاعل مع الخريطة
+        let tempCoords = null;
+        map.on('click', (e) => {
+            tempCoords = { lat: e.latlng.lat, lon: e.latlng.lng };
+            addMarker(tempCoords.lat, tempCoords.lon, "موقع جديد", "#f97316");
+            document.getElementById('spotSelector').value = "manual";
+        });
+
+        // اختيار الشاطئ
+        document.getElementById('spotSelector').addEventListener('change', function() {
+            if (this.value === 'predefined') {
+                currentSpot = PREDEFINED[0];
+                currentBeachDir = currentSpot.d;
+                addMarker(currentSpot.lat, currentSpot.lon, currentSpot.n, "#3b82f6");
+            } else if (this.value === 'favorites') {
+                if (favorites.length === 0) return alert("⚠️ لا توجد مواقع محفوظة.");
+                currentSpot = favorites[0];
+                currentBeachDir = currentSpot.facing;
+                addMarker(currentSpot.lat, currentSpot.lon, currentSpot.name, "#10b981");
+            } else if (this.value === 'manual') {
+                if (!tempCoords) return alert("⚠️ اضغط أولاً على الخريطة لتحديد موقع.");
+                currentSpot = tempCoords;
+                currentBeachDir = prompt("🧭 اتجاه واجهة الشاطئ؟ (N, NE, E, SE, S, SW, W, NW):", "E") || "E";
+            }
+        });
+
+        async function analyzeSelection() {
+            if (!currentSpot) return alert("⚠️ اختر موقعاً أولاً.");
+            
+            const loading = document.getElementById('loading');
+            const results = document.getElementById('results');
+            loading.classList.add('active');
+            results.style.display = 'none';
+            document.getElementById('bestListContainer').classList.remove('active');
+
+            try {
+                const res = await fetch(`${API_BASE_URL}/analyze`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ lat: currentSpot.lat, lon: currentSpot.lon, beach_direction: currentBeachDir })
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                currentAnalysis = await res.json();
+                renderResults(currentAnalysis, currentSpot.name || currentSpot.n || "موقع مخصص");
+            } catch (err) {
+                alert(`❌ فشل الاتصال بالخادم: ${err.message}\nتأكد من نشر الباكند على Render وتحديث API_BASE_URL`);
+            } finally {
+                loading.classList.remove('active');
+            }        }
+
+        function renderResults(data, spotName) {
+            const v = data.verdict;
+            document.getElementById('vTitle').textContent = `${spotName}: ${v.status}`;
+            document.getElementById('vTitle').style.color = v.status === "ممتاز" ? "#10b981" : v.status === "ممكن" ? "#eab308" : v.status === "صعب جداً" ? "#f97316" : "#ef4444";
+            document.getElementById('vText').textContent = v.explanation;
+            document.getElementById('vSinker').textContent = `🔩 وزن الرصاص: ${v.sinker_weight_g} غرام`;
+            
+            setMeter("mSeaweed", "rSeaweed", data.risks.seaweed_debris);
+            setMeter("mRip", "rRip", data.risks.rip_currents);
+            setMeter("mWind", "rWind", data.risks.wind_danger);
+            
+            document.getElementById('results').style.display = 'block';
+            window.scrollTo({ top: document.getElementById('results').offsetTop - 20, behavior: 'smooth' });
+        }
+
+        function setMeter(mId, rId, val) {
+            const m = document.getElementById(mId);
+            const r = document.getElementById(rId);
+            let w = "5%", c = "#10b981", t = val || "غير محدد";
+            if (val.includes("Low")) { w = "30%"; c = "#eab308"; }
+            else if (val.includes("High")) { w = "65%"; c = "#f97316"; }
+            else if (val.includes("Confirmed")) { w = "100%"; c = "#ef4444"; t = "مؤكد"; }
+            
+            m.style.width = w;
+            m.className = `progress-fill fill-${w === "5%" ? "green" : w === "30%" ? "yellow" : w === "65%" ? "orange" : "red"}`;
+            r.textContent = t;
+            r.className = `risk-val text-${w === "5%" ? "green" : w === "30%" ? "yellow" : w === "65%" ? "orange" : "red"}`;
+        }
+
+        async function loadBestSpots() {
+            const loading = document.getElementById('loading');
+            loading.textContent = "🔄 جاري مسح وتقييم جميع الشواطئ...";
+            loading.classList.add('active');
+
+            try {
+                const payload = favorites.map(f => ({ name: f.name, lat: f.lat, lon: f.lon, facing: f.facing }));
+                const res = await fetch(`${API_BASE_URL}/best-spots`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const list = await res.json();
+                renderBestList(list);
+                document.getElementById('bestListContainer').classList.add('active');
+            } catch (err) {
+                alert("❌ فشل جلب التقييم الشامل: " + err.message);
+            } finally {                loading.classList.remove('active');
+                loading.textContent = "⏳ جاري جلب البيانات وتحليل المخاطر...";
+            }
+        }
+
+        function renderBestList(list) {
+            const el = document.getElementById('bestList');
+            el.innerHTML = "";
+            if (!list.length) return el.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:10px;">لا توجد بيانات</p>';
+            
+            list.slice(0, 6).forEach(s => {
+                const div = document.createElement('div');
+                div.className = "spot-row";
+                div.innerHTML = `
+                    <div>
+                        <div class="spot-name">${s.name}</div>
+                        <div class="spot-meta">موجة: ${s.conditions.swell_height_m}م | رياح: ${s.conditions.wind_type}</div>
+                    </div>
+                    <div class="spot-score text-${s.verdict.status==='ممتاز'?'green':s.verdict.status==='ممكن'?'yellow':s.verdict.status==='صعب جداً'?'orange':'red'}">${s.verdict.score}</div>
+                `;
+                div.onclick = () => {
+                    currentSpot = { lat: s.location.lat, lon: s.location.lon, name: s.name };
+                    currentBeachDir = s.location.facing;
+                    addMarker(currentSpot.lat, currentSpot.lon, s.name, "#3b82f6");
+                    renderResults(s, s.name);
+                };
+                el.appendChild(div);
+            });
+        }
+
+        function saveToFavorites() {
+            if (!currentSpot) return alert("⚠️ حلّل موقعاً أولاً.");
+            const exists = favorites.some(f => Math.abs(f.lat - currentSpot.lat) < 0.005 && Math.abs(f.lon - currentSpot.lon) < 0.005);
+            if (exists) return alert("📍 الموقع محفوظ مسبقاً.");
+            
+            const name = prompt("أدخل اسماً للموقع:", currentSpot.name || currentSpot.n || `نقطة ${currentSpot.lat.toFixed(3)}`);
+            if (name) {
+                const facing = prompt("اتجاه الواجهة؟ (N, NE, E, SE, S, SW, W, NW):", currentBeachDir) || currentBeachDir;
+                favorites.push({ name, lat: currentSpot.lat, lon: currentSpot.lon, facing });
+                localStorage.setItem('surfcasting_fav', JSON.stringify(favorites));
+                addMarker(currentSpot.lat, currentSpot.lon, name, "#10b981");
+                alert("✅ تم الحفظ بنجاح!");
+            }
+        }
+    </script>
+</body>
+</html>
