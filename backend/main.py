@@ -28,10 +28,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Tighten to your Vercel domain in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,   # ← الإصلاح: لا يمكن دمج * مع credentials=True
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Authorization"],
+    max_age=600,
 )
 
 # ---------------------------------------------------------------------------
