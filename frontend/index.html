@@ -2,7 +2,7 @@
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
 <title>صيّاد المحيط — تحليل ذكي لصيد السيرف</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -10,1256 +10,1305 @@
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
 
 <style>
-/* ================================================
-   GLOBAL RESET & BASE
-================================================ */
+/* ─────────────────────────────────────────
+   RESET & BASE
+───────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; overflow: hidden; font-family: 'Cairo', sans-serif; }
-body { background: #030b18; color: #e2e8f0; display: flex; flex-direction: column; }
+html { height: 100%; }
+body {
+  height: 100%;
+  font-family: 'Cairo', sans-serif;
+  background: #030b18;
+  color: #e2e8f0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
 .mono { font-family: 'JetBrains Mono', monospace; }
 
-/* ================================================
-   GLASSMORPHISM UTILITIES
-================================================ */
-.glass {
-  background: rgba(13, 33, 55, 0.75);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(56, 189, 248, 0.1);
-}
-.glass-dark {
-  background: rgba(6, 13, 26, 0.85);
+/* ─────────────────────────────────────────
+   LAYOUT SYSTEM
+   Desktop: header + (map | sidebar) row
+   Mobile:  header + map + bottom-sheet
+───────────────────────────────────────── */
+#app-header {
+  flex-shrink: 0;
+  z-index: 300;
+  background: linear-gradient(135deg, rgba(3,11,24,.98), rgba(6,16,34,.98));
+  border-bottom: 1px solid rgba(56,189,248,.1);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(56, 189, 248, 0.08);
 }
-.glass-card {
-  background: rgba(16, 42, 71, 0.6);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(56, 189, 248, 0.12);
-  border-radius: 16px;
-  transition: border-color 0.25s ease, background 0.25s ease;
-}
-.glass-card:hover {
-  border-color: rgba(56, 189, 248, 0.25);
-  background: rgba(16, 42, 71, 0.8);
+#main-row {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  position: relative;
 }
 
-/* ================================================
-   MAP
-================================================ */
-#map { height: 100%; width: 100%; }
-.leaflet-control-zoom a {
-  background: rgba(13,33,55,0.9) !important;
-  color: #38bdf8 !important;
-  border-color: rgba(56,189,248,0.2) !important;
-  backdrop-filter: blur(8px) !important;
-}
-.leaflet-control-zoom a:hover { background: rgba(16,42,71,0.95) !important; }
-.leaflet-control-attribution {
-  background: rgba(3,11,24,0.85) !important;
-  color: #475569 !important;
-  font-size: 10px !important;
-}
-.leaflet-control-attribution a { color: #38bdf8 !important; }
-.leaflet-control-layers {
-  background: rgba(13,33,55,0.92) !important;
-  border: 1px solid rgba(56,189,248,0.15) !important;
-  border-radius: 12px !important;
-  backdrop-filter: blur(16px) !important;
-  color: #cbd5e1 !important;
-}
-.leaflet-control-layers-toggle { background-color: rgba(56,189,248,0.1) !important; }
+/* MAP */
+#map-wrap { flex: 1; position: relative; min-width: 0; }
+#map      { height: 100%; width: 100%; }
 
-/* ================================================
-   CROSSHAIR (المنظار)
-================================================ */
-#crosshair-wrap {
-  position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 800;
-  pointer-events: none;
-  width: 80px; height: 80px;
-}
-.ch-line-h, .ch-line-v {
-  position: absolute;
-  background: rgba(56,189,248,0.9);
-  border-radius: 2px;
-}
-.ch-line-h { width: 100%; height: 1.5px; top: 50%; transform: translateY(-50%); }
-.ch-line-v { width: 1.5px; height: 100%; left: 50%; transform: translateX(-50%); }
-/* الفراغ المركزي */
-.ch-line-h::after, .ch-line-v::after {
-  content: '';
-  position: absolute;
-  background: #030b18;
-}
-.ch-line-h::after { width: 18px; height: 100%; left: 50%; transform: translateX(-50%); }
-.ch-line-v::after { height: 18px; width: 100%; top: 50%; transform: translateY(-50%); }
-
-#ch-center {
-  position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  width: 7px; height: 7px;
-  background: #38bdf8;
-  border-radius: 50%;
-  box-shadow: 0 0 0 2px rgba(3,11,24,0.8), 0 0 14px rgba(56,189,248,0.9);
-  animation: centerPulse 2.5s ease-in-out infinite;
-}
-#ch-ring {
-  position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%,-50%);
-  width: 22px; height: 22px;
-  border: 1.5px solid rgba(56,189,248,0.45);
-  border-radius: 50%;
-  animation: ringExpand 2.5s ease-in-out infinite;
-}
-#ch-ring2 {
-  position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%,-50%);
-  width: 38px; height: 38px;
-  border: 1px solid rgba(56,189,248,0.18);
-  border-radius: 50%;
-  animation: ringExpand 2.5s ease-in-out infinite 0.4s;
-}
-@keyframes centerPulse {
-  0%,100% { box-shadow: 0 0 0 2px rgba(3,11,24,0.8), 0 0 10px rgba(56,189,248,0.8); }
-  50%      { box-shadow: 0 0 0 2px rgba(3,11,24,0.8), 0 0 22px rgba(56,189,248,1), 0 0 40px rgba(56,189,248,0.3); }
-}
-@keyframes ringExpand {
-  0%,100% { transform: translate(-50%,-50%) scale(1); opacity: 0.7; }
-  50%      { transform: translate(-50%,-50%) scale(1.2); opacity: 0.15; }
-}
-
-/* ================================================
-   SIDEBAR PANEL
-================================================ */
+/* SIDEBAR (desktop) */
 #sidebar {
   width: 320px;
   min-width: 320px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: linear-gradient(180deg, #030d1f 0%, #040f22 100%);
-  border-left: 1px solid rgba(56,189,248,0.1);
-  position: relative;
+  background: linear-gradient(180deg, #030d1f, #040f22);
+  border-left: 1px solid rgba(56,189,248,.1);
   z-index: 100;
 }
 #sidebar-scroll {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(56,189,248,0.2) transparent;
+  scrollbar-color: rgba(56,189,248,.15) transparent;
 }
 #sidebar-scroll::-webkit-scrollbar { width: 3px; }
-#sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
-#sidebar-scroll::-webkit-scrollbar-thumb { background: rgba(56,189,248,0.2); border-radius: 4px; }
+#sidebar-scroll::-webkit-scrollbar-thumb { background: rgba(56,189,248,.2); border-radius: 4px; }
 
-/* ================================================
-   HEADER
-================================================ */
-#app-header {
-  background: linear-gradient(135deg, rgba(6,13,26,0.98), rgba(10,22,40,0.98));
-  border-bottom: 1px solid rgba(56,189,248,0.1);
-  backdrop-filter: blur(20px);
+/* ─────────────────────────────────────────
+   BOTTOM SHEET (mobile only)
+───────────────────────────────────────── */
+#bottom-sheet {
+  display: none;  /* hidden on desktop */
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  z-index: 500;
+  max-height: 85vh;
+  border-radius: 20px 20px 0 0;
+  background: linear-gradient(180deg, #040f22ee, #030b18f5);
+  border-top: 1px solid rgba(56,189,248,.18);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  box-shadow: 0 -8px 40px rgba(0,0,0,.6);
+  transition: transform .35s cubic-bezier(.32,1,.32,1);
+  transform: translateY(calc(100% - 72px));
+  overflow: hidden;
+  flex-direction: column;
+}
+#bottom-sheet.expanded { transform: translateY(0); }
+
+/* drag handle */
+#sheet-handle {
   flex-shrink: 0;
-  z-index: 200;
+  padding: 10px 0 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  gap: 6px;
+}
+#sheet-handle-bar {
+  width: 36px; height: 4px;
+  background: rgba(56,189,248,.3);
+  border-radius: 99px;
+  transition: background .2s;
+}
+#sheet-handle:hover #sheet-handle-bar { background: rgba(56,189,248,.6); }
+
+#sheet-peek {
+  padding: 0 16px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#sheet-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 14px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(56,189,248,.15) transparent;
+  -webkit-overflow-scrolling: touch;
 }
 
-/* ================================================
+/* ─────────────────────────────────────────
+   MOBILE BREAKPOINTS
+───────────────────────────────────────── */
+@media (max-width: 767px) {
+  #sidebar       { display: none !important; }
+  #bottom-sheet  { display: flex !important; }
+  #coord-card    { bottom: 84px !important; }
+  #usage-hint    { top: 10px !important; font-size: 11px !important; padding: 8px 14px !important; }
+  #app-header    { padding: 8px 12px !important; }
+  #header-title  { font-size: .8rem !important; }
+  #header-coords { display: none !important; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  #sidebar { width: 280px; min-width: 280px; }
+}
+
+/* ─────────────────────────────────────────
+   GLASSMORPHISM
+───────────────────────────────────────── */
+.glass {
+  background: rgba(13,33,55,.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(56,189,248,.1);
+}
+.glass-card {
+  background: rgba(16,42,71,.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(56,189,248,.11);
+  border-radius: 14px;
+  transition: border-color .2s, background .2s;
+}
+.glass-card:hover { border-color: rgba(56,189,248,.24); background: rgba(16,42,71,.75); }
+
+/* ─────────────────────────────────────────
+   CROSSHAIR
+───────────────────────────────────────── */
+#crosshair-wrap {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  z-index: 800;
+  pointer-events: none;
+  width: 72px; height: 72px;
+}
+.ch-h, .ch-v {
+  position: absolute;
+  background: rgba(56,189,248,.88);
+}
+.ch-h { width: 100%; height: 1.5px; top: 50%; transform: translateY(-50%); }
+.ch-v { width: 1.5px; height: 100%; left: 50%; transform: translateX(-50%); }
+.ch-h::after {
+  content: ''; position: absolute;
+  width: 20px; height: 100%;
+  left: 50%; transform: translateX(-50%);
+  background: #030b18;
+}
+.ch-v::after {
+  content: ''; position: absolute;
+  height: 20px; width: 100%;
+  top: 50%; transform: translateY(-50%);
+  background: #030b18;
+}
+#ch-dot {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  width: 7px; height: 7px;
+  background: #38bdf8; border-radius: 50%;
+  border: 2px solid #030b18;
+  box-shadow: 0 0 14px rgba(56,189,248,.95);
+  animation: dotPulse 2.5s ease-in-out infinite;
+}
+#ch-r1 {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  width: 20px; height: 20px;
+  border: 1.5px solid rgba(56,189,248,.45);
+  border-radius: 50%;
+  animation: ringAnim 2.5s ease-in-out infinite;
+}
+#ch-r2 {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  width: 38px; height: 38px;
+  border: 1px solid rgba(56,189,248,.2);
+  border-radius: 50%;
+  animation: ringAnim 2.5s ease-in-out infinite .35s;
+}
+@keyframes dotPulse {
+  0%,100% { box-shadow: 0 0 8px rgba(56,189,248,.8); }
+  50%      { box-shadow: 0 0 20px rgba(56,189,248,1), 0 0 36px rgba(56,189,248,.35); }
+}
+@keyframes ringAnim {
+  0%,100% { transform: translate(-50%,-50%) scale(1); opacity: .65; }
+  50%      { transform: translate(-50%,-50%) scale(1.25); opacity: .1; }
+}
+
+/* ─────────────────────────────────────────
+   COORD CARD
+───────────────────────────────────────── */
+#coord-card {
+  position: absolute;
+  bottom: 20px; right: 14px;
+  z-index: 700;
+  border-radius: 14px;
+  padding: 10px 14px;
+  min-width: 178px;
+  background: rgba(3,11,24,.88);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(56,189,248,.14);
+  box-shadow: 0 8px 28px rgba(0,0,0,.5);
+}
+
+/* ─────────────────────────────────────────
+   USAGE HINT
+───────────────────────────────────────── */
+#usage-hint {
+  position: absolute;
+  top: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 700; white-space: nowrap;
+  border-radius: 12px; padding: 9px 18px;
+  background: rgba(3,11,24,.88);
+  border: 1px solid rgba(56,189,248,.18);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  transition: opacity .5s ease;
+  text-align: center;
+}
+
+/* ─────────────────────────────────────────
    CONNECTION STATUS
-================================================ */
-#conn-badge {
-  transition: all 0.4s ease;
-}
-.conn-checking { color: #fbbf24; }
-.conn-online   { color: #4ade80; }
-.conn-offline  { color: #f87171; }
-.conn-waking   { color: #38bdf8; }
-
+───────────────────────────────────────── */
 .conn-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
   display: inline-block;
-  margin-left: 5px;
+  flex-shrink: 0;
 }
-.conn-dot.checking { background: #fbbf24; animation: dotBlink 1s ease-in-out infinite; }
-.conn-dot.online   { background: #4ade80; animation: dotPulseGreen 2s ease-in-out infinite; }
-.conn-dot.offline  { background: #f87171; }
-.conn-dot.waking   { background: #38bdf8; animation: dotBlink 0.6s ease-in-out infinite; }
-
-@keyframes dotBlink    { 0%,100%{opacity:1} 50%{opacity:0.2} }
-@keyframes dotPulseGreen {
-  0%,100% { box-shadow: 0 0 0 0 rgba(74,222,128,0.4); }
+.dot-check  { background: #fbbf24; animation: blink 1s infinite; }
+.dot-wake   { background: #38bdf8; animation: blink .6s infinite; }
+.dot-on     { background: #4ade80; animation: greenPulse 2s infinite; }
+.dot-off    { background: #f87171; }
+.txt-check  { color: #fbbf24; }
+.txt-wake   { color: #38bdf8; }
+.txt-on     { color: #4ade80; }
+.txt-off    { color: #f87171; }
+@keyframes blink       { 0%,100%{opacity:1} 50%{opacity:.2} }
+@keyframes greenPulse  {
+  0%,100% { box-shadow: 0 0 0 0 rgba(74,222,128,.45); }
   50%      { box-shadow: 0 0 0 5px rgba(74,222,128,0); }
 }
 
-/* ================================================
-   SLIDERS
-================================================ */
+/* ─────────────────────────────────────────
+   SLIDER
+───────────────────────────────────────── */
 input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 5px;
-  border-radius: 99px;
-  outline: none;
-  direction: ltr;
-  cursor: pointer;
+  -webkit-appearance: none; appearance: none;
+  height: 5px; border-radius: 99px; outline: none;
+  direction: ltr; cursor: pointer; width: 100%;
   background: linear-gradient(to right,
-    #0ea5e9 0%,
-    #0ea5e9 var(--pct,50%),
-    rgba(26,58,92,0.8) var(--pct,50%),
-    rgba(26,58,92,0.8) 100%
+    #0ea5e9 0%, #0ea5e9 var(--pct,50%),
+    rgba(26,58,92,.8) var(--pct,50%), rgba(26,58,92,.8) 100%
   );
 }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 17px; height: 17px;
-  border-radius: 50%;
-  background: #38bdf8;
-  border: 2px solid #030b18;
-  box-shadow: 0 0 0 3px rgba(56,189,248,0.25), 0 2px 8px rgba(56,189,248,0.3);
-  transition: box-shadow 0.2s;
+  width: 17px; height: 17px; border-radius: 50%;
+  background: #38bdf8; border: 2px solid #030b18;
+  box-shadow: 0 0 0 3px rgba(56,189,248,.25);
+  transition: box-shadow .2s;
 }
 input[type="range"]:hover::-webkit-slider-thumb {
-  box-shadow: 0 0 0 5px rgba(56,189,248,0.2), 0 2px 12px rgba(56,189,248,0.5);
+  box-shadow: 0 0 0 5px rgba(56,189,248,.2), 0 0 12px rgba(56,189,248,.5);
 }
 
-/* ================================================
+/* ─────────────────────────────────────────
    RADIO CARDS
-================================================ */
+───────────────────────────────────────── */
 .r-card {
-  border: 1.5px solid rgba(26,58,92,0.8);
-  border-radius: 12px;
-  padding: 10px 12px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  background: rgba(16,42,71,0.4);
+  border: 1.5px solid rgba(26,58,92,.8);
+  border-radius: 12px; padding: 9px 10px;
+  cursor: pointer; background: rgba(16,42,71,.4);
+  transition: all .2s; text-align: center;
 }
-.r-card:hover { border-color: rgba(56,189,248,0.3); background: rgba(16,42,71,0.6); }
-.r-card.active {
+.r-card:hover { border-color: rgba(56,189,248,.3); background: rgba(16,42,71,.65); }
+.r-card.on    {
   border-color: #0ea5e9;
-  background: rgba(14,165,233,0.12);
-  box-shadow: 0 0 0 1px rgba(14,165,233,0.2) inset, 0 4px 16px rgba(14,165,233,0.1);
+  background: rgba(14,165,233,.12);
+  box-shadow: inset 0 0 0 1px rgba(14,165,233,.2), 0 4px 16px rgba(14,165,233,.1);
 }
 
-/* ================================================
+/* ─────────────────────────────────────────
    SCAN BUTTON
-================================================ */
+───────────────────────────────────────── */
 #scan-btn {
-  background: linear-gradient(135deg, #0369a1 0%, #0ea5e9 50%, #38bdf8 100%);
+  width: 100%; padding: 13px; border: none; cursor: pointer;
+  border-radius: 13px; font-weight: 900; font-size: .88rem;
+  color: white; font-family: 'Cairo', sans-serif;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: linear-gradient(135deg, #0369a1, #0ea5e9, #38bdf8);
   background-size: 200% 200%;
-  animation: gradShift 4s ease infinite;
-  border-radius: 14px;
-  font-weight: 900;
-  font-size: 0.9rem;
-  letter-spacing: 0.02em;
-  color: white;
-  border: none;
-  cursor: pointer;
-  width: 100%;
-  padding: 14px;
-  transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s;
-  box-shadow: 0 4px 20px rgba(14,165,233,0.35), 0 1px 3px rgba(0,0,0,0.3);
-  display: flex; align-items: center; justify-content: center; gap: 10px;
+  animation: gradMove 4s ease infinite;
+  box-shadow: 0 4px 20px rgba(14,165,233,.35);
+  transition: transform .2s, box-shadow .2s, opacity .2s;
 }
 #scan-btn:hover:not(:disabled) {
   transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(14,165,233,0.5), 0 2px 6px rgba(0,0,0,0.3);
+  box-shadow: 0 8px 28px rgba(14,165,233,.5);
 }
 #scan-btn:active:not(:disabled) { transform: translateY(0); }
-#scan-btn:disabled { opacity: 0.4; cursor: not-allowed; animation: none; }
-@keyframes gradShift {
+#scan-btn:disabled { opacity: .4; cursor: not-allowed; animation: none; }
+@keyframes gradMove {
   0%,100% { background-position: 0% 50%; }
   50%      { background-position: 100% 50%; }
 }
 
-/* ================================================
-   LOADING OVERLAY
-================================================ */
-#loading-overlay {
+/* ─────────────────────────────────────────
+   LOADING
+───────────────────────────────────────── */
+#load-overlay {
   position: fixed; inset: 0; z-index: 9999;
-  background: rgba(3,11,24,0.92);
+  background: rgba(3,11,24,.93);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 20px;
+  align-items: center; justify-content: center; gap: 18px;
   opacity: 0; pointer-events: none;
-  transition: opacity 0.35s ease;
+  transition: opacity .3s ease;
 }
-#loading-overlay.active { opacity: 1; pointer-events: all; }
-
-.spinner-ring {
-  width: 58px; height: 58px;
-  border-radius: 50%;
-  border: 3px solid rgba(56,189,248,0.1);
+#load-overlay.on { opacity: 1; pointer-events: all; }
+.spin {
+  width: 54px; height: 54px; border-radius: 50%;
+  border: 3px solid rgba(56,189,248,.12);
   border-top-color: #38bdf8;
-  animation: spinRing 0.75s linear infinite;
-  box-shadow: 0 0 20px rgba(56,189,248,0.2);
+  animation: spin .75s linear infinite;
+  box-shadow: 0 0 18px rgba(56,189,248,.2);
 }
-@keyframes spinRing { to { transform: rotate(360deg); } }
-
+@keyframes spin { to { transform: rotate(360deg); } }
 .load-dots span {
   display: inline-block;
-  width: 6px; height: 6px;
-  background: #38bdf8;
-  border-radius: 50%;
-  margin: 0 3px;
-  animation: dotJump 1.2s ease-in-out infinite;
+  width: 5px; height: 5px;
+  background: #38bdf8; border-radius: 50%;
+  margin: 0 2.5px;
+  animation: jump 1.2s ease-in-out infinite;
 }
-.load-dots span:nth-child(2) { animation-delay: 0.15s; }
-.load-dots span:nth-child(3) { animation-delay: 0.3s; }
-@keyframes dotJump { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-8px)} }
+.load-dots span:nth-child(2) { animation-delay: .15s; }
+.load-dots span:nth-child(3) { animation-delay: .3s; }
+@keyframes jump { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-7px)} }
 
-/* ================================================
-   ORIENTATION AUTO-DETECT
-================================================ */
-#orient-status {
-  font-size: 10px;
-  transition: all 0.3s;
-}
-.orient-scanning { color: #38bdf8; animation: dotBlink 0.8s infinite; }
-.orient-done     { color: #4ade80; }
-.orient-fail     { color: #fbbf24; }
-
-/* ================================================
-   AI REPORT (markdown)
-================================================ */
-.ai-content h2 {
-  font-size: 0.95rem; font-weight: 700; color: #38bdf8;
-  margin: 1.2rem 0 0.5rem;
-  padding-bottom: 0.3rem;
-  border-bottom: 1px solid rgba(56,189,248,0.15);
-}
-.ai-content p   { margin: 0.4rem 0; line-height: 1.85; color: #cbd5e1; font-size: 0.82rem; }
-.ai-content ul  { padding-right: 1.2rem; margin: 0.4rem 0; }
-.ai-content li  { margin: 0.25rem 0; color: #94a3b8; font-size: 0.82rem; line-height: 1.65; list-style: disc; }
-.ai-content strong { color: #f1f5f9; }
-.ai-content em { color: #7dd3fc; }
-
-/* ================================================
-   MODAL
-================================================ */
-#report-modal {
-  position: fixed; inset: 0; z-index: 9998;
-  background: rgba(3,11,24,0.97);
-  backdrop-filter: blur(16px);
-  display: flex; align-items: stretch; justify-content: center;
-  opacity: 0; pointer-events: none;
-  transition: opacity 0.3s ease;
-}
-#report-modal.active { opacity: 1; pointer-events: all; }
-#modal-box {
-  width: 100%; max-width: 740px;
-  display: flex; flex-direction: column;
-  background: linear-gradient(180deg, #040f22 0%, #030b18 100%);
-  border-right: 1px solid rgba(56,189,248,0.1);
-  border-left:  1px solid rgba(56,189,248,0.1);
-}
-
-/* ================================================
-   COORD CARD (map overlay)
-================================================ */
-#coord-card {
-  position: absolute;
-  bottom: 20px; right: 16px;
-  z-index: 700;
-  border-radius: 16px;
-  padding: 12px 16px;
-  min-width: 190px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(56,189,248,0.12);
-}
-
-/* ================================================
-   ANIMATIONS
-================================================ */
-@keyframes fadeUp {
-  from { opacity:0; transform:translateY(16px); }
-  to   { opacity:1; transform:translateY(0); }
-}
-.fade-up { animation: fadeUp 0.45s ease-out forwards; }
-
-/* ================================================
-   METRIC CARD
-================================================ */
-.metric-card {
-  background: rgba(10,22,40,0.7);
-  border: 1px solid rgba(56,189,248,0.1);
-  border-radius: 12px;
-  padding: 10px 12px;
-  transition: border-color 0.2s, background 0.2s;
-}
-.metric-card:hover {
-  border-color: rgba(56,189,248,0.22);
-  background: rgba(16,42,71,0.7);
-}
-
-/* ================================================
-   FLAGS
-================================================ */
-.flag-red    { background:rgba(239,68,68,0.08);  border:1.5px solid rgba(239,68,68,0.35); }
-.flag-green  { background:rgba(34,197,94,0.08);  border:1.5px solid rgba(34,197,94,0.35); }
-.flag-yellow { background:rgba(245,158,11,0.08); border:1.5px solid rgba(245,158,11,0.35); }
-.badge-red    { background:rgba(239,68,68,0.15); color:#f87171; border:1px solid rgba(239,68,68,0.3); }
-.badge-green  { background:rgba(34,197,94,0.15); color:#4ade80; border:1px solid rgba(34,197,94,0.3); }
-.badge-yellow { background:rgba(245,158,11,0.15);color:#fbbf24; border:1px solid rgba(245,158,11,0.3); }
-
-/* ================================================
-   USAGE HINT
-================================================ */
-#usage-hint {
-  position: absolute;
-  top: 16px; left: 50%; transform: translateX(-50%);
-  z-index: 700;
-  border-radius: 14px;
-  padding: 10px 20px;
-  text-align: center;
-  transition: opacity 0.5s ease;
-  white-space: nowrap;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.4);
-}
-
-/* ================================================
-   SECTION DIVIDER
-================================================ */
-.section-label {
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: rgba(148,163,184,0.5);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 4px 0;
-}
-.section-label::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: rgba(56,189,248,0.08);
-}
-
-/* ================================================
-   PING / WAKE-UP PROGRESS
-================================================ */
-#wake-bar {
-  height: 2px;
-  background: linear-gradient(90deg, #0ea5e9, #38bdf8, #0ea5e9);
+/* ─────────────────────────────────────────
+   PROGRESS BAR
+───────────────────────────────────────── */
+#prog-bar {
+  height: 2px; border-radius: 99px;
+  background: linear-gradient(90deg, #0369a1, #38bdf8, #0369a1);
   background-size: 200% 100%;
-  animation: barSlide 1.5s linear infinite;
-  border-radius: 99px;
-  transition: width 0.5s ease;
+  animation: progSlide 1.4s linear infinite;
 }
-@keyframes barSlide {
+@keyframes progSlide {
   0%   { background-position: 100% 0; }
   100% { background-position: -100% 0; }
+}
+
+/* ─────────────────────────────────────────
+   FLAGS / BADGES
+───────────────────────────────────────── */
+.f-red    { background: rgba(239,68,68,.08);  border: 1.5px solid rgba(239,68,68,.32);  border-radius: 13px; padding: 11px 13px; }
+.f-green  { background: rgba(34,197,94,.08);  border: 1.5px solid rgba(34,197,94,.32);  border-radius: 13px; padding: 11px 13px; }
+.f-yellow { background: rgba(245,158,11,.08); border: 1.5px solid rgba(245,158,11,.32); border-radius: 13px; padding: 11px 13px; }
+.b-red    { background: rgba(239,68,68,.14);  color: #f87171; border: 1px solid rgba(239,68,68,.28);  border-radius: 7px; padding: 2px 7px; font-size: 10px; }
+.b-green  { background: rgba(34,197,94,.14);  color: #4ade80; border: 1px solid rgba(34,197,94,.28);  border-radius: 7px; padding: 2px 7px; font-size: 10px; }
+.b-yellow { background: rgba(245,158,11,.14); color: #fbbf24; border: 1px solid rgba(245,158,11,.28); border-radius: 7px; padding: 2px 7px; font-size: 10px; }
+
+/* ─────────────────────────────────────────
+   METRIC CARD
+───────────────────────────────────────── */
+.m-card {
+  background: rgba(10,22,40,.7);
+  border: 1px solid rgba(56,189,248,.1);
+  border-radius: 12px; padding: 10px 11px;
+  transition: border-color .2s, background .2s;
+}
+.m-card:hover { border-color: rgba(56,189,248,.22); background: rgba(16,42,71,.7); }
+
+/* ─────────────────────────────────────────
+   SECTION LABEL
+───────────────────────────────────────── */
+.slabel {
+  font-size: 9px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .12em;
+  color: rgba(148,163,184,.45);
+  display: flex; align-items: center; gap: 7px;
+}
+.slabel::after {
+  content: ''; flex: 1; height: 1px;
+  background: rgba(56,189,248,.07);
+}
+
+/* ─────────────────────────────────────────
+   FADE IN UP
+───────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp .4s ease-out forwards; }
+
+/* ─────────────────────────────────────────
+   AI CONTENT (markdown)
+───────────────────────────────────────── */
+.ai-c h2 {
+  font-size: .93rem; font-weight: 700; color: #38bdf8;
+  margin: 1.2rem 0 .5rem;
+  padding-bottom: .3rem;
+  border-bottom: 1px solid rgba(56,189,248,.15);
+}
+.ai-c p  { margin: .4rem 0; line-height: 1.85; color: #cbd5e1; font-size: .82rem; }
+.ai-c ul { padding-right: 1.2rem; margin: .4rem 0; }
+.ai-c li { margin: .25rem 0; color: #94a3b8; font-size: .82rem; line-height: 1.65; list-style: disc; }
+.ai-c strong { color: #f1f5f9; }
+.ai-c em     { color: #7dd3fc; }
+
+/* ─────────────────────────────────────────
+   MODAL
+───────────────────────────────────────── */
+#modal {
+  position: fixed; inset: 0; z-index: 9998;
+  background: rgba(3,11,24,.97);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  display: flex; align-items: stretch; justify-content: center;
+  opacity: 0; pointer-events: none;
+  transition: opacity .28s ease;
+}
+#modal.on { opacity: 1; pointer-events: all; }
+#modal-box {
+  width: 100%; max-width: 720px;
+  display: flex; flex-direction: column;
+  background: linear-gradient(180deg,#040f22,#030b18);
+  border-right: 1px solid rgba(56,189,248,.1);
+  border-left:  1px solid rgba(56,189,248,.1);
+}
+#modal-scroll {
+  flex: 1; overflow-y: auto; padding: 20px 22px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(56,189,248,.14) transparent;
+}
+
+/* ─────────────────────────────────────────
+   LEAFLET OVERRIDES
+───────────────────────────────────────── */
+.leaflet-control-zoom a {
+  background: rgba(3,11,24,.9) !important;
+  color: #38bdf8 !important;
+  border-color: rgba(56,189,248,.2) !important;
+  backdrop-filter: blur(8px) !important;
+}
+.leaflet-control-zoom a:hover { background: rgba(16,42,71,.95) !important; }
+.leaflet-control-attribution {
+  background: rgba(3,11,24,.85) !important;
+  color: #475569 !important; font-size: 9px !important;
+}
+.leaflet-control-attribution a { color: #38bdf8 !important; }
+.leaflet-control-layers {
+  background: rgba(6,16,34,.95) !important;
+  border: 1px solid rgba(56,189,248,.15) !important;
+  border-radius: 12px !important; color: #cbd5e1 !important;
+  backdrop-filter: blur(16px) !important;
 }
 </style>
 </head>
 
 <body>
 
-<!-- ================================================
+<!-- ═══════════════════════════════════════
      LOADING OVERLAY
-================================================ -->
-<div id="loading-overlay">
-  <div style="position:relative; width:58px; height:58px;">
-    <div class="spinner-ring" style="position:absolute;inset:0;"></div>
+═══════════════════════════════════════ -->
+<div id="load-overlay">
+  <div style="position:relative;width:54px;height:54px;">
+    <div class="spin" style="position:absolute;inset:0;"></div>
     <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:20px;">🎣</div>
   </div>
-  <div style="text-align:center;">
-    <p id="load-step" style="color:#38bdf8;font-weight:700;font-size:0.95rem;margin-bottom:4px;">جاري التحليل...</p>
-    <div style="width:220px;height:2px;background:rgba(56,189,248,0.1);border-radius:99px;overflow:hidden;margin:8px auto 4px;">
-      <div id="wake-bar" style="height:100%;width:60%;"></div>
+  <div style="text-align:center;width:240px;">
+    <p id="load-step" style="color:#38bdf8;font-weight:700;font-size:.92rem;margin-bottom:8px;">جاري التحليل...</p>
+    <div style="height:2px;background:rgba(56,189,248,.1);border-radius:99px;overflow:hidden;margin-bottom:8px;">
+      <div id="prog-bar" style="width:60%;height:100%;"></div>
     </div>
-    <p style="color:#475569;font-size:11px;" class="mono">Open-Meteo · Physics Engine · Gemini AI</p>
+    <p class="mono" style="color:#475569;font-size:10px;">Open-Meteo · Physics Engine · Gemini AI</p>
   </div>
-  <div class="load-dots">
-    <span></span><span></span><span></span>
-  </div>
+  <div class="load-dots"><span></span><span></span><span></span></div>
 </div>
 
-<!-- ================================================
+<!-- ═══════════════════════════════════════
      HEADER
-================================================ -->
-<header id="app-header" style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+═══════════════════════════════════════ -->
+<header id="app-header" style="padding:9px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;">
 
   <!-- Logo -->
-  <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
-    <div style="width:36px;height:36px;background:linear-gradient(135deg,#0369a1,#38bdf8);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 0 16px rgba(56,189,248,0.3);">🎣</div>
+  <div style="display:flex;align-items:center;gap:9px;flex-shrink:0;">
+    <div style="width:34px;height:34px;background:linear-gradient(135deg,#0369a1,#38bdf8);border-radius:9px;
+                display:flex;align-items:center;justify-content:center;font-size:17px;
+                box-shadow:0 0 14px rgba(56,189,248,.3);flex-shrink:0;">🎣</div>
     <div>
-      <div style="font-weight:900;color:#fff;font-size:0.9rem;line-height:1.1;">صيّاد المحيط</div>
-      <div class="mono" style="font-size:9px;color:#0ea5e9;letter-spacing:0.08em;">SurfCast Analytics v2.0</div>
+      <div id="header-title" style="font-weight:900;color:#fff;font-size:.88rem;line-height:1.1;">صيّاد المحيط</div>
+      <div class="mono" style="font-size:9px;color:#0ea5e9;letter-spacing:.07em;">SurfCast Analytics v2.0</div>
     </div>
   </div>
 
-  <!-- Coord Display (header) -->
-  <div class="glass" style="border-radius:10px;padding:6px 12px;display:flex;gap:12px;font-size:11px;" id="header-coords">
+  <!-- Coord (desktop) -->
+  <div id="header-coords" class="glass" style="border-radius:9px;padding:5px 11px;display:flex;gap:10px;font-size:10.5px;align-items:center;">
     <span style="color:#475569;">خط العرض:</span>
     <span id="h-lat" class="mono" style="color:#38bdf8;font-weight:700;">---.----</span>
-    <span style="color:rgba(56,189,248,0.2);">|</span>
+    <span style="color:rgba(56,189,248,.2);">|</span>
     <span style="color:#475569;">خط الطول:</span>
     <span id="h-lng" class="mono" style="color:#38bdf8;font-weight:700;">---.----</span>
   </div>
 
-  <!-- Connection Status -->
-  <div id="conn-badge" style="display:flex;align-items:center;gap:6px;font-size:11px;flex-shrink:0;" class="conn-checking">
-    <span id="conn-dot" class="conn-dot checking"></span>
-    <span id="conn-text" class="mono">جاري الفحص...</span>
+  <!-- Connection status -->
+  <div id="conn-wrap" style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
+    <span id="conn-dot" class="conn-dot dot-check"></span>
+    <span id="conn-txt" class="mono txt-check" style="font-size:10.5px;">فحص...</span>
   </div>
 
 </header>
 
-<!-- ================================================
-     MAIN LAYOUT
-================================================ -->
-<div style="flex:1;display:flex;overflow:hidden;">
+<!-- ═══════════════════════════════════════
+     MAIN ROW
+═══════════════════════════════════════ -->
+<div id="main-row">
 
-  <!-- MAP AREA -->
-  <div style="flex:1;position:relative;">
+  <!-- MAP WRAP -->
+  <div id="map-wrap">
     <div id="map"></div>
 
-    <!-- CROSSHAIR -->
+    <!-- Crosshair -->
     <div id="crosshair-wrap">
-      <div class="ch-line-h"></div>
-      <div class="ch-line-v"></div>
-      <div id="ch-ring2"></div>
-      <div id="ch-ring"></div>
-      <div id="ch-center"></div>
+      <div class="ch-h"></div>
+      <div class="ch-v"></div>
+      <div id="ch-r2"></div>
+      <div id="ch-r1"></div>
+      <div id="ch-dot"></div>
     </div>
 
-    <!-- COORD CARD (map overlay) -->
-    <div id="coord-card" class="glass-dark">
-      <div style="font-size:10px;color:#475569;text-align:center;margin-bottom:6px;">📍 الموقع المحدد</div>
-      <div class="mono" style="font-size:12px;line-height:1.8;">
-        <div style="display:flex;justify-content:space-between;gap:16px;">
+    <!-- Coord overlay -->
+    <div id="coord-card">
+      <div style="font-size:9px;color:#475569;text-align:center;margin-bottom:6px;">📍 الموقع المحدد</div>
+      <div class="mono" style="font-size:11.5px;line-height:1.9;">
+        <div style="display:flex;justify-content:space-between;gap:14px;">
           <span style="color:#64748b;">عرض</span>
           <span id="c-lat" style="color:#38bdf8;font-weight:700;">---.------</span>
         </div>
-        <div style="display:flex;justify-content:space-between;gap:16px;">
+        <div style="display:flex;justify-content:space-between;gap:14px;">
           <span style="color:#64748b;">طول</span>
           <span id="c-lng" style="color:#38bdf8;font-weight:700;">---.------</span>
         </div>
       </div>
-      <div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(56,189,248,0.1);font-size:10px;color:#475569;text-align:center;">
-        حرّك الخريطة لتغيير الموقع
-      </div>
+      <div style="margin-top:5px;padding-top:5px;border-top:1px solid rgba(56,189,248,.1);
+                  font-size:9px;color:#475569;text-align:center;">حرّك الخريطة لتغيير الموقع</div>
     </div>
 
-    <!-- USAGE HINT -->
-    <div id="usage-hint" class="glass">
-      <p style="font-size:13px;font-weight:700;color:#38bdf8;">🗺️ حرّك الخريطة لتحديد موقع الصيد</p>
-      <p style="font-size:11px;color:#64748b;margin-top:3px;">ضع المنظار على الشاطئ ثم اضغط زر المسح</p>
+    <!-- Usage hint -->
+    <div id="usage-hint">
+      <p style="font-size:12.5px;font-weight:700;color:#38bdf8;">🗺️ حرّك الخريطة لتحديد موقع الصيد</p>
+      <p style="font-size:10px;color:#64748b;margin-top:2px;">ضع المنظار على الشاطئ ثم اضغط زر المسح</p>
     </div>
 
-  </div><!-- /MAP AREA -->
+    <!-- BOTTOM SHEET (mobile) -->
+    <div id="bottom-sheet">
 
-  <!-- ============================================
-       SIDEBAR
-  ============================================ -->
-  <div id="sidebar">
-
-    <!-- SCROLL AREA -->
-    <div id="sidebar-scroll" style="padding:14px;display:flex;flex-direction:column;gap:14px;">
-
-      <!-- ── إعدادات الموقع ── -->
-      <div class="section-label">⚙️ إعدادات الموقع</div>
-
-      <!-- اتجاه الشاطئ -->
-      <div class="glass-card" style="padding:14px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-          <span style="font-size:12px;font-weight:600;color:#94a3b8;display:flex;align-items:center;gap:5px;">
-            🧭 اتجاه الشاطئ
-          </span>
+      <!-- Handle -->
+      <div id="sheet-handle">
+        <div id="sheet-handle-bar"></div>
+        <div id="sheet-peek">
           <div style="display:flex;align-items:center;gap:6px;">
-            <span id="orient-status" class="orient-fail">—</span>
-            <span id="orient-val" class="mono" style="background:rgba(14,165,233,0.15);border:1px solid rgba(14,165,233,0.3);color:#38bdf8;border-radius:8px;padding:2px 8px;font-size:12px;font-weight:700;">180°</span>
+            <span style="font-size:13px;">⚙️</span>
+            <span style="font-weight:700;font-size:12px;color:#e2e8f0;">إعدادات الموقع</span>
           </div>
-        </div>
-
-        <!-- Compass + Slider -->
-        <div style="display:flex;align-items:center;gap:12px;">
-          <!-- Mini compass SVG -->
-          <svg viewBox="0 0 56 56" style="width:44px;height:44px;flex-shrink:0;">
-            <circle cx="28" cy="28" r="26" fill="rgba(6,13,26,0.8)" stroke="rgba(56,189,248,0.2)" stroke-width="1.5"/>
-            <text x="28" y="8"  text-anchor="middle" font-size="6" fill="#64748b" font-family="Cairo,sans-serif">ش</text>
-            <text x="28" y="53" text-anchor="middle" font-size="6" fill="#64748b" font-family="Cairo,sans-serif">ج</text>
-            <text x="52" y="31" text-anchor="middle" font-size="6" fill="#64748b" font-family="Cairo,sans-serif">ش</text>
-            <text x="4"  y="31" text-anchor="middle" font-size="6" fill="#64748b" font-family="Cairo,sans-serif">غ</text>
-            <line id="compass-needle"
-                  x1="28" y1="28" x2="28" y2="9"
-                  stroke="#38bdf8" stroke-width="2" stroke-linecap="round"
-                  style="transform-origin:28px 28px;transform:rotate(180deg);transition:transform 0.35s cubic-bezier(.34,1.56,.64,1)"/>
-            <circle cx="28" cy="28" r="2.5" fill="#38bdf8" opacity="0.9"/>
-          </svg>
-          <input type="range" id="orient-slider" min="0" max="360" value="180" style="flex:1;--pct:50%"/>
-        </div>
-
-        <!-- auto-detect button -->
-        <button id="auto-orient-btn"
-                style="margin-top:10px;width:100%;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.2);
-                       border-radius:10px;padding:7px;font-size:11px;color:#38bdf8;cursor:pointer;
-                       display:flex;align-items:center;justify-content:center;gap:6px;
-                       transition:background 0.2s,border-color 0.2s;"
-                onmouseover="this.style.background='rgba(56,189,248,0.15)'"
-                onmouseout="this.style.background='rgba(56,189,248,0.08)'">
-          <span>🎯</span>
-          <span>اكتشاف الاتجاه تلقائياً من الخريطة</span>
-        </button>
-      </div>
-
-      <!-- نوع القاع -->
-      <div class="glass-card" style="padding:14px;">
-        <div class="section-label" style="margin-bottom:10px;">🪨 نوع القاع</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          <label>
-            <input type="radio" name="beach_type" value="sandy" class="hidden" checked/>
-            <div class="r-card active" data-radio="beach_type">
-              <div style="font-size:20px;margin-bottom:4px;">🏖️</div>
-              <div style="font-weight:700;font-size:12px;color:#fff;">رملي</div>
-              <div style="font-size:10px;color:#475569;margin-top:2px;">بوري · مربو</div>
-            </div>
-          </label>
-          <label>
-            <input type="radio" name="beach_type" value="rocky" class="hidden"/>
-            <div class="r-card" data-radio="beach_type">
-              <div style="font-size:20px;margin-bottom:4px;">🪨</div>
-              <div style="font-weight:700;font-size:12px;color:#fff;">صخري</div>
-              <div style="font-size:10px;color:#475569;margin-top:2px;">سرق · لوب</div>
-            </div>
-          </label>
+          <div style="display:flex;align-items:center;gap:5px;">
+            <span id="mob-conn-dot" class="conn-dot dot-check" style="width:6px;height:6px;"></span>
+            <span id="mob-conn-txt" class="mono txt-check" style="font-size:10px;">فحص...</span>
+          </div>
         </div>
       </div>
 
-      <!-- التاريخ المستهدف -->
-      <div class="glass-card" style="padding:14px;">
-        <div class="section-label" style="margin-bottom:10px;">📅 اليوم المستهدف</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
-          <label>
-            <input type="radio" name="target_date" value="today" class="hidden" checked/>
-            <div class="r-card active" data-radio="target_date" style="text-align:center;padding:8px;">
-              <div style="font-size:18px;">☀️</div>
-              <div style="font-weight:700;font-size:11px;color:#fff;margin-top:3px;">اليوم</div>
-            </div>
-          </label>
-          <label>
-            <input type="radio" name="target_date" value="tomorrow" class="hidden"/>
-            <div class="r-card" data-radio="target_date" style="text-align:center;padding:8px;">
-              <div style="font-size:18px;">🌅</div>
-              <div style="font-weight:700;font-size:11px;color:#fff;margin-top:3px;">غداً</div>
-            </div>
-          </label>
-          <label>
-            <input type="radio" name="target_date" value="day_after" class="hidden"/>
-            <div class="r-card" data-radio="target_date" style="text-align:center;padding:8px;">
-              <div style="font-size:18px;">🌙</div>
-              <div style="font-weight:700;font-size:11px;color:#fff;margin-top:3px;">بعد غد</div>
-            </div>
-          </label>
-        </div>
+      <!-- Sheet scroll content (same controls as sidebar) -->
+      <div id="sheet-scroll">
+        <!-- controls injected by JS cloneControls() -->
       </div>
 
-      <!-- زر المسح -->
-      <button id="scan-btn">
-        <span style="font-size:20px;">🔭</span>
-        <span>مسح الموقع وتحليله</span>
-      </button>
+    </div>
 
-      <!-- رسالة الخطأ -->
-      <div id="err-box" style="display:none;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);
-           border-radius:12px;padding:12px;font-size:12px;color:#fca5a5;line-height:1.7;"></div>
+  </div><!-- /map-wrap -->
 
-      <!-- ── نتائج التحليل ── -->
-      <div id="results-wrap" style="display:none;flex-direction:column;gap:12px;" class="fade-up">
+  <!-- ════════════════════════════════
+       SIDEBAR (desktop)
+  ════════════════════════════════ -->
+  <div id="sidebar">
+    <div id="sidebar-scroll">
+      <!-- shared controls rendered here -->
+    </div>
+  </div>
 
-        <div class="section-label">📊 نتائج التحليل الفيزيائي</div>
-
-        <!-- بانر الحالة -->
-        <div id="flag-banner" style="border-radius:14px;padding:12px 14px;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-            <span id="flag-ico" style="font-size:18px;"></span>
-            <span id="flag-ttl" style="font-weight:800;font-size:13px;"></span>
-          </div>
-          <div id="flag-sub" style="font-size:11px;color:rgba(203,213,225,0.7);line-height:1.6;"></div>
-          <div id="flag-cnts" style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;"></div>
-        </div>
-
-        <!-- Metric cards -->
-        <div id="metrics-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;"></div>
-
-        <!-- Sinker -->
-        <div class="glass-card" style="padding:12px;display:flex;align-items:center;gap:10px;">
-          <span style="font-size:22px;">⚓</span>
-          <div>
-            <div style="font-size:10px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;">توصية الرصاصة</div>
-            <div id="sinker-txt" style="font-weight:700;font-size:12px;color:#e2e8f0;margin-top:3px;line-height:1.5;"></div>
-          </div>
-        </div>
-
-        <!-- Species -->
-        <div class="section-label">🎣 الأنواع المتوقعة</div>
-        <div id="species-list" style="display:flex;flex-direction:column;gap:8px;"></div>
-
-        <!-- Gemini report button -->
-        <button id="show-modal-btn"
-                style="width:100%;background:linear-gradient(135deg,rgba(124,58,237,0.8),rgba(14,165,233,0.8));
-                       border:1px solid rgba(124,58,237,0.4);border-radius:12px;padding:12px;
-                       color:#fff;font-weight:800;font-size:12px;cursor:pointer;
-                       display:flex;align-items:center;justify-content:center;gap:8px;
-                       transition:opacity 0.2s,transform 0.2s;box-shadow:0 4px 20px rgba(124,58,237,0.2);"
-                onmouseover="this.style.opacity='0.85';this.style.transform='translateY(-1px)'"
-                onmouseout="this.style.opacity='1';this.style.transform='translateY(0)'">
-          <span>🤖</span>
-          <span>التقرير التكتيكي الكامل — Gemini AI</span>
-        </button>
-
-      </div><!-- /results-wrap -->
-
-    </div><!-- /sidebar-scroll -->
-  </div><!-- /sidebar -->
-
-</div><!-- /main layout -->
+</div><!-- /main-row -->
 
 
-<!-- ================================================
-     MODAL — تقرير Gemini
-================================================ -->
-<div id="report-modal">
+<!-- ═══════════════════════════════════════
+     MODAL — Gemini Report
+═══════════════════════════════════════ -->
+<div id="modal">
   <div id="modal-box">
-
-    <!-- Modal Header -->
-    <div style="flex-shrink:0;background:rgba(4,15,34,0.98);border-bottom:1px solid rgba(56,189,248,0.1);
-                padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
-      <div style="display:flex;align-items:center;gap:10px;">
-        <div style="width:32px;height:32px;background:linear-gradient(135deg,#7c3aed,#0ea5e9);
-                    border-radius:9px;display:flex;align-items:center;justify-content:center;
-                    font-size:15px;box-shadow:0 4px 12px rgba(124,58,237,0.3);">🤖</div>
+    <div style="flex-shrink:0;background:rgba(4,15,34,.98);border-bottom:1px solid rgba(56,189,248,.1);
+                padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:10px;">
+      <div style="display:flex;align-items:center;gap:9px;">
+        <div style="width:30px;height:30px;background:linear-gradient(135deg,#7c3aed,#0ea5e9);
+                    border-radius:8px;display:flex;align-items:center;justify-content:center;
+                    font-size:14px;box-shadow:0 4px 10px rgba(124,58,237,.3);">🤖</div>
         <div>
-          <div style="font-weight:800;font-size:13px;color:#fff;">التقرير التكتيكي الكامل</div>
-          <div class="mono" style="font-size:10px;color:#64748b;margin-top:2px;">Gemini 1.5 Flash · خبير صيد السيرف</div>
+          <div style="font-weight:800;font-size:12.5px;color:#fff;">التقرير التكتيكي الكامل</div>
+          <div class="mono" style="font-size:9.5px;color:#64748b;margin-top:1px;">Gemini 1.5 Flash · خبير صيد السيرف</div>
         </div>
       </div>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <span id="tok-count" class="mono" style="font-size:10px;color:#475569;
-              background:rgba(16,42,71,0.8);border:1px solid rgba(56,189,248,0.1);
-              border-radius:8px;padding:4px 8px;"></span>
-        <button id="copy-btn"
-                style="font-size:11px;color:#94a3b8;cursor:pointer;
-                       background:rgba(16,42,71,0.6);border:1px solid rgba(56,189,248,0.15);
-                       border-radius:8px;padding:5px 10px;display:flex;align-items:center;gap:5px;
-                       transition:all 0.2s;"
-                class="mono"
-                onmouseover="this.style.color='#38bdf8';this.style.borderColor='rgba(56,189,248,0.35)'"
-                onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(56,189,248,0.15)'">
-          📋 نسخ
-        </button>
-        <button id="close-modal-btn"
-                style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;
-                       background:rgba(16,42,71,0.6);border:1px solid rgba(56,189,248,0.1);
-                       border-radius:8px;cursor:pointer;color:#64748b;font-size:16px;line-height:1;
-                       transition:all 0.2s;"
-                onmouseover="this.style.background='rgba(239,68,68,0.15)';this.style.color='#f87171'"
-                onmouseout="this.style.background='rgba(16,42,71,0.6)';this.style.color='#64748b'">
-          ×
-        </button>
+      <div style="display:flex;align-items:center;gap:7px;">
+        <span id="tok-cnt" class="mono" style="font-size:10px;color:#475569;background:rgba(16,42,71,.7);
+              border:1px solid rgba(56,189,248,.1);border-radius:7px;padding:3px 8px;"></span>
+        <button id="copy-btn" class="mono"
+                style="font-size:10.5px;color:#94a3b8;cursor:pointer;background:rgba(16,42,71,.6);
+                       border:1px solid rgba(56,189,248,.15);border-radius:7px;padding:4px 9px;
+                       transition:all .2s;"
+                onmouseover="this.style.color='#38bdf8'"
+                onmouseout="this.style.color='#94a3b8'">📋 نسخ</button>
+        <button id="close-modal"
+                style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+                       background:rgba(16,42,71,.6);border:1px solid rgba(56,189,248,.1);
+                       border-radius:7px;cursor:pointer;color:#64748b;font-size:15px;
+                       transition:all .2s;"
+                onmouseover="this.style.background='rgba(239,68,68,.15)';this.style.color='#f87171'"
+                onmouseout="this.style.background='rgba(16,42,71,.6)';this.style.color='#64748b'">×</button>
       </div>
     </div>
-
-    <!-- Modal Content -->
-    <div style="flex:1;overflow-y:auto;padding:20px 24px;
-                scrollbar-width:thin;scrollbar-color:rgba(56,189,248,0.15) transparent;">
-      <div id="ai-content" class="ai-content"></div>
-    </div>
-
+    <div id="modal-scroll"><div id="ai-out" class="ai-c"></div></div>
   </div>
 </div>
 
 
-<!-- ================================================
+<!-- ═══════════════════════════════════════
      JAVASCRIPT
-================================================ -->
+═══════════════════════════════════════ -->
 <script>
-// ============================================================
-// ⚠️  ضع هنا رابط Render الخاص بك
-// ============================================================
-const API_BASE = "https://spotdata.onrender.com";
-// مثال: const API_BASE = "https://surfcast-api.onrender.com";
+// ─────────────────────────────────────────
+// ⚠️  ضع رابط Render هنا
+// ─────────────────────────────────────────
+const API_BASE = "https://YOUR-APP-NAME.onrender.com";
 
-// ============================================================
+// ─────────────────────────────────────────
 // STATE
-// ============================================================
-let currentLat  = 36.7372;
-let currentLng  = 3.0860;
-let mapMoved    = false;
+// ─────────────────────────────────────────
+let lat = 36.7372, lng = 3.0860;
 let serverAlive = false;
-let lastReport  = '';
-let debounceTimer = null;
+let mapMoved    = false;
+let debTimer    = null;
+let sheetOpen   = false;
 
-// ============================================================
-// MAP INIT
-// ============================================================
+// ─────────────────────────────────────────
+// MAP
+// ─────────────────────────────────────────
 const map = L.map('map', {
-  center: [36.7372, 3.0860],
-  zoom: 9,
-  zoomControl: true,
-  attributionControl: true,
+  center: [lat, lng], zoom: 9,
+  zoomControl: true, attributionControl: true,
+  tap: true,   // iOS touch fix
 });
 
-const layers = {
-  "🛰️ صورة فضائية": L.tileLayer(
+const tileLayers = {
+  "🛰️ فضائي": L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    { attribution:'© Esri Satellite', maxZoom:19 }
+    { attribution: '© Esri', maxZoom: 19 }
   ),
-  "🗺️ خريطة عادية": L.tileLayer(
+  "🗺️ عادي": L.tileLayer(
     'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-    { attribution:'© OpenStreetMap', maxZoom:19 }
-  ),
-  "🌊 GEBCO (عمق)": L.tileLayer(
-    'https://tiles.gebco.net/tiles/gebco_latest/{z}/{x}/{y}.png',
-    { attribution:'© GEBCO', maxZoom:14, opacity:0.85 }
+    { attribution: '© OSM', maxZoom: 19 }
   ),
 };
+tileLayers["🛰️ فضائي"].addTo(map);
+L.control.layers(tileLayers, {}, { position:'topright', collapsed:true }).addTo(map);
 
-layers["🛰️ صورة فضائية"].addTo(map);
-L.control.layers(layers, {}, { position:'topright', collapsed:true }).addTo(map);
-
-// ============================================================
-// COORDINATE UPDATE (on map move)
-// ============================================================
-function updateCoords(lat, lng) {
-  currentLat = lat;
-  currentLng = lng;
-  document.getElementById('c-lat').textContent  = lat.toFixed(6);
-  document.getElementById('c-lng').textContent  = lng.toFixed(6);
-  document.getElementById('h-lat').textContent  = lat.toFixed(4);
-  document.getElementById('h-lng').textContent  = lng.toFixed(4);
+function updCoords(la, ln) {
+  lat = la; lng = ln;
+  const la6 = la.toFixed(6), ln6 = ln.toFixed(6);
+  document.getElementById('c-lat').textContent = la6;
+  document.getElementById('c-lng').textContent = ln6;
+  document.getElementById('h-lat').textContent = la.toFixed(4);
+  document.getElementById('h-lng').textContent = ln.toFixed(4);
 }
 
 map.on('move', () => {
   const c = map.getCenter();
-  updateCoords(c.lat, c.lng);
+  updCoords(c.lat, c.lng);
   if (!mapMoved) {
     mapMoved = true;
-    const hint = document.getElementById('usage-hint');
-    hint.style.opacity = '0';
-    setTimeout(() => hint.style.display = 'none', 500);
+    const h = document.getElementById('usage-hint');
+    h.style.opacity = '0';
+    setTimeout(() => h.style.display = 'none', 500);
   }
-  // Auto-detect orientation with debounce (1.5s after stop moving)
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => autoDetectOrientation(c.lat, c.lng), 1500);
+  clearTimeout(debTimer);
+  debTimer = setTimeout(() => autoOrient(c.lat, c.lng), 1500);
 });
 
-updateCoords(36.7372, 3.0860);
+updCoords(lat, lng);
 
-// ============================================================
-// AUTO-DETECT BEACH ORIENTATION via Open-Meteo Elevation API
-// Uses 16 surrounding points to find sea vs land direction
-// ============================================================
-const PROBE_DIST   = 0.012;  // ~1.3 km per probe step
-const PROBE_ANGLES = [0,22.5,45,67.5,90,112.5,135,157.5,180,202.5,225,247.5,270,292.5,315,337.5];
-const DEG_TO_RAD   = Math.PI / 180;
-const RAD_TO_DEG   = 180 / Math.PI;
+// ─────────────────────────────────────────
+// BOTTOM SHEET (mobile)
+// ─────────────────────────────────────────
+const sheet = document.getElementById('bottom-sheet');
+const handle = document.getElementById('sheet-handle');
 
-function probePoint(lat, lng, angleDeg) {
-  const r   = angleDeg * DEG_TO_RAD;
-  const dlat = PROBE_DIST * Math.cos(r);
-  const dlng = PROBE_DIST * Math.sin(r) / Math.cos(lat * DEG_TO_RAD);
-  return { lat: lat + dlat, lng: lng + dlng };
-}
-
-async function autoDetectOrientation(lat, lng) {
-  setOrientStatus('scanning', '🔄 يكتشف...');
-
-  // Build probe points
-  const points = PROBE_ANGLES.map(a => probePoint(lat, lng, a));
-  const lats   = points.map(p => p.lat.toFixed(6)).join(',');
-  const lngs   = points.map(p => p.lng.toFixed(6)).join(',');
-
-  try {
-    const url = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lngs}`;
-    const res  = await fetch(url, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) throw new Error('elevation fetch failed');
-    const data = await res.json();
-    const elevs = data.elevation;
-
-    // SEA = elevation ≤ 2m (coastline DEM tolerance)
-    const seaAngles = PROBE_ANGLES.filter((_, i) => elevs[i] <= 2.0);
-
-    if (seaAngles.length === 0 || seaAngles.length === PROBE_ANGLES.length) {
-      // All land or all sea — can't determine
-      setOrientStatus('fail', '⚠️ يدوي');
-      return;
-    }
-
-    // Compute mean sea direction using circular mean
-    let sinSum = 0, cosSum = 0;
-    seaAngles.forEach(a => {
-      sinSum += Math.sin(a * DEG_TO_RAD);
-      cosSum += Math.cos(a * DEG_TO_RAD);
-    });
-    let meanAngle = Math.atan2(sinSum, cosSum) * RAD_TO_DEG;
-    if (meanAngle < 0) meanAngle += 360;
-    const deg = Math.round(meanAngle);
-
-    // Update slider + display
-    setOrientSlider(deg);
-    setOrientStatus('done', '✓ تلقائي');
-
-  } catch (e) {
-    setOrientStatus('fail', '⚠️ يدوي');
-  }
-}
-
-function setOrientSlider(deg) {
-  const slider = document.getElementById('orient-slider');
-  slider.value = deg;
-  slider.style.setProperty('--pct', `${(deg/360)*100}%`);
-  document.getElementById('orient-val').textContent = `${deg}°`;
-  document.getElementById('compass-needle').style.transform = `rotate(${deg}deg)`;
-}
-
-function setOrientStatus(state, text) {
-  const el = document.getElementById('orient-status');
-  el.className = 'orient-' + (state === 'scanning' ? 'scanning' : state === 'done' ? 'done' : 'fail');
-  el.textContent = text;
-  el.style.fontSize = '10px';
-}
-
-// Manual slider control
-document.getElementById('orient-slider').addEventListener('input', function() {
-  const deg = parseInt(this.value);
-  this.style.setProperty('--pct', `${(deg/360)*100}%`);
-  document.getElementById('orient-val').textContent = `${deg}°`;
-  document.getElementById('compass-needle').style.transform = `rotate(${deg}deg)`;
-  setOrientStatus('fail', '✏️ يدوي');
+handle.addEventListener('click', () => {
+  sheetOpen = !sheetOpen;
+  sheet.classList.toggle('expanded', sheetOpen);
 });
 
-// Manual auto-detect button
-document.getElementById('auto-orient-btn').addEventListener('click', () => {
-  autoDetectOrientation(currentLat, currentLng);
-});
+// Touch drag for bottom sheet
+let touchStartY = 0, sheetStartH = false;
+sheet.addEventListener('touchstart', e => {
+  touchStartY = e.touches[0].clientY;
+  sheetStartH = sheetOpen;
+}, { passive: true });
+sheet.addEventListener('touchend', e => {
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  if (dy > 50 && sheetStartH)  { sheetOpen = false; sheet.classList.remove('expanded'); }
+  if (dy < -50 && !sheetStartH){ sheetOpen = true;  sheet.classList.add('expanded'); }
+}, { passive: true });
 
-// Run on load
-autoDetectOrientation(36.7372, 3.0860);
+// ─────────────────────────────────────────
+// CONTROLS HTML (shared between sidebar and sheet)
+// ─────────────────────────────────────────
+function controlsHTML() {
+  return `
+    <div class="slabel">⚙️ إعدادات الموقع</div>
 
-// ============================================================
-// CONNECTION STATUS + SERVER HEALTH CHECK + WAKE-UP
-// ============================================================
-const CONN = {
-  el:   document.getElementById('conn-badge'),
-  dot:  document.getElementById('conn-dot'),
-  text: document.getElementById('conn-text'),
-};
+    <!-- Orientation -->
+    <div class="glass-card" style="padding:13px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;">
+        <span style="font-size:12px;font-weight:600;color:#94a3b8;">🧭 اتجاه الشاطئ</span>
+        <div style="display:flex;align-items:center;gap:5px;">
+          <span id="$PFX$orient-status" style="font-size:9.5px;color:#64748b;">—</span>
+          <span id="$PFX$orient-val" class="mono"
+                style="background:rgba(14,165,233,.14);border:1px solid rgba(14,165,233,.28);
+                       color:#38bdf8;border-radius:7px;padding:2px 7px;font-size:11px;font-weight:700;">180°</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg viewBox="0 0 52 52" style="width:40px;height:40px;flex-shrink:0;">
+          <circle cx="26" cy="26" r="24" fill="rgba(3,11,24,.85)" stroke="rgba(56,189,248,.2)" stroke-width="1.5"/>
+          <text x="26" y="8"  text-anchor="middle" font-size="5.5" fill="#64748b" font-family="Cairo,sans-serif">ش</text>
+          <text x="26" y="49" text-anchor="middle" font-size="5.5" fill="#64748b" font-family="Cairo,sans-serif">ج</text>
+          <text x="48" y="29" text-anchor="middle" font-size="5.5" fill="#64748b" font-family="Cairo,sans-serif">ش</text>
+          <text x="4"  y="29" text-anchor="middle" font-size="5.5" fill="#64748b" font-family="Cairo,sans-serif">غ</text>
+          <line id="$PFX$needle" x1="26" y1="26" x2="26" y2="8"
+                stroke="#38bdf8" stroke-width="2" stroke-linecap="round"
+                style="transform-origin:26px 26px;transform:rotate(180deg);
+                       transition:transform .35s cubic-bezier(.34,1.56,.64,1)"/>
+          <circle cx="26" cy="26" r="2.5" fill="#38bdf8"/>
+        </svg>
+        <input type="range" id="$PFX$orient-slider" min="0" max="360" value="180" style="--pct:50%"/>
+      </div>
+      <button id="$PFX$auto-btn"
+              style="margin-top:9px;width:100%;background:rgba(56,189,248,.07);
+                     border:1px solid rgba(56,189,248,.18);border-radius:9px;padding:6px;
+                     font-size:10.5px;color:#38bdf8;cursor:pointer;font-family:'Cairo',sans-serif;
+                     display:flex;align-items:center;justify-content:center;gap:5px;
+                     transition:background .2s;"
+              onmouseover="this.style.background='rgba(56,189,248,.14)'"
+              onmouseout="this.style.background='rgba(56,189,248,.07)'">
+        🎯 اكتشاف الاتجاه تلقائياً
+      </button>
+    </div>
 
-function setConn(state, label) {
-  const map = {
-    checking: ['checking', 'conn-checking'],
-    waking:   ['waking',   'conn-waking'],
-    online:   ['online',   'conn-online'],
-    offline:  ['offline',  'conn-offline'],
-  };
-  CONN.dot.className  = `conn-dot ${map[state][0]}`;
-  CONN.el.className   = `conn-badge ${map[state][1]}`;
-  CONN.text.textContent = label;
-}
+    <!-- Beach type -->
+    <div class="glass-card" style="padding:13px;">
+      <div class="slabel" style="margin-bottom:9px;">🪨 نوع القاع</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;">
+        <label>
+          <input type="radio" name="bt_$PFX$" value="sandy" class="hidden" checked/>
+          <div class="r-card on" data-g="bt_$PFX$"><div style="font-size:18px;">🏖️</div><div style="font-weight:700;font-size:11px;color:#fff;margin-top:3px;">رملي</div><div style="font-size:9px;color:#475569;margin-top:1px;">بوري · مربو</div></div>
+        </label>
+        <label>
+          <input type="radio" name="bt_$PFX$" value="rocky" class="hidden"/>
+          <div class="r-card" data-g="bt_$PFX$"><div style="font-size:18px;">🪨</div><div style="font-weight:700;font-size:11px;color:#fff;margin-top:3px;">صخري</div><div style="font-size:9px;color:#475569;margin-top:1px;">سرق · لوب</div></div>
+        </label>
+      </div>
+    </div>
 
-async function pingServer(showWaking = false) {
-  setConn('checking', 'جاري الفحص...');
-  try {
-    const ctrl = new AbortController();
-    const t    = setTimeout(() => ctrl.abort(), 5000);
-    const res  = await fetch(`${API_BASE}/health`, {
-      signal: ctrl.signal,
-      cache:  'no-store',
-    });
-    clearTimeout(t);
-    if (res.ok) {
-      serverAlive = true;
-      setConn('online', 'الخادم متصل ✓');
-      return true;
-    }
-    throw new Error(`HTTP ${res.status}`);
-  } catch (e) {
-    if (e.name === 'AbortError' || e.message.includes('fetch')) {
-      if (showWaking) {
-        setConn('waking', 'تنبيه الخادم...');
-        // Try once more after 8s (Render cold start ~8-15s)
-        await new Promise(r => setTimeout(r, 8000));
-        return pingServer(false);
-      }
-      setConn('offline', 'الخادم غير متاح');
-      return false;
-    }
-    setConn('offline', 'فشل الاتصال');
-    return false;
-  }
-}
+    <!-- Date -->
+    <div class="glass-card" style="padding:13px;">
+      <div class="slabel" style="margin-bottom:9px;">📅 اليوم المستهدف</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
+        <label><input type="radio" name="td_$PFX$" value="today" class="hidden" checked/>
+          <div class="r-card on" data-g="td_$PFX$" style="text-align:center;padding:8px 4px;"><div style="font-size:17px;">☀️</div><div style="font-weight:700;font-size:10.5px;color:#fff;margin-top:3px;">اليوم</div></div></label>
+        <label><input type="radio" name="td_$PFX$" value="tomorrow" class="hidden"/>
+          <div class="r-card" data-g="td_$PFX$" style="text-align:center;padding:8px 4px;"><div style="font-size:17px;">🌅</div><div style="font-weight:700;font-size:10.5px;color:#fff;margin-top:3px;">غداً</div></div></label>
+        <label><input type="radio" name="td_$PFX$" value="day_after" class="hidden"/>
+          <div class="r-card" data-g="td_$PFX$" style="text-align:center;padding:8px 4px;"><div style="font-size:17px;">🌙</div><div style="font-weight:700;font-size:10.5px;color:#fff;margin-top:3px;">بعد غد</div></div></label>
+      </div>
+    </div>
 
-// Initial ping on load
-pingServer(true);
+    <button id="$PFX$scan-btn" class="scan-btn-style">
+      <span style="font-size:18px;">🔭</span>
+      <span>مسح الموقع وتحليله</span>
+    </button>
 
-// Re-ping every 45 seconds
-setInterval(() => pingServer(false), 45000);
+    <div id="$PFX$err" style="display:none;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.22);
+         border-radius:11px;padding:11px;font-size:11px;color:#fca5a5;line-height:1.75;"></div>
 
-// ============================================================
-// RADIO BUTTONS — Custom Styling
-// ============================================================
-document.querySelectorAll('input[type="radio"]').forEach(radio => {
-  radio.addEventListener('change', () => {
-    const name = radio.name;
-    document.querySelectorAll(`input[name="${name}"]`).forEach(r => {
-      r.closest('label').querySelector('.r-card').classList.remove('active');
-    });
-    radio.closest('label').querySelector('.r-card').classList.add('active');
-  });
-});
-
-// ============================================================
-// LOADING OVERLAY
-// ============================================================
-const STEPS = [
-  'جاري تحديد الموقع...',
-  'جلب بيانات Open-Meteo Marine...',
-  'جلب بيانات الطقس والضغط...',
-  'تشغيل محرك الفيزياء...',
-  'حساب قوة الأمواج والتيارات...',
-  'تحليل الاحتمالية البيولوجية...',
-  'إرسال البيانات إلى Gemini AI...',
-  'توليد التقرير التكتيكي...',
-  'تجميع النتائج النهائية...',
-];
-let stepTimer = null, stepIdx = 0;
-
-function showLoading(firstStep = 0) {
-  const ov = document.getElementById('loading-overlay');
-  stepIdx = firstStep;
-  document.getElementById('load-step').textContent = STEPS[stepIdx];
-  ov.classList.add('active');
-  document.getElementById('scan-btn').disabled = true;
-  stepTimer = setInterval(() => {
-    stepIdx = (stepIdx + 1) % STEPS.length;
-    document.getElementById('load-step').textContent = STEPS[stepIdx];
-  }, 2000);
-}
-
-function hideLoading() {
-  clearInterval(stepTimer);
-  const ov = document.getElementById('loading-overlay');
-  ov.classList.remove('active');
-  document.getElementById('scan-btn').disabled = false;
-}
-
-// ============================================================
-// ERROR DISPLAY
-// ============================================================
-function showErr(html) {
-  const el = document.getElementById('err-box');
-  el.innerHTML = html;
-  el.style.display = 'block';
-}
-function clearErr() {
-  document.getElementById('err-box').style.display = 'none';
-}
-
-// ============================================================
-// RENDERING — Flag Banner
-// ============================================================
-function renderBanner(a) {
-  const red    = a.flagged_hours?.RED?.length    || 0;
-  const green  = a.flagged_hours?.GREEN?.length  || 0;
-  const yellow = a.flagged_hours?.YELLOW?.length || 0;
-  const banner = document.getElementById('flag-banner');
-
-  let cls, ico, ttl, sub;
-  if (red > 0) {
-    cls = 'flag-red';   ico = '🔴'; ttl = `${red} ساعة خطرة`;
-    sub = 'قوة أمواج أو رياح أو ضغط يتجاوز الحدود الآمنة';
-  } else if (green > 0) {
-    cls = 'flag-green'; ico = '🟢'; ttl = `${green} نافذة صيد مثالية`;
-    sub = 'الأمواج والرياح في النطاق الأمثل للصيد';
-  } else {
-    cls = 'flag-yellow';ico = '🟡'; ttl = 'ظروف متوسطة';
-    sub = 'لا مخاطر حرجة — الظروف مقبولة بحذر';
-  }
-  if (a.cold_front_detected) sub += ' | ❄️ موجة برد مرصودة';
-  if (a.weed_risk_active)    sub += ' | 🌿 خطر أعشاب بحرية';
-
-  banner.className = cls;
-  banner.style.borderRadius = '14px';
-  banner.style.padding = '12px 14px';
-  document.getElementById('flag-ico').textContent = ico;
-  document.getElementById('flag-ttl').textContent = ttl;
-  document.getElementById('flag-sub').textContent = sub;
-  document.getElementById('flag-cnts').innerHTML  = `
-    <span class="badge-green mono" style="border-radius:8px;padding:2px 8px;font-size:10px;">🟢 ${green}</span>
-    <span class="badge-yellow mono" style="border-radius:8px;padding:2px 8px;font-size:10px;">🟡 ${yellow}</span>
-    <span class="badge-red mono" style="border-radius:8px;padding:2px 8px;font-size:10px;">🔴 ${red}</span>
+    <!-- RESULTS -->
+    <div id="$PFX$results" style="display:none;flex-direction:column;gap:11px;" class="fade-up">
+      <div class="slabel">📊 نتائج التحليل</div>
+      <div id="$PFX$flag"></div>
+      <div id="$PFX$metrics" style="display:grid;grid-template-columns:1fr 1fr;gap:7px;"></div>
+      <div class="glass-card" style="padding:11px;display:flex;align-items:center;gap:9px;">
+        <span style="font-size:20px;">⚓</span>
+        <div>
+          <div style="font-size:9px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.07em;">توصية الرصاصة</div>
+          <div id="$PFX$sinker" style="font-weight:700;font-size:11.5px;color:#e2e8f0;margin-top:2px;line-height:1.5;"></div>
+        </div>
+      </div>
+      <div class="slabel">🎣 الأنواع المتوقعة</div>
+      <div id="$PFX$species" style="display:flex;flex-direction:column;gap:7px;"></div>
+      <button id="$PFX$show-modal"
+              style="width:100%;background:linear-gradient(135deg,rgba(124,58,237,.8),rgba(14,165,233,.8));
+                     border:1px solid rgba(124,58,237,.35);border-radius:11px;padding:11px;
+                     color:#fff;font-weight:800;font-size:11.5px;cursor:pointer;font-family:'Cairo',sans-serif;
+                     display:flex;align-items:center;justify-content:center;gap:7px;
+                     box-shadow:0 4px 18px rgba(124,58,237,.18);transition:opacity .2s,transform .2s;"
+              onmouseover="this.style.opacity='.85';this.style.transform='translateY(-1px)'"
+              onmouseout="this.style.opacity='1';this.style.transform='none'">
+        🤖 التقرير التكتيكي الكامل — Gemini AI
+      </button>
+    </div>
   `;
 }
 
-// ============================================================
-// RENDERING — Metric Cards
-// ============================================================
-function renderMetrics(a) {
+// Render controls into both sidebar and sheet
+function buildControls(containerId, pfx) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = controlsHTML().replace(/\$PFX\$/g, pfx);
+
+  // Add scan button styling (can't use class in template easily)
+  const sb = el.querySelector(`#${pfx}scan-btn`);
+  if (sb) {
+    sb.style.cssText = `
+      width:100%;padding:13px;border:none;cursor:pointer;border-radius:13px;
+      font-weight:900;font-size:.88rem;color:white;font-family:'Cairo',sans-serif;
+      display:flex;align-items:center;justify-content:center;gap:8px;
+      background:linear-gradient(135deg,#0369a1,#0ea5e9,#38bdf8);
+      background-size:200% 200%;box-shadow:0 4px 18px rgba(14,165,233,.35);
+      transition:transform .2s,box-shadow .2s,opacity .2s;animation:gradMove 4s ease infinite;
+    `;
+  }
+
+  // Slider binding
+  const slider = el.querySelector(`#${pfx}orient-slider`);
+  slider.addEventListener('input', function() {
+    const d = parseInt(this.value);
+    this.style.setProperty('--pct', `${(d/360)*100}%`);
+    el.querySelector(`#${pfx}orient-val`).textContent = `${d}°`;
+    el.querySelector(`#${pfx}needle`).style.transform = `rotate(${d}deg)`;
+    el.querySelector(`#${pfx}orient-status`).textContent = '✏️ يدوي';
+    el.querySelector(`#${pfx}orient-status`).style.color = '#fbbf24';
+    // sync other panel
+    syncOrient(d, pfx);
+  });
+
+  // Radio buttons
+  el.querySelectorAll('input[type="radio"]').forEach(r => {
+    r.addEventListener('change', () => {
+      const g = r.name;
+      el.querySelectorAll(`input[name="${g}"]`).forEach(x => {
+        x.closest('label').querySelector('.r-card').classList.remove('on');
+      });
+      r.closest('label').querySelector('.r-card').classList.add('on');
+      syncRadios(pfx);
+    });
+  });
+
+  // Scan btn
+  el.querySelector(`#${pfx}scan-btn`).addEventListener('click', () => doScan(pfx));
+
+  // Auto-orient
+  el.querySelector(`#${pfx}auto-btn`).addEventListener('click', () => autoOrient(lat, lng));
+
+  // Show modal
+  el.addEventListener('click', e => {
+    if (e.target.closest(`#${pfx}show-modal`)) openModal();
+  });
+}
+
+buildControls('sidebar-scroll', 's_');
+buildControls('sheet-scroll',   'm_');
+
+// ─────────────────────────────────────────
+// SYNC BETWEEN PANELS
+// ─────────────────────────────────────────
+function syncOrient(deg, fromPfx) {
+  ['s_','m_'].forEach(pfx => {
+    if (pfx === fromPfx) return;
+    const el     = pfx === 's_' ? document.getElementById('sidebar-scroll') : document.getElementById('sheet-scroll');
+    const slider = el.querySelector(`#${pfx}orient-slider`);
+    const needle = el.querySelector(`#${pfx}needle`);
+    const valEl  = el.querySelector(`#${pfx}orient-val`);
+    if (!slider) return;
+    slider.value = deg;
+    slider.style.setProperty('--pct', `${(deg/360)*100}%`);
+    needle.style.transform = `rotate(${deg}deg)`;
+    valEl.textContent = `${deg}°`;
+  });
+}
+
+function syncRadios(fromPfx) {
+  const fromEl = fromPfx === 's_'
+    ? document.getElementById('sidebar-scroll')
+    : document.getElementById('sheet-scroll');
+  const bt = fromEl.querySelector(`input[name="bt_${fromPfx}"]:checked`)?.value;
+  const td = fromEl.querySelector(`input[name="td_${fromPfx}"]:checked`)?.value;
+
+  ['s_','m_'].forEach(pfx => {
+    if (pfx === fromPfx) return;
+    const el = pfx === 's_' ? document.getElementById('sidebar-scroll') : document.getElementById('sheet-scroll');
+    [['bt_', bt], ['td_', td]].forEach(([pre, val]) => {
+      if (!val) return;
+      el.querySelectorAll(`input[name="${pre}${pfx}"]`).forEach(r => {
+        r.closest('label').querySelector('.r-card').classList.remove('on');
+        if (r.value === val) {
+          r.checked = true;
+          r.closest('label').querySelector('.r-card').classList.add('on');
+        }
+      });
+    });
+  });
+}
+
+// Read values from active panel (sidebar on desktop, sheet on mobile)
+function getVals() {
+  const isMobile = window.innerWidth < 768;
+  const pfx = isMobile ? 'm_' : 's_';
+  const el  = isMobile
+    ? document.getElementById('sheet-scroll')
+    : document.getElementById('sidebar-scroll');
+  return {
+    pfx,
+    orient:     parseInt(el.querySelector(`#${pfx}orient-slider`).value),
+    beach_type: el.querySelector(`input[name="bt_${pfx}"]:checked`)?.value || 'sandy',
+    target_date:el.querySelector(`input[name="td_${pfx}"]:checked`)?.value || 'today',
+  };
+}
+
+// ─────────────────────────────────────────
+// AUTO ORIENT (elevation API)
+// ─────────────────────────────────────────
+const PROBE_D = 0.012;
+const ANGLES  = [0,22.5,45,67.5,90,112.5,135,157.5,180,202.5,225,247.5,270,292.5,315,337.5];
+const D2R = Math.PI/180, R2D = 180/Math.PI;
+
+function probe(la, ln, a) {
+  const r = a*D2R;
+  return {
+    lat: la + PROBE_D*Math.cos(r),
+    lng: ln + PROBE_D*Math.sin(r)/Math.cos(la*D2R),
+  };
+}
+
+function setOrientStatus(st, txt) {
+  const colMap = { scanning:'#38bdf8', done:'#4ade80', fail:'#fbbf24' };
+  ['s_','m_'].forEach(pfx => {
+    const el = pfx === 's_'
+      ? document.getElementById('sidebar-scroll')
+      : document.getElementById('sheet-scroll');
+    const s = el.querySelector(`#${pfx}orient-status`);
+    if (s) { s.textContent = txt; s.style.color = colMap[st] || '#fbbf24'; }
+  });
+}
+
+function applyOrient(deg) {
+  ['s_','m_'].forEach(pfx => {
+    const el = pfx === 's_'
+      ? document.getElementById('sidebar-scroll')
+      : document.getElementById('sheet-scroll');
+    const slider = el.querySelector(`#${pfx}orient-slider`);
+    const needle = el.querySelector(`#${pfx}needle`);
+    const valEl  = el.querySelector(`#${pfx}orient-val`);
+    if (!slider) return;
+    slider.value = deg;
+    slider.style.setProperty('--pct', `${(deg/360)*100}%`);
+    needle.style.transform = `rotate(${deg}deg)`;
+    valEl.textContent = `${deg}°`;
+  });
+}
+
+async function autoOrient(la, ln) {
+  setOrientStatus('scanning', '🔄 يكتشف...');
+  const pts  = ANGLES.map(a => probe(la, ln, a));
+  const lats = pts.map(p => p.lat.toFixed(6)).join(',');
+  const lngs = pts.map(p => p.lng.toFixed(6)).join(',');
+  try {
+    const r = await fetch(
+      `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lngs}`,
+      { signal: AbortSignal.timeout(7000) }
+    );
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    const elevs = data.elevation;
+    const seaA  = ANGLES.filter((_,i) => elevs[i] <= 2.0);
+    if (seaA.length === 0 || seaA.length === ANGLES.length) {
+      setOrientStatus('fail','⚠️ يدوي'); return;
+    }
+    let sinS=0, cosS=0;
+    seaA.forEach(a => { sinS += Math.sin(a*D2R); cosS += Math.cos(a*D2R); });
+    let mean = Math.atan2(sinS, cosS)*R2D;
+    if (mean < 0) mean += 360;
+    applyOrient(Math.round(mean));
+    setOrientStatus('done','✓ تلقائي');
+  } catch {
+    setOrientStatus('fail','⚠️ يدوي');
+  }
+}
+
+autoOrient(lat, lng);
+
+// ─────────────────────────────────────────
+// CONNECTION STATUS
+// ─────────────────────────────────────────
+function setConn(state) {
+  const map2 = {
+    check: ['dot-check','txt-check','فحص...'],
+    wake:  ['dot-wake', 'txt-wake', 'تنبيه الخادم...'],
+    on:    ['dot-on',   'txt-on',   'متصل ✓'],
+    off:   ['dot-off',  'txt-off',  'غير متاح'],
+  };
+  const [dc, tc, txt] = map2[state] || map2.off;
+  ['conn-dot','mob-conn-dot'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.className = `conn-dot ${dc}`;
+  });
+  ['conn-txt','mob-conn-txt'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.className = `mono ${tc}`; el.textContent = txt; }
+  });
+}
+
+async function pingServer() {
+  setConn('check');
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch(`${API_BASE}/health`, { signal: ctrl.signal, cache:'no-store' });
+    clearTimeout(t);
+    if (r.ok) { serverAlive = true; setConn('on'); return true; }
+    throw new Error();
+  } catch {
+    setConn('off'); serverAlive = false; return false;
+  }
+}
+
+pingServer();
+setInterval(pingServer, 50000);
+
+// ─────────────────────────────────────────
+// LOADING OVERLAY
+// ─────────────────────────────────────────
+const STEPS = [
+  'تنبيه الخادم من السبات...',
+  'جلب بيانات Open-Meteo Marine...',
+  'جلب بيانات الطقس والضغط...',
+  'تشغيل محرك الفيزياء...',
+  'حساب قوة الأمواج...',
+  'تحليل الاحتمالية البيولوجية...',
+  'إرسال البيانات إلى Gemini AI...',
+  'توليد التقرير التكتيكي...',
+];
+let stepTimer=null, stepIdx=0;
+
+function showLoad(s=0) {
+  stepIdx = s;
+  document.getElementById('load-step').textContent = STEPS[s];
+  document.getElementById('load-overlay').classList.add('on');
+  stepTimer = setInterval(() => {
+    stepIdx = (stepIdx+1) % STEPS.length;
+    document.getElementById('load-step').textContent = STEPS[stepIdx];
+  }, 2000);
+}
+function hideLoad() {
+  clearInterval(stepTimer);
+  document.getElementById('load-overlay').classList.remove('on');
+}
+
+// ─────────────────────────────────────────
+// RENDERING
+// ─────────────────────────────────────────
+const SPECIES_AR = {
+  'European Sea Bass (Loup / Bar)':'سمك اللوب / البار 🐟',
+  'Large White Seabream (Grand Sarg)':'السرق الكبير 🐠',
+  'White Seabream (Sarg)':'السرق 🐠',
+  'Gilthead Seabream (Daurade Royale)':'الدوراد الملكي 🐡',
+  'Striped Seabream (Marbré)':'المربو 🐟',
+  'Flathead Mullet (Bouri) / Striped Seabream (Marbré)':'البوري / المربو 🐟',
+  'Opportunistic Mixed Bag (Bogue, Mullet, Sarg)':'بوكا · بوري · سرق 🎣',
+};
+const PROB_AR  = {'HIGH':'عالٍ جداً','MEDIUM-HIGH':'عالٍ','MEDIUM':'متوسط','LOW-MEDIUM':'منخفض-متوسط'};
+const PROB_CLS = {'HIGH':'b-green','MEDIUM-HIGH':'b-green','MEDIUM':'b-yellow','LOW-MEDIUM':''};
+
+function renderAll(data, pfx) {
+  const a = data.analytics;
+  const el = pfx === 's_'
+    ? document.getElementById('sidebar-scroll')
+    : document.getElementById('sheet-scroll');
+
+  // Flag banner
+  const red   = a.flagged_hours?.RED?.length    || 0;
+  const green = a.flagged_hours?.GREEN?.length  || 0;
+  const yel   = a.flagged_hours?.YELLOW?.length || 0;
+  let cls, ico, ttl, sub;
+  if (red>0)   { cls='f-red';   ico='🔴'; ttl=`${red} ساعة خطرة`;         sub='قوة أمواج أو رياح تتجاوز الحدود الآمنة'; }
+  else if (green>0){ cls='f-green';ico='🟢'; ttl=`${green} نافذة مثالية`; sub='الأمواج والرياح في النطاق الأمثل للصيد'; }
+  else         { cls='f-yellow';ico='🟡'; ttl='ظروف متوسطة';             sub='لا مخاطر حرجة — تصرف بحذر'; }
+  if (a.cold_front_detected) sub += ' | ❄️ موجة برد';
+  if (a.weed_risk_active)    sub += ' | 🌿 خطر أعشاب';
+
+  el.querySelector(`#${pfx}flag`).innerHTML = `
+    <div class="${cls}">
+      <div style="display:flex;align-items:center;gap:7px;margin-bottom:5px;">
+        <span style="font-size:17px;">${ico}</span>
+        <span style="font-weight:800;font-size:12.5px;">${ttl}</span>
+      </div>
+      <div style="font-size:10.5px;color:rgba(203,213,225,.7);line-height:1.6;">${sub}</div>
+      <div style="display:flex;gap:5px;margin-top:7px;flex-wrap:wrap;">
+        <span class="b-green mono">🟢 ${green}</span>
+        <span class="b-yellow mono">🟡 ${yel}</span>
+        <span class="b-red mono">🔴 ${red}</span>
+      </div>
+    </div>`;
+
+  // Metrics
   const b = a.past_48h_baseline;
-  const windAr = b.dominant_wind_type === 'Onshore'  ? 'بحري 🌊' :
-                 b.dominant_wind_type === 'Offshore' ? 'بري 💨'  : 'جانبي ↔️';
-  const items = [
-    {
-      ico:'🌊', lbl:'أقصى قوة موج',
-      val:`${a.max_wave_power_today}`,  unit:'kW/m',
-      sub: a.max_wave_power_today > 3.0 ? '⚠️ يتجاوز الحد الآمن' : '✓ ضمن الحدود',
-      col: a.max_wave_power_today > 3.0 ? '#f87171' : '#4ade80',
-    },
-    {
-      ico:'💨', lbl:'ريح (48 ساعة)',
-      val: windAr, unit:'',
-      sub:`${b.sustained_wind_hours}h قوية (>15 عقدة)`,
-      col: b.dominant_wind_type === 'Onshore' ? '#fbbf24' : '#38bdf8',
-    },
-    {
-      ico:'🌡️', lbl:'متوسط الحرارة',
-      val:`${a.avg_temp_today}`, unit:'°م',
-      sub: a.avg_temp_today < 16 ? 'مياه باردة 🐟' : 'مياه دافئة 🐠',
-      col:'#e2e8f0',
-    },
-    {
-      ico:'🌀', lbl:'موج (48h)',
-      val:`${b.avg_swell_height_48h}`, unit:'م',
+  const windAr = b.dominant_wind_type==='Onshore'?'بحري 🌊':b.dominant_wind_type==='Offshore'?'بري 💨':'جانبي ↔️';
+  el.querySelector(`#${pfx}metrics`).innerHTML = [
+    { ico:'🌊',lbl:'أقصى قوة موج',    val:`${a.max_wave_power_today}`,   unit:'kW/m',
+      sub: a.max_wave_power_today>3?'⚠️ يتجاوز الحد':'✓ ضمن الحدود',
+      col: a.max_wave_power_today>3?'#f87171':'#4ade80' },
+    { ico:'💨',lbl:'ريح (48h)',         val:windAr,                         unit:'',
+      sub:`${b.sustained_wind_hours}h >15 عقدة`,
+      col: b.dominant_wind_type==='Onshore'?'#fbbf24':'#38bdf8' },
+    { ico:'🌡️',lbl:'حرارة متوسط',     val:`${a.avg_temp_today}`,          unit:'°م',
+      sub: a.avg_temp_today<16?'مياه باردة':'مياه دافئة', col:'#e2e8f0' },
+    { ico:'🌀',lbl:'موج (48h)',          val:`${b.avg_swell_height_48h}`,    unit:'م',
       sub:`دورة: ${b.avg_wave_period_48h}ث`,
-      col: a.weed_risk_active ? '#fbbf24' : '#e2e8f0',
-    },
-  ];
-  document.getElementById('metrics-grid').innerHTML = items.map(m => `
-    <div class="metric-card">
-      <div style="display:flex;align-items:center;gap:5px;margin-bottom:6px;">
-        <span style="font-size:14px;">${m.ico}</span>
-        <span style="font-size:9px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:0.07em;line-height:1.2;">${m.lbl}</span>
+      col: a.weed_risk_active?'#fbbf24':'#e2e8f0' },
+  ].map(m=>`
+    <div class="m-card">
+      <div style="display:flex;align-items:center;gap:4px;margin-bottom:5px;">
+        <span style="font-size:13px;">${m.ico}</span>
+        <span style="font-size:8.5px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.06em;line-height:1.2;">${m.lbl}</span>
       </div>
-      <div class="mono" style="font-size:18px;font-weight:900;color:${m.col};line-height:1;">
-        ${m.val}<span style="font-size:11px;opacity:0.7;margin-right:2px;">${m.unit}</span>
+      <div class="mono" style="font-size:17px;font-weight:900;color:${m.col};line-height:1;">
+        ${m.val}<span style="font-size:10px;opacity:.7;margin-right:1px;">${m.unit}</span>
       </div>
-      <div style="font-size:10px;color:#475569;margin-top:4px;">${m.sub}</div>
+      <div style="font-size:9.5px;color:#475569;margin-top:3px;">${m.sub}</div>
     </div>
   `).join('');
-}
 
-// ============================================================
-// RENDERING — Species
-// ============================================================
-const SPECIES_AR = {
-  'European Sea Bass (Loup / Bar)':               'سمك اللوب / البار 🐟',
-  'Large White Seabream (Grand Sarg)':             'السرق الكبير 🐠',
-  'White Seabream (Sarg)':                         'السرق 🐠',
-  'Gilthead Seabream (Daurade Royale)':            'الدوراد الملكي 🐡',
-  'Striped Seabream (Marbré)':                     'المربو 🐟',
-  'Flathead Mullet (Bouri) / Striped Seabream (Marbré)': 'البوري / المربو 🐟',
-  'Opportunistic Mixed Bag (Bogue, Mullet, Sarg)': 'بوكا · بوري · سرق 🎣',
-};
-const PROB_AR = {
-  'HIGH':'عالٍ جداً','MEDIUM-HIGH':'عالٍ','MEDIUM':'متوسط','LOW-MEDIUM':'منخفض-متوسط',
-};
-const PROB_CLS = {
-  'HIGH':'badge-green','MEDIUM-HIGH':'badge-green',
-  'MEDIUM':'badge-yellow','LOW-MEDIUM':'',
-};
+  // Sinker
+  el.querySelector(`#${pfx}sinker`).textContent = a.sinker_recommendation;
 
-function renderSpecies(preds) {
-  document.getElementById('species-list').innerHTML = preds.map(sp => {
-    const key  = Object.keys(PROB_AR).find(k => sp.probability.startsWith(k)) || 'LOW-MEDIUM';
-    const name = SPECIES_AR[sp.species] || sp.species;
+  // Species
+  el.querySelector(`#${pfx}species`).innerHTML = a.species_predictions.map(sp => {
+    const key  = Object.keys(PROB_AR).find(k=>sp.probability.startsWith(k))||'LOW-MEDIUM';
+    const name = SPECIES_AR[sp.species]||sp.species;
     return `
-    <div class="glass-card" style="padding:11px 13px;">
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px;margin-bottom:5px;">
-        <span style="font-weight:700;font-size:12px;color:#e2e8f0;line-height:1.3;">${name}</span>
-        <span class="${PROB_CLS[key]} mono" style="font-size:9px;border-radius:6px;padding:2px 7px;flex-shrink:0;white-space:nowrap;">${PROB_AR[key]}</span>
+    <div class="glass-card" style="padding:10px 12px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:5px;margin-bottom:4px;">
+        <span style="font-weight:700;font-size:11.5px;color:#e2e8f0;line-height:1.3;">${name}</span>
+        <span class="${PROB_CLS[key]} mono" style="font-size:9px;border-radius:6px;padding:2px 6px;flex-shrink:0;">${PROB_AR[key]}</span>
       </div>
-      <p style="font-size:11px;color:#64748b;line-height:1.55;margin-bottom:5px;">${sp.trigger}</p>
-      <p class="mono" style="font-size:10px;color:rgba(56,189,248,0.75);">🪱 ${sp.bait}</p>
+      <p style="font-size:10.5px;color:#64748b;line-height:1.55;margin-bottom:4px;">${sp.trigger}</p>
+      <p class="mono" style="font-size:9.5px;color:rgba(56,189,248,.75);">🪱 ${sp.bait}</p>
     </div>`;
   }).join('');
+
+  // AI report
+  document.getElementById('ai-out').innerHTML = md2html(data.ai_report);
+  document.getElementById('tok-cnt').textContent = `~${data.context_tokens_approx} رمز`;
+
+  // Show results
+  const rw = el.querySelector(`#${pfx}results`);
+  rw.style.display = 'flex';
 }
 
-// ============================================================
-// MARKDOWN → HTML
-// ============================================================
 function md2html(t) {
   return t
     .replace(/^## (.+)$/gm,    '<h2>$1</h2>')
-    .replace(/^### (.+)$/gm,   '<h2 style="font-size:.88rem">$1</h2>')
+    .replace(/^### (.+)$/gm,   '<h2 style="font-size:.87rem">$1</h2>')
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g,     '<em>$1</em>')
     .replace(/^[\-\*] (.+)$/gm,'<li>$1</li>')
-    .replace(/(<li>[\s\S]*?<\/li>)/g, m => `<ul>${m}</ul>`)
+    .replace(/(<li>[\s\S]*?<\/li>)/g, m=>`<ul>${m}</ul>`)
     .split('\n\n')
-    .map(p => {
-      if (!p.trim() || p.startsWith('<h') || p.startsWith('<ul')) return p;
-      return `<p>${p.replace(/\n/g,'<br>')}</p>`;
-    }).join('');
+    .map(p=>{ if(!p.trim()||p.startsWith('<h')||p.startsWith('<ul'))return p; return `<p>${p.replace(/\n/g,'<br>')}</p>`; })
+    .join('');
 }
 
-// ============================================================
-// MAP MARKER
-// ============================================================
+// ─────────────────────────────────────────
+// ERROR DISPLAY
+// ─────────────────────────────────────────
+function showErr(pfx, html) {
+  const el = pfx === 's_'
+    ? document.getElementById('sidebar-scroll')
+    : document.getElementById('sheet-scroll');
+  const eb = el.querySelector(`#${pfx}err`);
+  if (eb) { eb.innerHTML = html; eb.style.display = 'block'; }
+}
+function clearErr(pfx) {
+  const el = pfx === 's_'
+    ? document.getElementById('sidebar-scroll')
+    : document.getElementById('sheet-scroll');
+  const eb = el.querySelector(`#${pfx}err`);
+  if (eb) eb.style.display = 'none';
+}
+
+// ─────────────────────────────────────────
+// MAIN SCAN
+// ─────────────────────────────────────────
 let marker = null;
-function placeMarker(lat, lng) {
-  if (marker) map.removeLayer(marker);
-  marker = L.marker([lat, lng], {
-    icon: L.divIcon({
-      className:'',
-      html:`<div style="width:14px;height:14px;background:#38bdf8;border:2.5px solid #030b18;
-            border-radius:50%;box-shadow:0 0 10px rgba(56,189,248,0.9),0 0 22px rgba(56,189,248,0.4);"></div>`,
-      iconAnchor:[7,7],
-    })
-  }).addTo(map);
-}
 
-// ============================================================
-// MAIN SCAN BUTTON
-// ============================================================
-document.getElementById('scan-btn').addEventListener('click', async () => {
-  clearErr();
+async function doScan(pfx) {
+  const { orient, beach_type, target_date } = getVals();
+  clearErr(pfx);
+
+  // Disable both scan buttons
+  document.querySelectorAll('[id$="scan-btn"]').forEach(b => b.disabled = true);
 
   // Wake server if needed
   if (!serverAlive) {
-    showLoading(0);
-    setConn('waking', 'تنبيه الخادم...');
-    document.getElementById('load-step').textContent = 'تنبيه الخادم من السبات...';
-    const ok = await pingServer(true);
+    showLoad(0);
+    setConn('wake');
+    const ok = await pingServer();
     if (!ok) {
-      hideLoading();
-      showErr(`
-        ❌ <strong>تعذّر الاتصال بالخادم</strong><br>
-        <span style="color:#94a3b8;">• تأكد أن رابط <code style="background:rgba(56,189,248,0.1);padding:1px 5px;border-radius:4px;">API_BASE</code> صحيح في كود الموقع</span><br>
-        <span style="color:#94a3b8;">• الخادم على Render قد يحتاج 30–60 ثانية للاستيقاظ — حاول مجدداً</span><br>
-        <span style="color:#94a3b8;">• تحقق من الاتصال بالإنترنت</span>
+      hideLoad();
+      document.querySelectorAll('[id$="scan-btn"]').forEach(b => b.disabled = false);
+      showErr(pfx, `
+        📡 <strong>تعذّر الاتصال بالخادم</strong><br>
+        <span style="color:#94a3b8;font-size:10.5px;">
+          • تأكد من صحة <code style="background:rgba(56,189,248,.1);padding:1px 4px;border-radius:3px;">API_BASE</code> في الكود<br>
+          • خدمة Render تحتاج 30–60 ثانية للاستيقاظ — انتظر وأعد المحاولة<br>
+          • تحقق من اتصالك بالإنترنت
+        </span>
       `);
       return;
     }
   } else {
-    showLoading(1);
+    showLoad(1);
   }
 
   const payload = {
-    latitude:          currentLat,
-    longitude:         currentLng,
-    beach_orientation: parseInt(document.getElementById('orient-slider').value),
-    beach_type:        document.querySelector("input[name='beach_type']:checked").value,
-    target_date:       document.querySelector("input[name='target_date']:checked").value,
+    latitude: lat, longitude: lng,
+    beach_orientation: orient,
+    beach_type, target_date,
   };
 
   try {
     const ctrl = new AbortController();
-    const t    = setTimeout(() => ctrl.abort(), 90000); // 90s timeout
+    const t = setTimeout(() => ctrl.abort(), 90000);
 
-    const res  = await fetch(`${API_BASE}/analyze`, {
+    const res = await fetch(`${API_BASE}/analyze`, {
       method:  'POST',
       headers: { 'Content-Type':'application/json', 'Accept':'application/json' },
       body:    JSON.stringify(payload),
@@ -1269,83 +1318,73 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
     clearTimeout(t);
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      const code = res.status;
-      let msg = err.detail || `خطأ ${code} من الخادم`;
-      if (code === 502) msg = '⚠️ Open-Meteo لم يستجب — حاول بعد لحظة';
-      if (code === 500) msg = '⚠️ خطأ داخلي — تحقق من GEMINI_API_KEY في Render Dashboard';
-      if (code === 422) msg = '⚠️ بيانات غير صحيحة — تحقق من الإحداثيات';
+      const err = await res.json().catch(()=>({}));
+      let msg = err.detail || `خطأ ${res.status}`;
+      if (res.status===502) msg = '⚠️ Open-Meteo لم يستجب — حاول بعد لحظة';
+      if (res.status===500) msg = '⚠️ خطأ داخلي — تحقق من GEMINI_API_KEY في Render';
+      if (res.status===422) msg = '⚠️ إحداثيات غير صحيحة';
       throw new Error(msg);
     }
 
     const data = await res.json();
-    const a    = data.analytics;
+    renderAll(data, pfx);
 
-    // Render everything
-    renderBanner(a);
-    renderMetrics(a);
-    document.getElementById('sinker-txt').textContent = a.sinker_recommendation;
-    renderSpecies(a.species_predictions);
+    // Place marker
+    if (marker) map.removeLayer(marker);
+    marker = L.marker([lat, lng], {
+      icon: L.divIcon({
+        className:'',
+        html:`<div style="width:13px;height:13px;background:#38bdf8;border:2.5px solid #030b18;
+              border-radius:50%;box-shadow:0 0 10px rgba(56,189,248,.9),0 0 22px rgba(56,189,248,.4);"></div>`,
+        iconAnchor:[6.5,6.5],
+      })
+    }).addTo(map);
 
-    // AI Report
-    lastReport = data.ai_report;
-    document.getElementById('ai-content').innerHTML   = md2html(data.ai_report);
-    document.getElementById('tok-count').textContent  = `~${data.context_tokens_approx} رمز`;
-
-    // Show results
-    const rw = document.getElementById('results-wrap');
-    rw.style.display = 'flex';
-    rw.classList.add('fade-up');
-
-    // Place map marker
-    placeMarker(currentLat, currentLng);
-
-    // Update server status
     serverAlive = true;
-    setConn('online', 'الخادم متصل ✓');
+    setConn('on');
+
+    // Auto-open sheet on mobile after results
+    if (window.innerWidth < 768) {
+      sheetOpen = true;
+      sheet.classList.add('expanded');
+    }
 
   } catch(e) {
     let html = '';
     if (e.name === 'AbortError') {
-      html = `⏱️ <strong>انتهت مهلة الطلب</strong><br>
-              <span style="color:#94a3b8;">الخادم يعالج البيانات — انتظر 30 ثانية وحاول مجدداً.</span>`;
-    } else if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError') || e.message.includes('fetch')) {
+      html = `⏱️ <strong>انتهت مهلة الطلب</strong><br><span style="color:#94a3b8;">انتظر 30 ثانية وأعد المحاولة.</span>`;
+    } else if (/fetch|network|failed/i.test(e.message)) {
       serverAlive = false;
-      setConn('offline', 'انقطع الاتصال');
-      html = `📡 <strong>فشل الاتصال بالخادم</strong><br>
-              <span style="color:#94a3b8;">• تأكد من صحة رابط <code style="background:rgba(56,189,248,0.1);padding:1px 5px;border-radius:4px;">API_BASE</code><br>
-              • خدمة Render قد تكون في السبات — انتظر دقيقة وأعد المحاولة<br>
-              • تحقق من اتصالك بالإنترنت</span>`;
+      setConn('off');
+      html = `📡 <strong>انقطع الاتصال بالخادم</strong><br>
+              <span style="color:#94a3b8;font-size:10.5px;">
+                • تأكد من صحة <code style="background:rgba(56,189,248,.1);padding:1px 4px;border-radius:3px;">API_BASE</code><br>
+                • خدمة Render قد تكون في السبات<br>
+                • تحقق من اتصالك بالإنترنت
+              </span>`;
     } else {
       html = `⚠️ ${e.message}`;
     }
-    showErr(html);
+    showErr(pfx, html);
   } finally {
-    hideLoading();
+    hideLoad();
+    document.querySelectorAll('[id$="scan-btn"]').forEach(b => b.disabled = false);
   }
-});
-
-// ============================================================
-// MODAL
-// ============================================================
-document.getElementById('show-modal-btn').addEventListener('click', () => {
-  document.getElementById('report-modal').classList.add('active');
-});
-document.getElementById('close-modal-btn').addEventListener('click', closeModal);
-document.getElementById('report-modal').addEventListener('click', e => {
-  if (e.target === e.currentTarget) closeModal();
-});
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
-function closeModal() {
-  document.getElementById('report-modal').classList.remove('active');
 }
 
-// Copy report
+// ─────────────────────────────────────────
+// MODAL
+// ─────────────────────────────────────────
+function openModal()  { document.getElementById('modal').classList.add('on'); }
+function closeModal() { document.getElementById('modal').classList.remove('on'); }
+document.getElementById('close-modal').addEventListener('click', closeModal);
+document.getElementById('modal').addEventListener('click', e => { if(e.target===e.currentTarget) closeModal(); });
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
 document.getElementById('copy-btn').addEventListener('click', () => {
-  navigator.clipboard.writeText(document.getElementById('ai-content').innerText).then(() => {
-    const b = document.getElementById('copy-btn');
-    b.textContent = '✅ تم النسخ!';
-    setTimeout(() => { b.textContent = '📋 نسخ'; }, 2500);
+  navigator.clipboard.writeText(document.getElementById('ai-out').innerText).then(()=>{
+    const b=document.getElementById('copy-btn');
+    b.textContent='✅ تم النسخ!';
+    setTimeout(()=>b.textContent='📋 نسخ', 2500);
   });
 });
 </script>
