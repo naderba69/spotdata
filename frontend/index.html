@@ -1,739 +1,1013 @@
 <!DOCTYPE html>
-<html lang="en" class="scroll-smooth">
+<html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SurfCast Analytics — AI Powered Marine Forecast</title>
+  <title>صياد المحيط — تحليل ذكي لصيد السيرف</title>
+
+  <!-- Tailwind -->
   <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Leaflet Map -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Arabic Font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+
   <script>
     tailwind.config = {
       theme: {
         extend: {
           colors: {
-            ocean:  { 900: '#0a1628', 800: '#0d2137', 700: '#102a47', 600: '#1a3a5c' },
-            wave:   { 400: '#38bdf8', 500: '#0ea5e9', 600: '#0284c7' },
-            foam:   { 100: '#f0f9ff', 200: '#e0f2fe' },
-            danger: { 500: '#ef4444', 600: '#dc2626' },
-            caution:{ 500: '#f59e0b', 600: '#d97706' },
-            safe:   { 500: '#22c55e', 600: '#16a34a'  },
-          },
-          fontFamily: {
-            mono: ['"JetBrains Mono"', '"Fira Code"', 'monospace'],
-          },
-          animation: {
-            'wave-pulse': 'wavePulse 2.5s ease-in-out infinite',
-            'fade-in-up': 'fadeInUp 0.6s ease-out forwards',
-          },
-          keyframes: {
-            wavePulse: {
-              '0%, 100%': { opacity: '0.6', transform: 'scaleX(1)' },
-              '50%':       { opacity: '1',   transform: 'scaleX(1.05)' },
-            },
-            fadeInUp: {
-              '0%':   { opacity: '0', transform: 'translateY(24px)' },
-              '100%': { opacity: '1', transform: 'translateY(0)' },
-            },
+            ocean:  { 950:'#060d1a', 900:'#0a1628', 800:'#0d2137', 700:'#102a47', 600:'#1a3a5c' },
+            wave:   { 300:'#7dd3fc', 400:'#38bdf8', 500:'#0ea5e9', 600:'#0284c7' },
+            danger: { 400:'#f87171', 500:'#ef4444' },
+            caution:{ 400:'#fbbf24', 500:'#f59e0b' },
+            safe:   { 400:'#4ade80', 500:'#22c55e' },
           },
         }
       }
     }
   </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet" />
-  <style>
-    body { font-family: 'Inter', sans-serif; }
 
-    /* ---- Loading Overlay ---- */
+  <style>
+    * { font-family: 'Cairo', sans-serif; }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+    body { background-color: #060d1a; }
+
+    /* ===== خريطة Leaflet ===== */
+    #map {
+      height: 100%;
+      width: 100%;
+      border-radius: 0;
+      z-index: 1;
+    }
+
+    /* ===== المنظار الثابت في المنتصف ===== */
+    #crosshair {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 1000;
+      pointer-events: none;
+      width: 60px;
+      height: 60px;
+    }
+    #crosshair::before,
+    #crosshair::after {
+      content: '';
+      position: absolute;
+      background: #38bdf8;
+      border-radius: 2px;
+    }
+    /* الخط الأفقي */
+    #crosshair::before {
+      width: 100%;
+      height: 2px;
+      top: 50%;
+      left: 0;
+      transform: translateY(-50%);
+      box-shadow: 0 0 8px rgba(56,189,248,0.8);
+    }
+    /* الخط العمودي */
+    #crosshair::after {
+      width: 2px;
+      height: 100%;
+      left: 50%;
+      top: 0;
+      transform: translateX(-50%);
+      box-shadow: 0 0 8px rgba(56,189,248,0.8);
+    }
+    /* النقطة المركزية */
+    #crosshair-dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 8px;
+      height: 8px;
+      background: #38bdf8;
+      border-radius: 50%;
+      border: 2px solid #0a1628;
+      box-shadow: 0 0 12px rgba(56,189,248,1);
+      animation: dotPulse 2s ease-in-out infinite;
+    }
+    /* دوائر النبض حول المنظار */
+    #crosshair-ring {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 24px;
+      height: 24px;
+      border: 1.5px solid rgba(56,189,248,0.5);
+      border-radius: 50%;
+      animation: ringPulse 2s ease-in-out infinite;
+    }
+
+    @keyframes dotPulse {
+      0%,100% { box-shadow: 0 0 8px rgba(56,189,248,0.8); }
+      50%      { box-shadow: 0 0 20px rgba(56,189,248,1), 0 0 40px rgba(56,189,248,0.4); }
+    }
+    @keyframes ringPulse {
+      0%,100% { transform: translate(-50%,-50%) scale(1); opacity:0.6; }
+      50%      { transform: translate(-50%,-50%) scale(1.4); opacity:0.2; }
+    }
+
+    /* ===== بطاقة التحكم الجانبية ===== */
+    #control-panel {
+      scrollbar-width: thin;
+      scrollbar-color: #1a3a5c #060d1a;
+    }
+    #control-panel::-webkit-scrollbar { width: 4px; }
+    #control-panel::-webkit-scrollbar-track { background: #060d1a; }
+    #control-panel::-webkit-scrollbar-thumb { background: #1a3a5c; border-radius: 4px; }
+
+    /* ===== Loading Overlay ===== */
     #loading-overlay {
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-      transition: opacity 0.3s ease;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      transition: opacity 0.4s ease;
     }
     .spinner {
-      width: 56px; height: 56px;
-      border: 4px solid rgba(56, 189, 248, 0.2);
+      width: 52px; height: 52px;
+      border: 3px solid rgba(56,189,248,0.15);
       border-top-color: #38bdf8;
       border-radius: 50%;
-      animation: spin 0.9s linear infinite;
+      animation: spin 0.8s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ---- Slider Styling ---- */
+    /* ===== Slider ===== */
     input[type="range"] {
       -webkit-appearance: none;
       appearance: none;
-      height: 6px;
+      height: 5px;
       border-radius: 99px;
-      background: linear-gradient(to right, #0ea5e9 0%, #0ea5e9 var(--pct,50%), #1a3a5c var(--pct,50%), #1a3a5c 100%);
+      background: linear-gradient(to left, #0ea5e9 0%, #0ea5e9 var(--pct,50%), #1a3a5c var(--pct,50%), #1a3a5c 100%);
       outline: none;
+      direction: ltr;
     }
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none;
-      width: 20px; height: 20px;
+      width: 18px; height: 18px;
       border-radius: 50%;
       background: #38bdf8;
       cursor: pointer;
-      border: 3px solid #0d2137;
-      box-shadow: 0 0 0 3px rgba(56,189,248,0.3);
-    }
-    input[type="range"]::-moz-range-thumb {
-      width: 20px; height: 20px;
-      border-radius: 50%;
-      background: #38bdf8;
-      cursor: pointer;
-      border: 3px solid #0d2137;
+      border: 2.5px solid #0a1628;
+      box-shadow: 0 0 0 3px rgba(56,189,248,0.25);
     }
 
-    /* ---- Compass Preview ---- */
-    .compass-needle {
-      transform-origin: bottom center;
-      transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-    }
-
-    /* ---- Markdown-like AI Output ---- */
+    /* ===== AI Report Markdown ===== */
     .ai-content h2 {
-      font-size: 1.1rem;
+      font-size: 1rem;
       font-weight: 700;
       color: #38bdf8;
-      margin: 1.5rem 0 0.5rem;
-      padding-bottom: 0.25rem;
+      margin: 1.4rem 0 0.6rem;
+      padding-bottom: 0.3rem;
       border-bottom: 1px solid rgba(56,189,248,0.2);
     }
-    .ai-content p   { margin: 0.5rem 0; line-height: 1.7; color: #cbd5e1; }
-    .ai-content ul  { list-style: disc; padding-left: 1.25rem; margin: 0.5rem 0; }
-    .ai-content li  { margin: 0.25rem 0; color: #94a3b8; line-height: 1.6; }
+    .ai-content p   { margin: 0.5rem 0; line-height: 1.9; color: #cbd5e1; font-size:0.875rem; }
+    .ai-content ul  { list-style: disc; padding-right: 1.25rem; margin: 0.5rem 0; }
+    .ai-content li  { margin: 0.3rem 0; color: #94a3b8; font-size:0.875rem; line-height:1.7; }
     .ai-content strong { color: #f1f5f9; }
 
-    /* ---- Scrollbar ---- */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #0a1628; }
-    ::-webkit-scrollbar-thumb { background: #1a3a5c; border-radius: 3px; }
-
-    /* ---- Flag Badge Pulse ---- */
-    .badge-red    { animation: redPulse 2s ease-in-out infinite; }
-    @keyframes redPulse {
-      0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
-      50%      { box-shadow: 0 0 0 8px rgba(239,68,68,0); }
+    /* ===== Animations ===== */
+    @keyframes fadeInUp {
+      from { opacity:0; transform:translateY(20px); }
+      to   { opacity:1; transform:translateY(0); }
     }
+    .fade-in-up { animation: fadeInUp 0.5s ease-out forwards; }
+
+    /* ===== زر المسح (Scan Button) ===== */
+    #scan-btn {
+      background: linear-gradient(135deg, #0ea5e9, #0284c7);
+      transition: all 0.3s ease;
+      position: relative;
+      overflow: hidden;
+    }
+    #scan-btn::before {
+      content: '';
+      position: absolute;
+      top: -2px; left: -2px; right: -2px; bottom: -2px;
+      background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+      border-radius: inherit;
+      z-index: -1;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    #scan-btn:hover::before { opacity: 1; }
+    #scan-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(14,165,233,0.4); }
+    #scan-btn:active { transform: translateY(0); }
+
+    /* ===== Leaflet overrides ===== */
+    .leaflet-control-zoom a {
+      background-color: #0d2137 !important;
+      color: #38bdf8 !important;
+      border-color: #1a3a5c !important;
+    }
+    .leaflet-control-zoom a:hover {
+      background-color: #102a47 !important;
+    }
+    .leaflet-control-attribution {
+      background: rgba(10,22,40,0.8) !important;
+      color: #475569 !important;
+    }
+    .leaflet-control-attribution a { color: #38bdf8 !important; }
   </style>
 </head>
 
-<body class="bg-ocean-900 text-slate-200 min-h-screen">
+<body class="bg-ocean-950 text-slate-200 h-screen flex flex-col overflow-hidden">
 
 <!-- =========================================================
-     LOADING OVERLAY (covers cold-start latency from Render)
+     LOADING OVERLAY
 ========================================================= -->
 <div id="loading-overlay"
-     class="hidden fixed inset-0 z-50 bg-ocean-900/90 flex flex-col items-center justify-center gap-6">
-  <div class="spinner"></div>
-  <div class="text-center">
-    <p class="text-wave-400 font-semibold text-lg tracking-wide">Analyzing Marine Conditions</p>
-    <p class="text-slate-500 text-sm mt-1">Fetching Open-Meteo data · Running physics engine · Synthesizing with Gemini AI</p>
-    <div class="mt-4 flex gap-2 justify-center">
-      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0s"></span>
-      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.15s"></span>
-      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.3s"></span>
+     class="hidden fixed inset-0 z-[9999] bg-ocean-950/90 flex flex-col items-center justify-center gap-5">
+  <div class="relative">
+    <div class="spinner"></div>
+    <div class="absolute inset-0 flex items-center justify-center">
+      <span class="text-xl">🎣</span>
     </div>
+  </div>
+  <div class="text-center space-y-1">
+    <p class="text-wave-400 font-bold text-lg" id="loading-step">جاري تحليل الموقع...</p>
+    <p class="text-slate-500 text-xs">جلب بيانات Open-Meteo · حسابات الفيزياء · تحليل Gemini AI</p>
+  </div>
+  <div class="flex gap-1.5 mt-2">
+    <span class="w-1.5 h-1.5 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0s"></span>
+    <span class="w-1.5 h-1.5 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.15s"></span>
+    <span class="w-1.5 h-1.5 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.3s"></span>
   </div>
 </div>
 
 <!-- =========================================================
      HEADER
 ========================================================= -->
-<header class="border-b border-ocean-600/50 bg-ocean-800/80 backdrop-blur-md sticky top-0 z-40">
-  <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+<header class="flex-shrink-0 bg-ocean-900/95 backdrop-blur-md border-b border-ocean-600/40 z-50 px-4 py-3">
+  <div class="flex items-center justify-between max-w-full">
+
+    <!-- Logo -->
     <div class="flex items-center gap-3">
-      <div class="w-9 h-9 bg-wave-500 rounded-lg flex items-center justify-center text-xl shadow-lg shadow-wave-500/30">
+      <div class="w-9 h-9 bg-wave-500 rounded-xl flex items-center justify-center shadow-lg shadow-wave-500/30 text-xl">
         🎣
       </div>
       <div>
-        <h1 class="text-base font-bold text-white leading-none">SurfCast Analytics</h1>
-        <p class="text-xs text-wave-400 mt-0.5 font-mono">Physics · Marine · AI</p>
+        <h1 class="text-base font-black text-white leading-none">صيّاد المحيط</h1>
+        <p class="text-xs text-wave-400 font-mono mt-0.5">SurfCast Analytics · AI Marine Intelligence</p>
       </div>
     </div>
-    <div class="hidden sm:flex items-center gap-2 text-xs text-slate-500 font-mono bg-ocean-700/50 px-3 py-1.5 rounded-full border border-ocean-600/50">
-      <span class="w-1.5 h-1.5 bg-safe-500 rounded-full animate-pulse"></span>
-      Open-Meteo · Gemini 1.5 Flash
+
+    <!-- Status -->
+    <div class="hidden sm:flex items-center gap-4">
+      <!-- Coordinates Display -->
+      <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl px-4 py-2 font-mono text-xs">
+        <span class="text-slate-500">خط العرض: </span>
+        <span id="header-lat" class="text-wave-400 font-bold">---.----</span>
+        <span class="text-slate-600 mx-2">|</span>
+        <span class="text-slate-500">خط الطول: </span>
+        <span id="header-lng" class="text-wave-400 font-bold">---.----</span>
+      </div>
+      <div class="flex items-center gap-2 text-xs text-slate-500 font-mono bg-ocean-800/50 px-3 py-2 rounded-xl border border-ocean-600/40">
+        <span class="w-1.5 h-1.5 bg-safe-500 rounded-full animate-pulse"></span>
+        Open-Meteo · Gemini 1.5 Flash
+      </div>
     </div>
+
   </div>
 </header>
 
 <!-- =========================================================
-     MAIN LAYOUT
+     MAIN LAYOUT (خريطة + لوحة تحكم)
 ========================================================= -->
-<main class="max-w-5xl mx-auto px-4 py-8 space-y-8">
+<div class="flex-1 flex overflow-hidden">
 
-  <!-- Hero -->
-  <div class="text-center py-6 animate-fade-in-up" style="animation-delay:0.1s">
-    <h2 class="text-3xl sm:text-4xl font-black text-white leading-tight">
-      High-Precision <span class="text-wave-400">Surfcasting</span> Intelligence
-    </h2>
-    <p class="text-slate-400 mt-3 max-w-2xl mx-auto text-sm sm:text-base leading-relaxed">
-      Enter your spot's coordinates and parameters. The physics engine calculates wave tension, 
-      wind classifications, and biological probabilities — Gemini synthesizes it into a tactical report.
-    </p>
-  </div>
+  <!-- ===== الخريطة (الجزء الأكبر) ===== -->
+  <div class="flex-1 relative">
 
-  <!-- =========================================================
-       INPUT FORM CARD
-  ========================================================= -->
-  <div class="bg-ocean-800 rounded-2xl border border-ocean-600/50 shadow-2xl overflow-hidden animate-fade-in-up"
-       style="animation-delay:0.2s">
-    <div class="bg-gradient-to-r from-wave-600/20 to-transparent px-6 py-4 border-b border-ocean-600/50">
-      <h3 class="font-bold text-wave-400 flex items-center gap-2 text-sm uppercase tracking-widest">
-        <span>⚙️</span> Location & Conditions Input
-      </h3>
+    <!-- خريطة Leaflet -->
+    <div id="map"></div>
+
+    <!-- المنظار الثابت -->
+    <div id="crosshair">
+      <div id="crosshair-ring"></div>
+      <div id="crosshair-dot"></div>
     </div>
 
-    <form id="analysis-form" class="p-6 space-y-6">
-
-      <!-- Row 1: Coordinates -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div class="space-y-2">
-          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-            <span>🌐</span> Latitude
-          </label>
-          <input type="number" id="latitude" step="0.0001" placeholder="e.g. 35.8897"
-                 required
-                 class="w-full bg-ocean-700 border border-ocean-600 rounded-xl px-4 py-3 text-white
-                        placeholder-slate-500 font-mono text-sm focus:outline-none focus:border-wave-500
-                        focus:ring-2 focus:ring-wave-500/20 transition-all" />
+    <!-- بطاقة الإحداثيات المتحركة (داخل الخريطة - يسار أسفل) -->
+    <div class="absolute bottom-4 right-4 z-[500] bg-ocean-900/95 backdrop-blur-md
+                border border-ocean-600/50 rounded-2xl px-4 py-3 shadow-xl min-w-[200px]">
+      <p class="text-xs text-slate-500 mb-1.5 text-center">📍 الموقع المحدد</p>
+      <div class="font-mono text-sm space-y-1">
+        <div class="flex justify-between gap-4">
+          <span class="text-slate-400">خط العرض</span>
+          <span id="coord-lat" class="text-wave-400 font-bold">---.------</span>
         </div>
-        <div class="space-y-2">
-          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-            <span>🌐</span> Longitude
-          </label>
-          <input type="number" id="longitude" step="0.0001" placeholder="e.g. 14.5125"
-                 required
-                 class="w-full bg-ocean-700 border border-ocean-600 rounded-xl px-4 py-3 text-white
-                        placeholder-slate-500 font-mono text-sm focus:outline-none focus:border-wave-500
-                        focus:ring-2 focus:ring-wave-500/20 transition-all" />
+        <div class="flex justify-between gap-4">
+          <span class="text-slate-400">خط الطول</span>
+          <span id="coord-lng" class="text-wave-400 font-bold">---.------</span>
         </div>
       </div>
+      <div class="mt-2 pt-2 border-t border-ocean-600/40 text-center">
+        <p class="text-xs text-slate-500">حرّك الخريطة لتحديد الموقع</p>
+      </div>
+    </div>
 
-      <!-- Row 2: Beach Orientation Slider + Compass -->
-      <div class="space-y-3">
-        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-          <span>🧭</span> Beach Facing Orientation
+    <!-- تلميح الاستخدام (يختفي بعد أول تحريك) -->
+    <div id="usage-hint"
+         class="absolute top-4 left-1/2 -translate-x-1/2 z-[500]
+                bg-ocean-900/90 backdrop-blur-md border border-wave-500/30
+                rounded-2xl px-5 py-3 text-center shadow-xl transition-opacity duration-500">
+      <p class="text-sm text-wave-400 font-bold">🗺️ حرّك الخريطة لتحديد موقع الصيد</p>
+      <p class="text-xs text-slate-500 mt-0.5">ضع المنظار على الشاطئ ثم اضغط "مسح الموقع"</p>
+    </div>
+
+  </div>
+
+  <!-- ===== لوحة التحكم (يمين) ===== -->
+  <div id="control-panel"
+       class="w-80 bg-ocean-900 border-r border-ocean-600/40 flex flex-col overflow-y-auto z-40">
+
+    <!-- ===== قسم الإعدادات ===== -->
+    <div class="p-4 space-y-4 border-b border-ocean-700/50">
+
+      <h2 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2">
+        <span>⚙️</span> إعدادات الموقع
+      </h2>
+
+      <!-- اتجاه الشاطئ -->
+      <div class="space-y-2">
+        <label class="text-xs font-semibold text-slate-400 flex items-center justify-between">
+          <span class="flex items-center gap-1.5">🧭 اتجاه الشاطئ (الدرجات)</span>
           <span id="orientation-display"
-                class="ml-auto bg-ocean-700 border border-ocean-600 text-wave-400 font-mono text-sm
-                       px-3 py-0.5 rounded-lg">
-            180°
-          </span>
+                class="bg-ocean-700 border border-ocean-600 text-wave-400 font-mono text-xs
+                       px-2.5 py-0.5 rounded-lg">180°</span>
         </label>
 
-        <!-- Compass Visual -->
-        <div class="flex items-center gap-6">
-          <svg id="compass-svg" viewBox="0 0 80 80" class="w-16 h-16 flex-shrink-0">
-            <circle cx="40" cy="40" r="38" fill="#102a47" stroke="#1a3a5c" stroke-width="2"/>
-            <text x="40" y="11" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">N</text>
-            <text x="40" y="74" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">S</text>
-            <text x="72" y="44" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">E</text>
-            <text x="8"  y="44" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">W</text>
-            <!-- Needle -->
+        <!-- Compass Mini -->
+        <div class="flex items-center gap-3">
+          <svg viewBox="0 0 64 64" class="w-12 h-12 flex-shrink-0">
+            <circle cx="32" cy="32" r="30" fill="#102a47" stroke="#1a3a5c" stroke-width="1.5"/>
+            <text x="32" y="9"  text-anchor="middle" font-size="7" fill="#94a3b8" font-family="Cairo,sans-serif">ش</text>
+            <text x="32" y="60" text-anchor="middle" font-size="7" fill="#94a3b8" font-family="Cairo,sans-serif">ج</text>
+            <text x="58" y="36" text-anchor="middle" font-size="7" fill="#94a3b8" font-family="Cairo,sans-serif">ش</text>
+            <text x="6"  y="36" text-anchor="middle" font-size="7" fill="#94a3b8" font-family="Cairo,sans-serif">غ</text>
             <line id="compass-needle"
-                  x1="40" y1="40" x2="40" y2="12"
-                  stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"
-                  style="transform-origin: 40px 40px; transform: rotate(180deg); transition: transform 0.4s cubic-bezier(0.34,1.56,0.64,1)"/>
-            <circle cx="40" cy="40" r="4" fill="#38bdf8"/>
+                  x1="32" y1="32" x2="32" y2="10"
+                  stroke="#38bdf8" stroke-width="2" stroke-linecap="round"
+                  style="transform-origin:32px 32px; transform:rotate(180deg); transition:transform 0.3s cubic-bezier(0.34,1.56,0.64,1)"/>
+            <circle cx="32" cy="32" r="3" fill="#38bdf8"/>
           </svg>
-
           <input type="range" id="beach_orientation" min="0" max="360" value="180"
-                 class="w-full" style="--pct: 50%" />
+                 class="w-full" style="--pct:50%" />
         </div>
-        <p class="text-xs text-slate-500">Drag to set the compass bearing your beach faces (the direction waves arrive from).</p>
       </div>
 
-      <!-- Row 3: Beach Type -->
-      <div class="space-y-3">
-        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-          <span>🪨</span> Beach Bottom Type
+      <!-- نوع القاع -->
+      <div class="space-y-2">
+        <label class="text-xs font-semibold text-slate-400 flex items-center gap-1.5">
+          🪨 نوع القاع
         </label>
-        <div class="grid grid-cols-2 gap-3">
-          <label class="beach-type-option cursor-pointer">
+        <div class="grid grid-cols-2 gap-2">
+          <label class="cursor-pointer">
             <input type="radio" name="beach_type" value="sandy" class="hidden" checked />
-            <div class="beach-type-card flex items-center gap-3 bg-ocean-700 border-2 border-wave-500
-                        rounded-xl px-4 py-3 transition-all duration-200">
-              <span class="text-2xl">🏖️</span>
+            <div class="beach-card flex items-center gap-2 bg-ocean-800 border-2 border-wave-500
+                        rounded-xl px-3 py-2.5 transition-all duration-200">
+              <span class="text-xl">🏖️</span>
               <div>
-                <p class="font-semibold text-sm text-white">Sandy</p>
-                <p class="text-xs text-slate-400">Flat surf, mullet, Marbré</p>
+                <p class="font-bold text-xs text-white">رملي</p>
+                <p class="text-xs text-slate-500 leading-tight">بوري / مربو</p>
               </div>
             </div>
           </label>
-          <label class="beach-type-option cursor-pointer">
+          <label class="cursor-pointer">
             <input type="radio" name="beach_type" value="rocky" class="hidden" />
-            <div class="beach-type-card flex items-center gap-3 bg-ocean-700 border-2 border-ocean-600
-                        rounded-xl px-4 py-3 transition-all duration-200 hover:border-ocean-500">
-              <span class="text-2xl">🪨</span>
+            <div class="beach-card flex items-center gap-2 bg-ocean-800 border-2 border-ocean-600
+                        rounded-xl px-3 py-2.5 transition-all duration-200 hover:border-ocean-500">
+              <span class="text-xl">🪨</span>
               <div>
-                <p class="font-semibold text-sm text-white">Rocky</p>
-                <p class="text-xs text-slate-400">Structure, Sarg, Bass</p>
+                <p class="font-bold text-xs text-white">صخري</p>
+                <p class="text-xs text-slate-500 leading-tight">سرق / لوب</p>
               </div>
             </div>
           </label>
         </div>
       </div>
 
-      <!-- Row 4: Target Date -->
-      <div class="space-y-3">
-        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-          <span>📅</span> Target Date
+      <!-- التاريخ المستهدف -->
+      <div class="space-y-2">
+        <label class="text-xs font-semibold text-slate-400 flex items-center gap-1.5">
+          📅 اليوم المستهدف
         </label>
-        <div class="grid grid-cols-3 gap-3">
-          <label class="date-option cursor-pointer">
+        <div class="grid grid-cols-3 gap-1.5">
+          <label class="cursor-pointer">
             <input type="radio" name="target_date" value="today" class="hidden" checked />
-            <div class="date-card text-center bg-ocean-700 border-2 border-wave-500 rounded-xl
-                        px-3 py-3 transition-all duration-200">
-              <p class="text-xl">☀️</p>
-              <p class="text-sm font-semibold text-white">Today</p>
+            <div class="date-card text-center bg-ocean-800 border-2 border-wave-500
+                        rounded-xl py-2.5 transition-all duration-200">
+              <p class="text-base">☀️</p>
+              <p class="text-xs font-bold text-white mt-0.5">اليوم</p>
             </div>
           </label>
-          <label class="date-option cursor-pointer">
+          <label class="cursor-pointer">
             <input type="radio" name="target_date" value="tomorrow" class="hidden" />
-            <div class="date-card text-center bg-ocean-700 border-2 border-ocean-600 rounded-xl
-                        px-3 py-3 transition-all duration-200 hover:border-ocean-500">
-              <p class="text-xl">🌅</p>
-              <p class="text-sm font-semibold text-white">Tomorrow</p>
+            <div class="date-card text-center bg-ocean-800 border-2 border-ocean-600
+                        rounded-xl py-2.5 transition-all duration-200 hover:border-ocean-500">
+              <p class="text-base">🌅</p>
+              <p class="text-xs font-bold text-white mt-0.5">غداً</p>
             </div>
           </label>
-          <label class="date-option cursor-pointer">
+          <label class="cursor-pointer">
             <input type="radio" name="target_date" value="day_after" class="hidden" />
-            <div class="date-card text-center bg-ocean-700 border-2 border-ocean-600 rounded-xl
-                        px-3 py-3 transition-all duration-200 hover:border-ocean-500">
-              <p class="text-xl">🌙</p>
-              <p class="text-sm font-semibold text-white">Day After</p>
+            <div class="date-card text-center bg-ocean-800 border-2 border-ocean-600
+                        rounded-xl py-2.5 transition-all duration-200 hover:border-ocean-500">
+              <p class="text-base">🌙</p>
+              <p class="text-xs font-bold text-white mt-0.5">بعد غد</p>
             </div>
           </label>
         </div>
       </div>
 
-      <!-- Submit -->
-      <button type="submit" id="submit-btn"
-              class="w-full bg-gradient-to-r from-wave-600 to-wave-500 hover:from-wave-500 hover:to-wave-400
-                     text-white font-bold py-4 rounded-xl text-sm uppercase tracking-widest shadow-lg
-                     shadow-wave-500/30 transition-all duration-300 hover:shadow-wave-500/50
-                     hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-3
-                     disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100">
-        <span class="text-xl">🌊</span>
-        <span>Generate Tactical Report</span>
-        <span class="text-wave-200 text-xs font-normal font-mono">(Gemini AI)</span>
+      <!-- زر المسح الرئيسي -->
+      <button id="scan-btn"
+              class="w-full text-white font-black py-4 rounded-2xl text-sm shadow-lg
+                     flex items-center justify-center gap-2.5 disabled:opacity-40
+                     disabled:cursor-not-allowed">
+        <span class="text-xl">🔭</span>
+        <span>مسح الموقع وتحليله</span>
       </button>
 
-      <!-- Error display -->
+      <!-- رسالة الخطأ -->
       <div id="error-banner"
-           class="hidden bg-danger-500/10 border border-danger-500/40 text-danger-400
-                  rounded-xl px-4 py-3 text-sm font-mono">
+           class="hidden bg-danger-500/10 border border-danger-500/30 text-danger-400
+                  rounded-xl px-3 py-2.5 text-xs leading-relaxed">
       </div>
 
-    </form>
-  </div>
+    </div>
 
-  <!-- =========================================================
-       ANALYTICS CARDS (raw metrics, pre-Gemini)
-  ========================================================= -->
-  <div id="analytics-section" class="hidden space-y-4 animate-fade-in-up">
+    <!-- ===== قسم النتائج ===== -->
+    <div id="results-area" class="hidden flex-1 p-4 space-y-4 fade-in-up">
 
-    <h3 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2">
-      <span>⚡</span> Physics Engine Output
-    </h3>
-
-    <!-- Safety Flag Banner -->
-    <div id="flag-banner" class="rounded-xl px-5 py-4 flex items-center justify-between border-2">
-      <div class="flex items-center gap-3">
-        <span id="flag-icon" class="text-2xl"></span>
-        <div>
+      <!-- بانر الحالة العامة -->
+      <div id="flag-banner" class="rounded-xl p-3 border-2">
+        <div class="flex items-center gap-2 mb-2">
+          <span id="flag-icon" class="text-xl"></span>
           <p id="flag-title" class="font-bold text-sm"></p>
-          <p id="flag-subtitle" class="text-xs opacity-75 mt-0.5"></p>
+        </div>
+        <p id="flag-subtitle" class="text-xs opacity-70 leading-relaxed"></p>
+        <div id="flag-counts" class="flex gap-1.5 mt-2"></div>
+      </div>
+
+      <!-- بطاقات المقاييس -->
+      <div class="grid grid-cols-2 gap-2" id="metric-cards"></div>
+
+      <!-- توصية الرصاصة -->
+      <div class="bg-ocean-800 border border-ocean-600/40 rounded-xl p-3 flex items-center gap-3">
+        <span class="text-xl">⚓</span>
+        <div>
+          <p class="text-xs text-slate-400 mb-0.5">توصية وزن الرصاصة</p>
+          <p id="sinker-text" class="text-white font-bold text-xs leading-relaxed"></p>
         </div>
       </div>
-      <div id="flag-counts" class="flex gap-2"></div>
+
+      <!-- الأنواع المتوقعة -->
+      <div id="species-section" class="space-y-2"></div>
+
+      <!-- زر فتح تقرير Gemini -->
+      <button id="show-report-btn"
+              class="w-full bg-gradient-to-r from-purple-600 to-wave-600 text-white
+                     font-bold py-3 rounded-xl text-xs flex items-center justify-center
+                     gap-2 hover:opacity-90 transition-opacity shadow-lg">
+        <span>🤖</span>
+        <span>عرض التقرير التكتيكي الكامل (Gemini AI)</span>
+      </button>
+
     </div>
-
-    <!-- Metric Cards Grid -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3" id="metric-cards"></div>
-
-    <!-- Sinker Recommendation -->
-    <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl px-5 py-4
-                flex items-center gap-4">
-      <span class="text-2xl">⚓</span>
-      <div>
-        <p class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Lead Sinker Recommendation</p>
-        <p id="sinker-text" class="text-white font-bold mt-1 text-sm"></p>
-      </div>
-    </div>
-
-    <!-- Species Prediction Pills -->
-    <div id="species-section" class="space-y-2"></div>
 
   </div>
+</div>
 
-  <!-- =========================================================
-       GEMINI AI REPORT CARD
-  ========================================================= -->
-  <div id="ai-report-section" class="hidden animate-fade-in-up">
+<!-- =========================================================
+     MODAL — تقرير Gemini AI الكامل
+========================================================= -->
+<div id="report-modal"
+     class="hidden fixed inset-0 z-[9998] bg-ocean-950/95 backdrop-blur-md
+            flex items-stretch justify-center overflow-hidden">
 
-    <h3 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2 mb-4">
-      <span>🤖</span> Gemini AI Tactical Report
-      <span class="ml-auto text-wave-400 font-mono text-xs" id="token-audit"></span>
-    </h3>
+  <div class="w-full max-w-3xl flex flex-col bg-ocean-900 border-r border-l border-ocean-600/40 shadow-2xl">
 
-    <div class="bg-ocean-800 border border-ocean-600/50 rounded-2xl overflow-hidden shadow-2xl">
-      <div class="bg-gradient-to-r from-wave-600/15 to-transparent px-6 py-4 border-b border-ocean-600/50
-                  flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <div class="w-2 h-2 rounded-full bg-safe-500 animate-pulse"></div>
-          <span class="text-xs font-mono text-slate-400">Gemini 1.5 Flash · Surfcasting Master Mode</span>
+    <!-- Modal Header -->
+    <div class="flex-shrink-0 bg-ocean-800 border-b border-ocean-600/40 px-6 py-4
+                flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 bg-purple-600 rounded-lg flex items-center justify-center text-sm shadow-lg">🤖</div>
+        <div>
+          <p class="font-bold text-sm text-white">التقرير التكتيكي الكامل</p>
+          <p class="text-xs text-slate-400 font-mono mt-0.5">Gemini 1.5 Flash · خبير صيد السيرف</p>
         </div>
-        <button id="copy-btn"
-                class="text-xs text-slate-500 hover:text-wave-400 transition-colors flex items-center gap-1.5
-                       font-mono border border-ocean-600/50 rounded-lg px-3 py-1.5 hover:border-wave-500/50">
-          📋 Copy Report
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="modal-token-count" class="text-xs text-slate-500 font-mono bg-ocean-700 px-3 py-1 rounded-lg"></span>
+        <button id="copy-report-btn"
+                class="text-xs text-slate-400 hover:text-wave-400 transition-colors
+                       font-mono border border-ocean-600/50 rounded-lg px-3 py-1.5
+                       hover:border-wave-500/40 flex items-center gap-1.5">
+          📋 نسخ
+        </button>
+        <button id="close-modal-btn"
+                class="w-8 h-8 flex items-center justify-center rounded-lg
+                       bg-ocean-700 hover:bg-danger-500/20 text-slate-400
+                       hover:text-danger-400 transition-all text-lg">
+          ×
         </button>
       </div>
-      <div id="ai-report-content" class="ai-content px-6 py-6 text-sm leading-relaxed"></div>
     </div>
+
+    <!-- Modal Content -->
+    <div class="flex-1 overflow-y-auto px-6 py-6">
+      <div id="ai-report-content" class="ai-content text-sm leading-relaxed"></div>
+    </div>
+
   </div>
-
-</main>
-
-<!-- =========================================================
-     FOOTER
-========================================================= -->
-<footer class="mt-16 border-t border-ocean-700/50 text-center py-6 text-xs text-slate-600 font-mono">
-  SurfCast Analytics · Powered by Open-Meteo + Gemini AI · Physics-grade accuracy
-</footer>
+</div>
 
 
 <!-- =========================================================
-     JAVASCRIPT — APPLICATION LOGIC
+     JAVASCRIPT
 ========================================================= -->
 <script>
-  // ---------------------------------------------------------------------------
-  // CONFIGURATION
-  // ---------------------------------------------------------------------------
-  const API_BASE = "https://spotdata.onrender.com";  // ← Replace with your Render URL
-
-  // ---------------------------------------------------------------------------
-  // DOM REFS
-  // ---------------------------------------------------------------------------
-  const form           = document.getElementById("analysis-form");
-  const loadingOverlay = document.getElementById("loading-overlay");
-  const errorBanner    = document.getElementById("error-banner");
-  const submitBtn      = document.getElementById("submit-btn");
-  const orientSlider   = document.getElementById("beach_orientation");
-  const orientDisplay  = document.getElementById("orientation-display");
-  const compassNeedle  = document.getElementById("compass-needle");
-  const analyticsSection  = document.getElementById("analytics-section");
-  const aiReportSection   = document.getElementById("ai-report-section");
-  const metricCardsEl     = document.getElementById("metric-cards");
-  const sinkerTextEl      = document.getElementById("sinker-text");
-  const speciesSectionEl  = document.getElementById("species-section");
-  const aiReportContentEl = document.getElementById("ai-report-content");
-  const tokenAuditEl      = document.getElementById("token-audit");
-  const flagBanner        = document.getElementById("flag-banner");
-  const flagIcon          = document.getElementById("flag-icon");
-  const flagTitle         = document.getElementById("flag-title");
-  const flagSubtitle      = document.getElementById("flag-subtitle");
-  const flagCounts        = document.getElementById("flag-counts");
-  const copyBtn           = document.getElementById("copy-btn");
+// ===========================================================================
+// ⚠️ الإعداد المهم — ضع هنا رابط خدمة Render الخاصة بك
+// ===========================================================================
+const API_BASE = "https://spotdata.onrender.com";
+// مثال: const API_BASE = "https://surfcast-api.onrender.com";
 
 
-  // ---------------------------------------------------------------------------
-  // ORIENTATION SLIDER — Compass Update
-  // ---------------------------------------------------------------------------
-  orientSlider.addEventListener("input", () => {
-    const deg = parseInt(orientSlider.value);
-    const pct = (deg / 360) * 100;
-    orientSlider.style.setProperty("--pct", `${pct}%`);
-    orientDisplay.textContent = `${deg}°`;
-    compassNeedle.style.transform = `rotate(${deg}deg)`;
-  });
+// ===========================================================================
+// تهيئة الخريطة
+// ===========================================================================
+const map = L.map('map', {
+  center: [36.7372, 3.0860],   // الجزائر العاصمة كموقع افتراضي
+  zoom: 9,
+  zoomControl: true,
+  attributionControl: true,
+});
 
-  // Trigger once on load for default value
-  orientSlider.dispatchEvent(new Event("input"));
+// طبقة الخريطة — ESRI Satellite (مثالي لرؤية الشواطئ)
+const satelliteLayer = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { attribution: '© Esri · Satellite', maxZoom: 19 }
+);
+
+// طبقة OpenStreetMap (بديل)
+const streetLayer = L.tileLayer(
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { attribution: '© OpenStreetMap', maxZoom: 19 }
+);
+
+// إضافة زر التبديل بين الطبقات
+L.control.layers(
+  { "🛰️ صورة فضائية": satelliteLayer, "🗺️ خريطة عادية": streetLayer },
+  {},
+  { position: 'topright', collapsed: false }
+).addTo(map);
+
+satelliteLayer.addTo(map);   // الطبقة الافتراضية
 
 
-  // ---------------------------------------------------------------------------
-  // RADIO BUTTON — Custom Styling
-  // ---------------------------------------------------------------------------
-  function initRadioGroup(name, cardClass) {
-    document.querySelectorAll(`input[name="${name}"]`).forEach(radio => {
-      radio.addEventListener("change", () => {
-        document.querySelectorAll(`input[name="${name}"]`).forEach(r => {
-          const card = r.closest("label").querySelector(`.${cardClass}`);
-          card.classList.remove("border-wave-500");
-          card.classList.add("border-ocean-600");
-        });
-        const selectedCard = radio.closest("label").querySelector(`.${cardClass}`);
-        selectedCard.classList.remove("border-ocean-600");
-        selectedCard.classList.add("border-wave-500");
+// ===========================================================================
+// إدارة الإحداثيات عبر المنظار
+// ===========================================================================
+let currentLat = 36.7372;
+let currentLng = 3.0860;
+let mapMoved   = false;
+
+function updateCoordinates(lat, lng) {
+  currentLat = lat;
+  currentLng = lng;
+  const latStr = lat.toFixed(6);
+  const lngStr = lng.toFixed(6);
+  document.getElementById('coord-lat').textContent = latStr;
+  document.getElementById('coord-lng').textContent = lngStr;
+  document.getElementById('header-lat').textContent = lat.toFixed(4);
+  document.getElementById('header-lng').textContent = lng.toFixed(4);
+}
+
+// تحديث الإحداثيات عند تحريك الخريطة
+map.on('move', () => {
+  const center = map.getCenter();
+  updateCoordinates(center.lat, center.lng);
+
+  // إخفاء التلميح بعد أول تحريك
+  if (!mapMoved) {
+    mapMoved = true;
+    const hint = document.getElementById('usage-hint');
+    hint.style.opacity = '0';
+    setTimeout(() => hint.style.display = 'none', 500);
+  }
+});
+
+// تهيئة أولية
+updateCoordinates(36.7372, 3.0860);
+
+
+// ===========================================================================
+// Slider الاتجاه
+// ===========================================================================
+const orientSlider   = document.getElementById('beach_orientation');
+const orientDisplay  = document.getElementById('orientation-display');
+const compassNeedle  = document.getElementById('compass-needle');
+
+orientSlider.addEventListener('input', () => {
+  const deg = parseInt(orientSlider.value);
+  const pct = (deg / 360) * 100;
+  orientSlider.style.setProperty('--pct', `${pct}%`);
+  orientDisplay.textContent = `${deg}°`;
+  compassNeedle.style.transform = `rotate(${deg}deg)`;
+});
+orientSlider.dispatchEvent(new Event('input'));
+
+
+// ===========================================================================
+// Radio Buttons — تخصيص
+// ===========================================================================
+function initRadio(name, cardClass) {
+  document.querySelectorAll(`input[name="${name}"]`).forEach(r => {
+    r.addEventListener('change', () => {
+      document.querySelectorAll(`input[name="${name}"]`).forEach(x => {
+        const c = x.closest('label').querySelector(`.${cardClass}`);
+        c.classList.replace('border-wave-500', 'border-ocean-600');
       });
+      const sel = r.closest('label').querySelector(`.${cardClass}`);
+      sel.classList.replace('border-ocean-600', 'border-wave-500');
     });
+  });
+}
+initRadio('beach_type', 'beach-card');
+initRadio('target_date', 'date-card');
+
+
+// ===========================================================================
+// Loading Overlay
+// ===========================================================================
+const loadingSteps = [
+  "جاري تحديد الموقع...",
+  "جلب بيانات Open-Meteo Marine...",
+  "جلب بيانات الطقس...",
+  "تشغيل محرك الفيزياء...",
+  "حساب قوة الأمواج...",
+  "تحليل الأنواع البيولوجية...",
+  "إرسال البيانات إلى Gemini AI...",
+  "توليد التقرير التكتيكي...",
+];
+let stepInterval = null;
+let stepIndex    = 0;
+
+function showLoading() {
+  document.getElementById('loading-overlay').classList.remove('hidden');
+  document.getElementById('scan-btn').disabled = true;
+  document.getElementById('error-banner').classList.add('hidden');
+  stepIndex = 0;
+  document.getElementById('loading-step').textContent = loadingSteps[0];
+  stepInterval = setInterval(() => {
+    stepIndex = (stepIndex + 1) % loadingSteps.length;
+    document.getElementById('loading-step').textContent = loadingSteps[stepIndex];
+  }, 1800);
+}
+
+function hideLoading() {
+  clearInterval(stepInterval);
+  const overlay = document.getElementById('loading-overlay');
+  overlay.style.opacity = '0';
+  setTimeout(() => {
+    overlay.classList.add('hidden');
+    overlay.style.opacity = '1';
+  }, 400);
+  document.getElementById('scan-btn').disabled = false;
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.innerHTML = `⚠️ ${msg}`;
+  el.classList.remove('hidden');
+}
+
+
+// ===========================================================================
+// Rendering — بانر الحالة
+// ===========================================================================
+function renderFlagBanner(analytics) {
+  const red    = analytics.flagged_hours?.RED?.length    || 0;
+  const green  = analytics.flagged_hours?.GREEN?.length  || 0;
+  const yellow = analytics.flagged_hours?.YELLOW?.length || 0;
+
+  const banner = document.getElementById('flag-banner');
+  let colorClass, icon, title, subtitle;
+
+  if (red > 0) {
+    colorClass = 'bg-danger-500/10 border-danger-500/40';
+    icon       = '🔴';
+    title      = `تحذير: ${red} ساعة خطرة`;
+    subtitle   = 'قوة أمواج أو رياح أو ضغط يتجاوز حدود الأمان';
+  } else if (green > 0) {
+    colorClass = 'bg-safe-500/10 border-safe-500/40';
+    icon       = '🟢';
+    title      = `${green} نافذة صيد مثالية`;
+    subtitle   = 'ظروف الأمواج والرياح في النطاق الأمثل للصيد';
+  } else {
+    colorClass = 'bg-caution-500/10 border-caution-500/40';
+    icon       = '🟡';
+    title      = 'ظروف متوسطة — تصرف بحذر';
+    subtitle   = 'لا توجد مخاطر حرجة، لكن الظروف ليست مثالية';
   }
 
-  initRadioGroup("beach_type",   "beach-type-card");
-  initRadioGroup("target_date",  "date-card");
+  if (analytics.cold_front_detected) subtitle += ' | ❄️ موجة برد مرصودة';
+  if (analytics.weed_risk_active)     subtitle += ' | 🌿 خطر أعشاب بحرية';
+
+  banner.className = `rounded-xl p-3 border-2 ${colorClass}`;
+  document.getElementById('flag-icon').textContent    = icon;
+  document.getElementById('flag-title').textContent   = title;
+  document.getElementById('flag-subtitle').textContent = subtitle;
+
+  document.getElementById('flag-counts').innerHTML = `
+    <span class="text-xs font-mono px-2 py-0.5 rounded-lg bg-safe-500/20 text-safe-400">🟢 ${green}</span>
+    <span class="text-xs font-mono px-2 py-0.5 rounded-lg bg-caution-500/20 text-caution-400">🟡 ${yellow}</span>
+    <span class="text-xs font-mono px-2 py-0.5 rounded-lg bg-danger-500/20 text-danger-400">🔴 ${red}</span>
+  `;
+}
 
 
-  // ---------------------------------------------------------------------------
-  // UTILITY — Show / Hide Loading Overlay
-  // ---------------------------------------------------------------------------
-  function showLoading() {
-    loadingOverlay.classList.remove("hidden");
-    loadingOverlay.style.opacity = "1";
-    submitBtn.disabled = true;
-    errorBanner.classList.add("hidden");
-  }
+// ===========================================================================
+// Rendering — بطاقات المقاييس
+// ===========================================================================
+function renderMetricCards(analytics) {
+  const b = analytics.past_48h_baseline;
+  const metrics = [
+    {
+      icon: '🌊',
+      label: 'أقصى قوة موج',
+      value: `${analytics.max_wave_power_today} kW/m`,
+      sub: analytics.max_wave_power_today > 3.0 ? '⚠️ يتجاوز الحد الأمن' : '✓ ضمن الحدود',
+      color: analytics.max_wave_power_today > 3.0 ? 'text-danger-400' : 'text-safe-400',
+    },
+    {
+      icon: '💨',
+      label: 'الريح (48 ساعة)',
+      value: b.dominant_wind_type === 'Onshore'  ? 'بحري' :
+             b.dominant_wind_type === 'Offshore' ? 'بري'  : 'جانبي',
+      sub: `${b.sustained_wind_hours} ساعة رياح قوية`,
+      color: b.dominant_wind_type === 'Onshore' ? 'text-caution-400' : 'text-wave-400',
+    },
+    {
+      icon: '🌡️',
+      label: 'درجة الحرارة',
+      value: `${analytics.avg_temp_today}°م`,
+      sub: analytics.avg_temp_today < 16 ? 'أسماك المياه الباردة' : 'أسماك المياه الدافئة',
+      color: 'text-slate-300',
+    },
+    {
+      icon: '🌀',
+      label: 'ارتفاع الموج (48h)',
+      value: `${b.avg_swell_height_48h} م`,
+      sub: `الدورة: ${b.avg_wave_period_48h} ث`,
+      color: analytics.weed_risk_active ? 'text-caution-400' : 'text-slate-300',
+    },
+  ];
 
-  function hideLoading() {
-    loadingOverlay.style.opacity = "0";
-    setTimeout(() => loadingOverlay.classList.add("hidden"), 300);
-    submitBtn.disabled = false;
-  }
-
-  function showError(msg) {
-    errorBanner.textContent = `⚠️ ${msg}`;
-    errorBanner.classList.remove("hidden");
-  }
-
-
-  // ---------------------------------------------------------------------------
-  // RENDERING — Analytics Cards
-  // ---------------------------------------------------------------------------
-  function renderFlagBanner(analytics) {
-    const red    = analytics.flagged_hours?.RED?.length    || 0;
-    const green  = analytics.flagged_hours?.GREEN?.length  || 0;
-    const yellow = analytics.flagged_hours?.YELLOW?.length || 0;
-
-    let color, icon, title, subtitle;
-
-    if (red > 0) {
-      color    = "bg-danger-500/10 border-danger-500/40";
-      icon     = "🔴";
-      title    = `${red} CRITICAL Hour${red > 1 ? 's' : ''} Detected`;
-      subtitle = "Wave power, gusts, or pressure exceed safe thresholds";
-    } else if (green > 0) {
-      color    = "bg-safe-500/10 border-safe-500/40";
-      icon     = "🟢";
-      title    = `${green} Prime Fishing Window${green > 1 ? 's' : ''} Identified`;
-      subtitle = "Optimal wave height, power, and wind conditions aligned";
-    } else {
-      color    = "bg-caution-500/10 border-caution-500/40";
-      icon     = "🟡";
-      title    = "Moderate Conditions — Caution Advised";
-      subtitle = "No critical hazards, but conditions are suboptimal";
-    }
-
-    flagBanner.className = `rounded-xl px-5 py-4 flex items-center justify-between border-2 ${color}`;
-    flagIcon.textContent   = icon;
-    flagTitle.textContent  = title;
-    flagSubtitle.textContent = subtitle;
-
-    if (analytics.cold_front_detected) {
-      flagSubtitle.textContent += " | ❄️ Cold front passage detected";
-    }
-    if (analytics.weed_risk_active) {
-      flagSubtitle.textContent += " | 🌿 Weed risk active";
-    }
-
-    flagCounts.innerHTML = `
-      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-safe-500/20 text-safe-400">🟢 ${green}</span>
-      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-caution-500/20 text-caution-400">🟡 ${yellow}</span>
-      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-danger-500/20 text-danger-400">🔴 ${red}</span>
-    `;
-  }
-
-
-  function renderMetricCards(analytics) {
-    const baseline = analytics.past_48h_baseline;
-    const metrics = [
-      {
-        icon: "🌊",
-        label: "Max Wave Power",
-        value: `${analytics.max_wave_power_today} kW/m`,
-        sub: analytics.max_wave_power_today > 3.0 ? "⚠️ Exceeds safety threshold" : "Within tolerance",
-        color: analytics.max_wave_power_today > 3.0 ? "text-danger-400" : "text-safe-400",
-      },
-      {
-        icon: "💨",
-        label: "48h Wind Type",
-        value: baseline.dominant_wind_type,
-        sub: `${baseline.sustained_wind_hours}h sustained >15 kts`,
-        color: baseline.dominant_wind_type === "Onshore" ? "text-caution-400" : "text-wave-400",
-      },
-      {
-        icon: "🌡️",
-        label: "Avg Air Temp",
-        value: `${analytics.avg_temp_today}°C`,
-        sub: analytics.avg_temp_today < 16 ? "Cold water species active" : "Warm water species active",
-        color: "text-slate-300",
-      },
-      {
-        icon: "🌊",
-        label: "48h Swell Height",
-        value: `${baseline.avg_swell_height_48h} m`,
-        sub: `Period: ${baseline.avg_wave_period_48h}s`,
-        color: analytics.weed_risk_active ? "text-caution-400" : "text-slate-300",
-      },
-    ];
-
-    metricCardsEl.innerHTML = metrics.map(m => `
-      <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl p-4 hover:border-ocean-500/70 transition-colors">
-        <div class="flex items-center gap-2 mb-2">
-          <span class="text-lg">${m.icon}</span>
-          <span class="text-xs text-slate-500 uppercase tracking-wider font-semibold">${m.label}</span>
-        </div>
-        <p class="text-xl font-bold font-mono ${m.color}">${m.value}</p>
-        <p class="text-xs text-slate-500 mt-1">${m.sub}</p>
+  document.getElementById('metric-cards').innerHTML = metrics.map(m => `
+    <div class="bg-ocean-800 border border-ocean-600/40 rounded-xl p-3
+                hover:border-ocean-500/60 transition-colors">
+      <div class="flex items-center gap-1.5 mb-1.5">
+        <span class="text-base">${m.icon}</span>
+        <span class="text-xs text-slate-500 font-semibold leading-tight">${m.label}</span>
       </div>
-    `).join("");
+      <p class="text-lg font-black font-mono ${m.color} leading-none">${m.value}</p>
+      <p class="text-xs text-slate-500 mt-1 leading-tight">${m.sub}</p>
+    </div>
+  `).join('');
+}
+
+
+// ===========================================================================
+// Rendering — الأنواع المتوقعة
+// ===========================================================================
+function renderSpecies(predictions) {
+  const probColors = {
+    'HIGH':        'bg-safe-500/15 border-safe-500/30 text-safe-400',
+    'MEDIUM-HIGH': 'bg-wave-500/15 border-wave-500/30 text-wave-400',
+    'MEDIUM':      'bg-caution-500/15 border-caution-500/30 text-caution-400',
+    'LOW-MEDIUM':  'bg-slate-500/15 border-slate-500/30 text-slate-400',
+  };
+
+  const speciesNames = {
+    'European Sea Bass (Loup / Bar)':               'سمك اللوب / البار 🐟',
+    'Large White Seabream (Grand Sarg)':             'السرق الكبير 🐠',
+    'White Seabream (Sarg)':                         'السرق 🐠',
+    'Gilthead Seabream (Daurade Royale)':            'الدوراد الملكي 🐡',
+    'Striped Seabream (Marbré)':                     'المربو 🐟',
+    'Flathead Mullet (Bouri) / Striped Seabream (Marbré)': 'البوري / المربو 🐟',
+    'Opportunistic Mixed Bag (Bogue, Mullet, Sarg)': 'صيد متنوع (بوكا، بوري، سرق) 🎣',
+  };
+
+  document.getElementById('species-section').innerHTML = `
+    <h4 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-1.5">
+      <span>🎣</span> الأنواع المتوقعة
+    </h4>
+    ${predictions.map(sp => {
+      const probKey    = Object.keys(probColors).find(k => sp.probability.startsWith(k)) || 'LOW-MEDIUM';
+      const colorClass = probColors[probKey];
+      const arabicName = speciesNames[sp.species] || sp.species;
+
+      const probArabic = sp.probability.startsWith('HIGH')        ? 'احتمال عالٍ'    :
+                         sp.probability.startsWith('MEDIUM-HIGH') ? 'عالٍ-متوسط'    :
+                         sp.probability.startsWith('MEDIUM')      ? 'متوسط'          : 'منخفض-متوسط';
+      return `
+      <div class="bg-ocean-800 border border-ocean-600/40 rounded-xl p-3 space-y-1.5
+                  hover:border-ocean-500/60 transition-colors">
+        <div class="flex items-center justify-between gap-2">
+          <p class="font-bold text-xs text-white">${arabicName}</p>
+          <span class="text-xs font-mono px-2 py-0.5 rounded-full border flex-shrink-0 ${colorClass}">
+            ${probArabic}
+          </span>
+        </div>
+        <p class="text-xs text-slate-500 leading-relaxed">${sp.trigger}</p>
+        <p class="text-xs text-wave-400/80 font-mono">🪱 ${sp.bait}</p>
+      </div>`;
+    }).join('')}
+  `;
+}
+
+
+// ===========================================================================
+// Rendering — تقرير Gemini (Markdown → HTML)
+// ===========================================================================
+function parseMarkdown(text) {
+  return text
+    .replace(/^## (.+)$/gm,    '<h2>$1</h2>')
+    .replace(/^### (.+)$/gm,   '<h2 style="font-size:0.9rem">$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,     '<em style="color:#7dd3fc">$1</em>')
+    .replace(/^[\-\*] (.+)$/gm,'<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>')
+    .split('\n\n')
+    .map(p => {
+      if (p.startsWith('<h') || p.startsWith('<ul')) return p;
+      if (!p.trim()) return '';
+      return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+    })
+    .join('');
+}
+
+
+// ===========================================================================
+// زر المسح الرئيسي — منطق الطلب
+// ===========================================================================
+const scanBtn = document.getElementById('scan-btn');
+let lastAiReport = '';
+
+scanBtn.addEventListener('click', async () => {
+
+  // التحقق من الإحداثيات
+  if (!currentLat || !currentLng) {
+    showError('يرجى تحريك الخريطة لتحديد موقع أولاً.');
+    return;
   }
 
+  const payload = {
+    latitude:          currentLat,
+    longitude:         currentLng,
+    beach_orientation: parseInt(orientSlider.value),
+    beach_type:        document.querySelector("input[name='beach_type']:checked").value,
+    target_date:       document.querySelector("input[name='target_date']:checked").value,
+  };
 
-  function renderSpecies(predictions) {
-    const probColors = {
-      "HIGH":       "bg-safe-500/15 border-safe-500/30 text-safe-400",
-      "MEDIUM-HIGH":"bg-wave-500/15 border-wave-500/30 text-wave-400",
-      "MEDIUM":     "bg-caution-500/15 border-caution-500/30 text-caution-400",
-      "LOW-MEDIUM": "bg-slate-500/15 border-slate-500/30 text-slate-400",
-    };
+  showLoading();
 
-    speciesSectionEl.innerHTML = `
-      <h4 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2 mt-2">
-        <span>🎣</span> Biological Probability Matrix
-      </h4>
-      ${predictions.map(sp => {
-        const probKey = Object.keys(probColors).find(k => sp.probability.startsWith(k)) || "LOW-MEDIUM";
-        const colorClass = probColors[probKey];
-        return `
-        <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl px-5 py-4 flex items-start gap-4
-                    hover:border-ocean-500/70 transition-colors">
-          <span class="text-2xl mt-0.5">🐟</span>
-          <div class="flex-1 min-w-0">
-            <div class="flex items-center flex-wrap gap-2 mb-1">
-              <p class="font-bold text-sm text-white">${sp.species}</p>
-              <span class="text-xs font-mono px-2 py-0.5 rounded-full border ${colorClass}">
-                ${sp.probability}
-              </span>
-            </div>
-            <p class="text-xs text-slate-400 mb-1.5">${sp.trigger}</p>
-            <p class="text-xs text-wave-400/80 font-mono">🪱 ${sp.bait}</p>
-          </div>
-        </div>`;
-      }).join("")}
-    `;
-  }
-
-
-  // ---------------------------------------------------------------------------
-  // RENDERING — Gemini AI Report (Markdown-to-HTML parser)
-  // ---------------------------------------------------------------------------
-  function parseMarkdownToHTML(text) {
-    // Convert ## headers, **bold**, bullet lists, and paragraphs
-    let html = text
-      .replace(/^## (.+)$/gm,    '<h2>$1</h2>')
-      .replace(/^### (.+)$/gm,   '<h2 style="font-size:0.95rem">$1</h2>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.+?)\*/g,     '<em style="color:#7dd3fc">$1</em>')
-      .replace(/^[\-\*] (.+)$/gm,'<li>$1</li>')
-      .replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`)
-      .split('\n\n')
-      .map(para => {
-        if (para.startsWith('<h') || para.startsWith('<ul')) return para;
-        if (para.trim() === '') return '';
-        return `<p>${para.replace(/\n/g, '<br>')}</p>`;
-      })
-      .join('');
-    return html;
-  }
-
-
-  // ---------------------------------------------------------------------------
-  // MAIN FORM SUBMIT
-  // ---------------------------------------------------------------------------
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    showLoading();
-
-    const payload = {
-      latitude:          parseFloat(document.getElementById("latitude").value),
-      longitude:         parseFloat(document.getElementById("longitude").value),
-      beach_orientation: parseInt(orientSlider.value),
-      beach_type:        document.querySelector("input[name='beach_type']:checked").value,
-      target_date:       document.querySelector("input[name='target_date']:checked").value,
-    };
-
-    // Basic client-side validation
-    if (isNaN(payload.latitude) || isNaN(payload.longitude)) {
-      hideLoading();
-      showError("Please enter valid latitude and longitude coordinates.");
-      return;
-    }
-    if (payload.latitude < -90 || payload.latitude > 90) {
-      hideLoading();
-      showError("Latitude must be between -90 and 90.");
-      return;
-    }
-    if (payload.longitude < -180 || payload.longitude > 180) {
-      hideLoading();
-      showError("Longitude must be between -180 and 180.");
-      return;
-    }
-
-    try {
-      const response = await fetch(`${API_BASE}/analyze`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.detail || `Server error: ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      // ---- Render Analytics Cards ----
-      renderFlagBanner(data.analytics);
-      renderMetricCards(data.analytics);
-      sinkerTextEl.textContent = data.analytics.sinker_recommendation;
-      renderSpecies(data.analytics.species_predictions);
-
-      // ---- Render AI Report ----
-      aiReportContentEl.innerHTML = parseMarkdownToHTML(data.ai_report);
-      tokenAuditEl.textContent = `~${data.context_tokens_approx} context tokens`;
-
-      // ---- Show Sections ----
-      analyticsSection.classList.remove("hidden");
-      aiReportSection.classList.remove("hidden");
-
-      // Smooth scroll to results
-      setTimeout(() => {
-        analyticsSection.scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 100);
-
-    } catch (err) {
-      showError(err.message || "An unexpected error occurred. Check API connectivity.");
-    } finally {
-      hideLoading();
-    }
-  });
-
-
-  // ---------------------------------------------------------------------------
-  // COPY REPORT BUTTON
-  // ---------------------------------------------------------------------------
-  copyBtn.addEventListener("click", () => {
-    const text = aiReportContentEl.innerText;
-    navigator.clipboard.writeText(text).then(() => {
-      copyBtn.textContent = "✅ Copied!";
-      setTimeout(() => { copyBtn.textContent = "📋 Copy Report"; }, 2500);
+  try {
+    const response = await fetch(`${API_BASE}/analyze`, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept':        'application/json',
+      },
+      body: JSON.stringify(payload),
     });
+
+    if (!response.ok) {
+      let errMsg = `خطأ من الخادم: ${response.status}`;
+      try {
+        const errData = await response.json();
+        errMsg = errData.detail || errMsg;
+      } catch (_) {}
+      throw new Error(errMsg);
+    }
+
+    const data = await response.json();
+
+    // عرض النتائج
+    renderFlagBanner(data.analytics);
+    renderMetricCards(data.analytics);
+    document.getElementById('sinker-text').textContent = data.analytics.sinker_recommendation;
+    renderSpecies(data.analytics.species_predictions);
+
+    // حفظ تقرير Gemini للعرض عند الطلب
+    lastAiReport = data.ai_report;
+    document.getElementById('ai-report-content').innerHTML = parseMarkdown(data.ai_report);
+    document.getElementById('modal-token-count').textContent =
+      `~${data.context_tokens_approx} رمز سياقي`;
+
+    // إظهار قسم النتائج
+    document.getElementById('results-area').classList.remove('hidden');
+
+    // إضافة علامة على الخريطة
+    addMapMarker(currentLat, currentLng);
+
+  } catch (err) {
+    let userMsg = err.message;
+
+    // رسائل خطأ مفصّلة بالعربية
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError')) {
+      userMsg = `تعذّر الاتصال بالخادم.<br>
+        <span class="block mt-1">تأكد من:</span>
+        <span class="block">• صحة رابط API_BASE في كود الموقع</span>
+        <span class="block">• أن خدمة Render تعمل (قد تحتاج دقيقة للاستيقاظ)</span>
+        <span class="block">• اتصالك بالإنترنت</span>`;
+    } else if (err.message.includes('502')) {
+      userMsg = 'Open-Meteo لم يستجب — حاول مرة أخرى بعد لحظة.';
+    } else if (err.message.includes('500')) {
+      userMsg = 'خطأ داخلي في الخادم — تحقق من متغير GEMINI_API_KEY في Render.';
+    }
+
+    showError(userMsg);
+  } finally {
+    hideLoading();
+  }
+});
+
+
+// ===========================================================================
+// علامة على الخريطة
+// ===========================================================================
+let currentMarker = null;
+function addMapMarker(lat, lng) {
+  if (currentMarker) map.removeLayer(currentMarker);
+  const icon = L.divIcon({
+    className: '',
+    html: `<div style="
+      width:16px; height:16px;
+      background:#38bdf8;
+      border:3px solid #0a1628;
+      border-radius:50%;
+      box-shadow:0 0 12px rgba(56,189,248,0.8), 0 0 24px rgba(56,189,248,0.4);
+    "></div>`,
+    iconAnchor: [8, 8],
   });
+  currentMarker = L.marker([lat, lng], { icon }).addTo(map);
+}
+
+
+// ===========================================================================
+// Modal التقرير الكامل
+// ===========================================================================
+document.getElementById('show-report-btn').addEventListener('click', () => {
+  document.getElementById('report-modal').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+});
+
+document.getElementById('close-modal-btn').addEventListener('click', () => {
+  document.getElementById('report-modal').classList.add('hidden');
+  document.body.style.overflow = '';
+});
+
+// إغلاق بالنقر خارج المحتوى
+document.getElementById('report-modal').addEventListener('click', function(e) {
+  if (e.target === this) {
+    this.classList.add('hidden');
+    document.body.style.overflow = '';
+  }
+});
+
+// زر نسخ التقرير
+document.getElementById('copy-report-btn').addEventListener('click', () => {
+  const text = document.getElementById('ai-report-content').innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('copy-report-btn');
+    btn.textContent = '✅ تم النسخ!';
+    setTimeout(() => { btn.textContent = '📋 نسخ'; }, 2500);
+  });
+});
+
+// ESC لإغلاق المودال
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.getElementById('report-modal').classList.add('hidden');
+    document.body.style.overflow = '';
+  }
+});
 
 </script>
-
 </body>
-  </html>
+</html>
