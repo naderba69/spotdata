@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SurfCast Analytics — AI Powered Marine Forecast</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ocean:  { 900: '#0a1628', 800: '#0d2137', 700: '#102a47', 600: '#1a3a5c' },
+            wave:   { 400: '#38bdf8', 500: '#0ea5e9', 600: '#0284c7' },
+            foam:   { 100: '#f0f9ff', 200: '#e0f2fe' },
+            danger: { 500: '#ef4444', 600: '#dc2626' },
+            caution:{ 500: '#f59e0b', 600: '#d97706' },
+            safe:   { 500: '#22c55e', 600: '#16a34a'  },
+          },
+          fontFamily: {
+            mono: ['"JetBrains Mono"', '"Fira Code"', 'monospace'],
+          },
+          animation: {
+            'wave-pulse': 'wavePulse 2.5s ease-in-out infinite',
+            'fade-in-up': 'fadeInUp 0.6s ease-out forwards',
+          },
+          keyframes: {
+            wavePulse: {
+              '0%, 100%': { opacity: '0.6', transform: 'scaleX(1)' },
+              '50%':       { opacity: '1',   transform: 'scaleX(1.05)' },
+            },
+            fadeInUp: {
+              '0%':   { opacity: '0', transform: 'translateY(24px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' },
+            },
+          },
+        }
+      }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet" />
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+
+    /* ---- Loading Overlay ---- */
+    #loading-overlay {
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      transition: opacity 0.3s ease;
+    }
+    .spinner {
+      width: 56px; height: 56px;
+      border: 4px solid rgba(56, 189, 248, 0.2);
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- Slider Styling ---- */
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 6px;
+      border-radius: 99px;
+      background: linear-gradient(to right, #0ea5e9 0%, #0ea5e9 var(--pct,50%), #1a3a5c var(--pct,50%), #1a3a5c 100%);
+      outline: none;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: #38bdf8;
+      cursor: pointer;
+      border: 3px solid #0d2137;
+      box-shadow: 0 0 0 3px rgba(56,189,248,0.3);
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: #38bdf8;
+      cursor: pointer;
+      border: 3px solid #0d2137;
+    }
+
+    /* ---- Compass Preview ---- */
+    .compass-needle {
+      transform-origin: bottom center;
+      transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    /* ---- Markdown-like AI Output ---- */
+    .ai-content h2 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #38bdf8;
+      margin: 1.5rem 0 0.5rem;
+      padding-bottom: 0.25rem;
+      border-bottom: 1px solid rgba(56,189,248,0.2);
+    }
+    .ai-content p   { margin: 0.5rem 0; line-height: 1.7; color: #cbd5e1; }
+    .ai-content ul  { list-style: disc; padding-left: 1.25rem; margin: 0.5rem 0; }
+    .ai-content li  { margin: 0.25rem 0; color: #94a3b8; line-height: 1.6; }
+    .ai-content strong { color: #f1f5f9; }
+
+    /* ---- Scrollbar ---- */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a1628; }
+    ::-webkit-scrollbar-thumb { background: #1a3a5c; border-radius: 3px; }
+
+    /* ---- Flag Badge Pulse ---- */
+    .badge-red    { animation: redPulse 2s ease-in-out infinite; }
+    @keyframes redPulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+      50%      { box-shadow: 0 0 0 8px rgba(239,68,68,0); }
+    }
+  </style>
+</head>
+
+<body class="bg-ocean-900 text-slate-200 min-h-screen">
+
+<!-- =========================================================
+     LOADING OVERLAY (covers cold-start latency from Render)
+========================================================= -->
+<div id="loading-overlay"
+     class="hidden fixed inset-0 z-50 bg-ocean-900/90 flex flex-col items-center justify-center gap-6">
+  <div class="spinner"></div>
+  <div class="text-center">
+    <p class="text-wave-400 font-semibold text-lg tracking-wide">Analyzing Marine Conditions</p>
+    <p class="text-slate-500 text-sm mt-1">Fetching Open-Meteo data · Running physics engine · Synthesizing with Gemini AI</p>
+    <div class="mt-4 flex gap-2 justify-center">
+      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0s"></span>
+      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.15s"></span>
+      <span class="w-2 h-2 bg-wave-400 rounded-full animate-bounce" style="animation-delay:0.3s"></span>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================
+     HEADER
+========================================================= -->
+<header class="border-b border-ocean-600/50 bg-ocean-800/80 backdrop-blur-md sticky top-0 z-40">
+  <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 bg-wave-500 rounded-lg flex items-center justify-center text-xl shadow-lg shadow-wave-500/30">
+        🎣
+      </div>
+      <div>
+        <h1 class="text-base font-bold text-white leading-none">SurfCast Analytics</h1>
+        <p class="text-xs text-wave-400 mt-0.5 font-mono">Physics · Marine · AI</p>
+      </div>
+    </div>
+    <div class="hidden sm:flex items-center gap-2 text-xs text-slate-500 font-mono bg-ocean-700/50 px-3 py-1.5 rounded-full border border-ocean-600/50">
+      <span class="w-1.5 h-1.5 bg-safe-500 rounded-full animate-pulse"></span>
+      Open-Meteo · Gemini 1.5 Flash
+    </div>
+  </div>
+</header>
+
+<!-- =========================================================
+     MAIN LAYOUT
+========================================================= -->
+<main class="max-w-5xl mx-auto px-4 py-8 space-y-8">
+
+  <!-- Hero -->
+  <div class="text-center py-6 animate-fade-in-up" style="animation-delay:0.1s">
+    <h2 class="text-3xl sm:text-4xl font-black text-white leading-tight">
+      High-Precision <span class="text-wave-400">Surfcasting</span> Intelligence
+    </h2>
+    <p class="text-slate-400 mt-3 max-w-2xl mx-auto text-sm sm:text-base leading-relaxed">
+      Enter your spot's coordinates and parameters. The physics engine calculates wave tension, 
+      wind classifications, and biological probabilities — Gemini synthesizes it into a tactical report.
+    </p>
+  </div>
+
+  <!-- =========================================================
+       INPUT FORM CARD
+  ========================================================= -->
+  <div class="bg-ocean-800 rounded-2xl border border-ocean-600/50 shadow-2xl overflow-hidden animate-fade-in-up"
+       style="animation-delay:0.2s">
+    <div class="bg-gradient-to-r from-wave-600/20 to-transparent px-6 py-4 border-b border-ocean-600/50">
+      <h3 class="font-bold text-wave-400 flex items-center gap-2 text-sm uppercase tracking-widest">
+        <span>⚙️</span> Location & Conditions Input
+      </h3>
+    </div>
+
+    <form id="analysis-form" class="p-6 space-y-6">
+
+      <!-- Row 1: Coordinates -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div class="space-y-2">
+          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            <span>🌐</span> Latitude
+          </label>
+          <input type="number" id="latitude" step="0.0001" placeholder="e.g. 35.8897"
+                 required
+                 class="w-full bg-ocean-700 border border-ocean-600 rounded-xl px-4 py-3 text-white
+                        placeholder-slate-500 font-mono text-sm focus:outline-none focus:border-wave-500
+                        focus:ring-2 focus:ring-wave-500/20 transition-all" />
+        </div>
+        <div class="space-y-2">
+          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            <span>🌐</span> Longitude
+          </label>
+          <input type="number" id="longitude" step="0.0001" placeholder="e.g. 14.5125"
+                 required
+                 class="w-full bg-ocean-700 border border-ocean-600 rounded-xl px-4 py-3 text-white
+                        placeholder-slate-500 font-mono text-sm focus:outline-none focus:border-wave-500
+                        focus:ring-2 focus:ring-wave-500/20 transition-all" />
+        </div>
+      </div>
+
+      <!-- Row 2: Beach Orientation Slider + Compass -->
+      <div class="space-y-3">
+        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+          <span>🧭</span> Beach Facing Orientation
+          <span id="orientation-display"
+                class="ml-auto bg-ocean-700 border border-ocean-600 text-wave-400 font-mono text-sm
+                       px-3 py-0.5 rounded-lg">
+            180°
+          </span>
+        </label>
+
+        <!-- Compass Visual -->
+        <div class="flex items-center gap-6">
+          <svg id="compass-svg" viewBox="0 0 80 80" class="w-16 h-16 flex-shrink-0">
+            <circle cx="40" cy="40" r="38" fill="#102a47" stroke="#1a3a5c" stroke-width="2"/>
+            <text x="40" y="11" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">N</text>
+            <text x="40" y="74" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">S</text>
+            <text x="72" y="44" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">E</text>
+            <text x="8"  y="44" text-anchor="middle" font-size="8" fill="#94a3b8" font-family="sans-serif">W</text>
+            <!-- Needle -->
+            <line id="compass-needle"
+                  x1="40" y1="40" x2="40" y2="12"
+                  stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"
+                  style="transform-origin: 40px 40px; transform: rotate(180deg); transition: transform 0.4s cubic-bezier(0.34,1.56,0.64,1)"/>
+            <circle cx="40" cy="40" r="4" fill="#38bdf8"/>
+          </svg>
+
+          <input type="range" id="beach_orientation" min="0" max="360" value="180"
+                 class="w-full" style="--pct: 50%" />
+        </div>
+        <p class="text-xs text-slate-500">Drag to set the compass bearing your beach faces (the direction waves arrive from).</p>
+      </div>
+
+      <!-- Row 3: Beach Type -->
+      <div class="space-y-3">
+        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+          <span>🪨</span> Beach Bottom Type
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="beach-type-option cursor-pointer">
+            <input type="radio" name="beach_type" value="sandy" class="hidden" checked />
+            <div class="beach-type-card flex items-center gap-3 bg-ocean-700 border-2 border-wave-500
+                        rounded-xl px-4 py-3 transition-all duration-200">
+              <span class="text-2xl">🏖️</span>
+              <div>
+                <p class="font-semibold text-sm text-white">Sandy</p>
+                <p class="text-xs text-slate-400">Flat surf, mullet, Marbré</p>
+              </div>
+            </div>
+          </label>
+          <label class="beach-type-option cursor-pointer">
+            <input type="radio" name="beach_type" value="rocky" class="hidden" />
+            <div class="beach-type-card flex items-center gap-3 bg-ocean-700 border-2 border-ocean-600
+                        rounded-xl px-4 py-3 transition-all duration-200 hover:border-ocean-500">
+              <span class="text-2xl">🪨</span>
+              <div>
+                <p class="font-semibold text-sm text-white">Rocky</p>
+                <p class="text-xs text-slate-400">Structure, Sarg, Bass</p>
+              </div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Row 4: Target Date -->
+      <div class="space-y-3">
+        <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+          <span>📅</span> Target Date
+        </label>
+        <div class="grid grid-cols-3 gap-3">
+          <label class="date-option cursor-pointer">
+            <input type="radio" name="target_date" value="today" class="hidden" checked />
+            <div class="date-card text-center bg-ocean-700 border-2 border-wave-500 rounded-xl
+                        px-3 py-3 transition-all duration-200">
+              <p class="text-xl">☀️</p>
+              <p class="text-sm font-semibold text-white">Today</p>
+            </div>
+          </label>
+          <label class="date-option cursor-pointer">
+            <input type="radio" name="target_date" value="tomorrow" class="hidden" />
+            <div class="date-card text-center bg-ocean-700 border-2 border-ocean-600 rounded-xl
+                        px-3 py-3 transition-all duration-200 hover:border-ocean-500">
+              <p class="text-xl">🌅</p>
+              <p class="text-sm font-semibold text-white">Tomorrow</p>
+            </div>
+          </label>
+          <label class="date-option cursor-pointer">
+            <input type="radio" name="target_date" value="day_after" class="hidden" />
+            <div class="date-card text-center bg-ocean-700 border-2 border-ocean-600 rounded-xl
+                        px-3 py-3 transition-all duration-200 hover:border-ocean-500">
+              <p class="text-xl">🌙</p>
+              <p class="text-sm font-semibold text-white">Day After</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Submit -->
+      <button type="submit" id="submit-btn"
+              class="w-full bg-gradient-to-r from-wave-600 to-wave-500 hover:from-wave-500 hover:to-wave-400
+                     text-white font-bold py-4 rounded-xl text-sm uppercase tracking-widest shadow-lg
+                     shadow-wave-500/30 transition-all duration-300 hover:shadow-wave-500/50
+                     hover:scale-[1.01] active:scale-[0.99] flex items-center justify-center gap-3
+                     disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100">
+        <span class="text-xl">🌊</span>
+        <span>Generate Tactical Report</span>
+        <span class="text-wave-200 text-xs font-normal font-mono">(Gemini AI)</span>
+      </button>
+
+      <!-- Error display -->
+      <div id="error-banner"
+           class="hidden bg-danger-500/10 border border-danger-500/40 text-danger-400
+                  rounded-xl px-4 py-3 text-sm font-mono">
+      </div>
+
+    </form>
+  </div>
+
+  <!-- =========================================================
+       ANALYTICS CARDS (raw metrics, pre-Gemini)
+  ========================================================= -->
+  <div id="analytics-section" class="hidden space-y-4 animate-fade-in-up">
+
+    <h3 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2">
+      <span>⚡</span> Physics Engine Output
+    </h3>
+
+    <!-- Safety Flag Banner -->
+    <div id="flag-banner" class="rounded-xl px-5 py-4 flex items-center justify-between border-2">
+      <div class="flex items-center gap-3">
+        <span id="flag-icon" class="text-2xl"></span>
+        <div>
+          <p id="flag-title" class="font-bold text-sm"></p>
+          <p id="flag-subtitle" class="text-xs opacity-75 mt-0.5"></p>
+        </div>
+      </div>
+      <div id="flag-counts" class="flex gap-2"></div>
+    </div>
+
+    <!-- Metric Cards Grid -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3" id="metric-cards"></div>
+
+    <!-- Sinker Recommendation -->
+    <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl px-5 py-4
+                flex items-center gap-4">
+      <span class="text-2xl">⚓</span>
+      <div>
+        <p class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Lead Sinker Recommendation</p>
+        <p id="sinker-text" class="text-white font-bold mt-1 text-sm"></p>
+      </div>
+    </div>
+
+    <!-- Species Prediction Pills -->
+    <div id="species-section" class="space-y-2"></div>
+
+  </div>
+
+  <!-- =========================================================
+       GEMINI AI REPORT CARD
+  ========================================================= -->
+  <div id="ai-report-section" class="hidden animate-fade-in-up">
+
+    <h3 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2 mb-4">
+      <span>🤖</span> Gemini AI Tactical Report
+      <span class="ml-auto text-wave-400 font-mono text-xs" id="token-audit"></span>
+    </h3>
+
+    <div class="bg-ocean-800 border border-ocean-600/50 rounded-2xl overflow-hidden shadow-2xl">
+      <div class="bg-gradient-to-r from-wave-600/15 to-transparent px-6 py-4 border-b border-ocean-600/50
+                  flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full bg-safe-500 animate-pulse"></div>
+          <span class="text-xs font-mono text-slate-400">Gemini 1.5 Flash · Surfcasting Master Mode</span>
+        </div>
+        <button id="copy-btn"
+                class="text-xs text-slate-500 hover:text-wave-400 transition-colors flex items-center gap-1.5
+                       font-mono border border-ocean-600/50 rounded-lg px-3 py-1.5 hover:border-wave-500/50">
+          📋 Copy Report
+        </button>
+      </div>
+      <div id="ai-report-content" class="ai-content px-6 py-6 text-sm leading-relaxed"></div>
+    </div>
+  </div>
+
+</main>
+
+<!-- =========================================================
+     FOOTER
+========================================================= -->
+<footer class="mt-16 border-t border-ocean-700/50 text-center py-6 text-xs text-slate-600 font-mono">
+  SurfCast Analytics · Powered by Open-Meteo + Gemini AI · Physics-grade accuracy
+</footer>
+
+
+<!-- =========================================================
+     JAVASCRIPT — APPLICATION LOGIC
+========================================================= -->
+<script>
+  // ---------------------------------------------------------------------------
+  // CONFIGURATION
+  // ---------------------------------------------------------------------------
+  const API_BASE = "https://YOUR-RENDER-SERVICE.onrender.com";  // ← Replace with your Render URL
+
+  // ---------------------------------------------------------------------------
+  // DOM REFS
+  // ---------------------------------------------------------------------------
+  const form           = document.getElementById("analysis-form");
+  const loadingOverlay = document.getElementById("loading-overlay");
+  const errorBanner    = document.getElementById("error-banner");
+  const submitBtn      = document.getElementById("submit-btn");
+  const orientSlider   = document.getElementById("beach_orientation");
+  const orientDisplay  = document.getElementById("orientation-display");
+  const compassNeedle  = document.getElementById("compass-needle");
+  const analyticsSection  = document.getElementById("analytics-section");
+  const aiReportSection   = document.getElementById("ai-report-section");
+  const metricCardsEl     = document.getElementById("metric-cards");
+  const sinkerTextEl      = document.getElementById("sinker-text");
+  const speciesSectionEl  = document.getElementById("species-section");
+  const aiReportContentEl = document.getElementById("ai-report-content");
+  const tokenAuditEl      = document.getElementById("token-audit");
+  const flagBanner        = document.getElementById("flag-banner");
+  const flagIcon          = document.getElementById("flag-icon");
+  const flagTitle         = document.getElementById("flag-title");
+  const flagSubtitle      = document.getElementById("flag-subtitle");
+  const flagCounts        = document.getElementById("flag-counts");
+  const copyBtn           = document.getElementById("copy-btn");
+
+
+  // ---------------------------------------------------------------------------
+  // ORIENTATION SLIDER — Compass Update
+  // ---------------------------------------------------------------------------
+  orientSlider.addEventListener("input", () => {
+    const deg = parseInt(orientSlider.value);
+    const pct = (deg / 360) * 100;
+    orientSlider.style.setProperty("--pct", `${pct}%`);
+    orientDisplay.textContent = `${deg}°`;
+    compassNeedle.style.transform = `rotate(${deg}deg)`;
+  });
+
+  // Trigger once on load for default value
+  orientSlider.dispatchEvent(new Event("input"));
+
+
+  // ---------------------------------------------------------------------------
+  // RADIO BUTTON — Custom Styling
+  // ---------------------------------------------------------------------------
+  function initRadioGroup(name, cardClass) {
+    document.querySelectorAll(`input[name="${name}"]`).forEach(radio => {
+      radio.addEventListener("change", () => {
+        document.querySelectorAll(`input[name="${name}"]`).forEach(r => {
+          const card = r.closest("label").querySelector(`.${cardClass}`);
+          card.classList.remove("border-wave-500");
+          card.classList.add("border-ocean-600");
+        });
+        const selectedCard = radio.closest("label").querySelector(`.${cardClass}`);
+        selectedCard.classList.remove("border-ocean-600");
+        selectedCard.classList.add("border-wave-500");
+      });
+    });
+  }
+
+  initRadioGroup("beach_type",   "beach-type-card");
+  initRadioGroup("target_date",  "date-card");
+
+
+  // ---------------------------------------------------------------------------
+  // UTILITY — Show / Hide Loading Overlay
+  // ---------------------------------------------------------------------------
+  function showLoading() {
+    loadingOverlay.classList.remove("hidden");
+    loadingOverlay.style.opacity = "1";
+    submitBtn.disabled = true;
+    errorBanner.classList.add("hidden");
+  }
+
+  function hideLoading() {
+    loadingOverlay.style.opacity = "0";
+    setTimeout(() => loadingOverlay.classList.add("hidden"), 300);
+    submitBtn.disabled = false;
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = `⚠️ ${msg}`;
+    errorBanner.classList.remove("hidden");
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // RENDERING — Analytics Cards
+  // ---------------------------------------------------------------------------
+  function renderFlagBanner(analytics) {
+    const red    = analytics.flagged_hours?.RED?.length    || 0;
+    const green  = analytics.flagged_hours?.GREEN?.length  || 0;
+    const yellow = analytics.flagged_hours?.YELLOW?.length || 0;
+
+    let color, icon, title, subtitle;
+
+    if (red > 0) {
+      color    = "bg-danger-500/10 border-danger-500/40";
+      icon     = "🔴";
+      title    = `${red} CRITICAL Hour${red > 1 ? 's' : ''} Detected`;
+      subtitle = "Wave power, gusts, or pressure exceed safe thresholds";
+    } else if (green > 0) {
+      color    = "bg-safe-500/10 border-safe-500/40";
+      icon     = "🟢";
+      title    = `${green} Prime Fishing Window${green > 1 ? 's' : ''} Identified`;
+      subtitle = "Optimal wave height, power, and wind conditions aligned";
+    } else {
+      color    = "bg-caution-500/10 border-caution-500/40";
+      icon     = "🟡";
+      title    = "Moderate Conditions — Caution Advised";
+      subtitle = "No critical hazards, but conditions are suboptimal";
+    }
+
+    flagBanner.className = `rounded-xl px-5 py-4 flex items-center justify-between border-2 ${color}`;
+    flagIcon.textContent   = icon;
+    flagTitle.textContent  = title;
+    flagSubtitle.textContent = subtitle;
+
+    if (analytics.cold_front_detected) {
+      flagSubtitle.textContent += " | ❄️ Cold front passage detected";
+    }
+    if (analytics.weed_risk_active) {
+      flagSubtitle.textContent += " | 🌿 Weed risk active";
+    }
+
+    flagCounts.innerHTML = `
+      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-safe-500/20 text-safe-400">🟢 ${green}</span>
+      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-caution-500/20 text-caution-400">🟡 ${yellow}</span>
+      <span class="text-xs font-mono px-2 py-1 rounded-lg bg-danger-500/20 text-danger-400">🔴 ${red}</span>
+    `;
+  }
+
+
+  function renderMetricCards(analytics) {
+    const baseline = analytics.past_48h_baseline;
+    const metrics = [
+      {
+        icon: "🌊",
+        label: "Max Wave Power",
+        value: `${analytics.max_wave_power_today} kW/m`,
+        sub: analytics.max_wave_power_today > 3.0 ? "⚠️ Exceeds safety threshold" : "Within tolerance",
+        color: analytics.max_wave_power_today > 3.0 ? "text-danger-400" : "text-safe-400",
+      },
+      {
+        icon: "💨",
+        label: "48h Wind Type",
+        value: baseline.dominant_wind_type,
+        sub: `${baseline.sustained_wind_hours}h sustained >15 kts`,
+        color: baseline.dominant_wind_type === "Onshore" ? "text-caution-400" : "text-wave-400",
+      },
+      {
+        icon: "🌡️",
+        label: "Avg Air Temp",
+        value: `${analytics.avg_temp_today}°C`,
+        sub: analytics.avg_temp_today < 16 ? "Cold water species active" : "Warm water species active",
+        color: "text-slate-300",
+      },
+      {
+        icon: "🌊",
+        label: "48h Swell Height",
+        value: `${baseline.avg_swell_height_48h} m`,
+        sub: `Period: ${baseline.avg_wave_period_48h}s`,
+        color: analytics.weed_risk_active ? "text-caution-400" : "text-slate-300",
+      },
+    ];
+
+    metricCardsEl.innerHTML = metrics.map(m => `
+      <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl p-4 hover:border-ocean-500/70 transition-colors">
+        <div class="flex items-center gap-2 mb-2">
+          <span class="text-lg">${m.icon}</span>
+          <span class="text-xs text-slate-500 uppercase tracking-wider font-semibold">${m.label}</span>
+        </div>
+        <p class="text-xl font-bold font-mono ${m.color}">${m.value}</p>
+        <p class="text-xs text-slate-500 mt-1">${m.sub}</p>
+      </div>
+    `).join("");
+  }
+
+
+  function renderSpecies(predictions) {
+    const probColors = {
+      "HIGH":       "bg-safe-500/15 border-safe-500/30 text-safe-400",
+      "MEDIUM-HIGH":"bg-wave-500/15 border-wave-500/30 text-wave-400",
+      "MEDIUM":     "bg-caution-500/15 border-caution-500/30 text-caution-400",
+      "LOW-MEDIUM": "bg-slate-500/15 border-slate-500/30 text-slate-400",
+    };
+
+    speciesSectionEl.innerHTML = `
+      <h4 class="text-xs font-bold uppercase tracking-widest text-slate-500 flex items-center gap-2 mt-2">
+        <span>🎣</span> Biological Probability Matrix
+      </h4>
+      ${predictions.map(sp => {
+        const probKey = Object.keys(probColors).find(k => sp.probability.startsWith(k)) || "LOW-MEDIUM";
+        const colorClass = probColors[probKey];
+        return `
+        <div class="bg-ocean-800 border border-ocean-600/50 rounded-xl px-5 py-4 flex items-start gap-4
+                    hover:border-ocean-500/70 transition-colors">
+          <span class="text-2xl mt-0.5">🐟</span>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center flex-wrap gap-2 mb-1">
+              <p class="font-bold text-sm text-white">${sp.species}</p>
+              <span class="text-xs font-mono px-2 py-0.5 rounded-full border ${colorClass}">
+                ${sp.probability}
+              </span>
+            </div>
+            <p class="text-xs text-slate-400 mb-1.5">${sp.trigger}</p>
+            <p class="text-xs text-wave-400/80 font-mono">🪱 ${sp.bait}</p>
+          </div>
+        </div>`;
+      }).join("")}
+    `;
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // RENDERING — Gemini AI Report (Markdown-to-HTML parser)
+  // ---------------------------------------------------------------------------
+  function parseMarkdownToHTML(text) {
+    // Convert ## headers, **bold**, bullet lists, and paragraphs
+    let html = text
+      .replace(/^## (.+)$/gm,    '<h2>$1</h2>')
+      .replace(/^### (.+)$/gm,   '<h2 style="font-size:0.95rem">$1</h2>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g,     '<em style="color:#7dd3fc">$1</em>')
+      .replace(/^[\-\*] (.+)$/gm,'<li>$1</li>')
+      .replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`)
+      .split('\n\n')
+      .map(para => {
+        if (para.startsWith('<h') || para.startsWith('<ul')) return para;
+        if (para.trim() === '') return '';
+        return `<p>${para.replace(/\n/g, '<br>')}</p>`;
+      })
+      .join('');
+    return html;
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // MAIN FORM SUBMIT
+  // ---------------------------------------------------------------------------
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    showLoading();
+
+    const payload = {
+      latitude:          parseFloat(document.getElementById("latitude").value),
+      longitude:         parseFloat(document.getElementById("longitude").value),
+      beach_orientation: parseInt(orientSlider.value),
+      beach_type:        document.querySelector("input[name='beach_type']:checked").value,
+      target_date:       document.querySelector("input[name='target_date']:checked").value,
+    };
+
+    // Basic client-side validation
+    if (isNaN(payload.latitude) || isNaN(payload.longitude)) {
+      hideLoading();
+      showError("Please enter valid latitude and longitude coordinates.");
+      return;
+    }
+    if (payload.latitude < -90 || payload.latitude > 90) {
+      hideLoading();
+      showError("Latitude must be between -90 and 90.");
+      return;
+    }
+    if (payload.longitude < -180 || payload.longitude > 180) {
+      hideLoading();
+      showError("Longitude must be between -180 and 180.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/analyze`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || `Server error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      // ---- Render Analytics Cards ----
+      renderFlagBanner(data.analytics);
+      renderMetricCards(data.analytics);
+      sinkerTextEl.textContent = data.analytics.sinker_recommendation;
+      renderSpecies(data.analytics.species_predictions);
+
+      // ---- Render AI Report ----
+      aiReportContentEl.innerHTML = parseMarkdownToHTML(data.ai_report);
+      tokenAuditEl.textContent = `~${data.context_tokens_approx} context tokens`;
+
+      // ---- Show Sections ----
+      analyticsSection.classList.remove("hidden");
+      aiReportSection.classList.remove("hidden");
+
+      // Smooth scroll to results
+      setTimeout(() => {
+        analyticsSection.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 100);
+
+    } catch (err) {
+      showError(err.message || "An unexpected error occurred. Check API connectivity.");
+    } finally {
+      hideLoading();
+    }
+  });
+
+
+  // ---------------------------------------------------------------------------
+  // COPY REPORT BUTTON
+  // ---------------------------------------------------------------------------
+  copyBtn.addEventListener("click", () => {
+    const text = aiReportContentEl.innerText;
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = "✅ Copied!";
+      setTimeout(() => { copyBtn.textContent = "📋 Copy Report"; }, 2500);
+    });
+  });
+
+</script>
+
+</body>
+  </html>
