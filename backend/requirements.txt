@@ -1,6 +1,21 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-httpx==0.27.0
-pydantic==2.7.1
-google-generativeai==0.7.2
-python-dotenv==1.0.1
+# =============================================================================
+# SurfCast Analytics — Backend Dependencies
+# Python Target: 3.11.x (pinned via runtime.txt)
+# Last Verified: May 2026
+# =============================================================================
+
+# --- Web Framework ---
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+
+# --- HTTP Client (async) ---
+httpx==0.28.1
+
+# --- Data Validation ---
+pydantic==2.11.5
+
+# --- Google Gemini AI SDK ---
+google-generativeai==0.8.5
+
+# --- Environment Variables ---
+python-dotenv==1.1.0
