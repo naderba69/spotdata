@@ -1,5 +1,10 @@
 """
-Surfcasting Analytics API - Final v11.1 (Fixed past_avg_power error)
+Surfcasting Analytics API – Final v13.0 (Precision Fixes)
+- Extracts real local date from Open-Meteo time stamps.
+- Adds min/max for waves & wind to show true ranges.
+- Refines wind classification (Onshore light, etc.).
+- Richer weather description.
+- Token limit 4000 for full report.
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -14,7 +19,7 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
-app = FastAPI(title="Surfcasting Analytics", version="11.1.0")
+app = FastAPI(title="Surfcasting Analytics", version="13.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,6 +33,7 @@ MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+# --------------- النماذج ---------------
 class ReportRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -51,7 +57,7 @@ def health():
     return {"status": "ok", "gemini": bool(GEMINI_KEY), "model": MODEL_NAME}
 
 # --------------- المنطقة الزمنية ---------------
-async def fetch_timezone(lat, lon):
+async def fetch_timezone_info(lat, lon):
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(MARINE_URL, params={
@@ -59,25 +65,32 @@ async def fetch_timezone(lat, lon):
                 "hourly": "wave_height", "timezone": "auto", "forecast_days": 1
             }, timeout=10)
             r.raise_for_status()
-            tz = r.json().get("timezone", "UTC")
-            zoneinfo.ZoneInfo(tz)
-            return tz
+            data = r.json()
+            tz_name = data.get("timezone", "UTC")
+            tz_abbr = data.get("timezone_abbreviation", "UTC")
+            zoneinfo.ZoneInfo(tz_name)
+            return tz_name, tz_abbr
     except:
-        return "UTC"
+        return "UTC", "UTC"
 
-def target_date_from_str(txt, tz_name):
-    try:
+def extract_real_date_from_times(times: list, tz_name: str) -> date:
+    if not times:
         tz = zoneinfo.ZoneInfo(tz_name)
+        return datetime.now(tz).date()
+    try:
+        dt = datetime.fromisoformat(times[0])
+        if dt.tzinfo is None:
+            tz = zoneinfo.ZoneInfo(tz_name)
+            dt = dt.replace(tzinfo=tz)
+        return dt.date()
     except:
-        tz = zoneinfo.ZoneInfo("UTC")
-    now = datetime.now(tz)
-    logger.info(f"Local now: {now}, date: {now.date()}")
-    if txt == "today":
-        return now.date()
-    elif txt == "tomorrow":
-        return now.date() + timedelta(days=1)
-    else:
-        return now.date() + timedelta(days=2)
+        tz = zoneinfo.ZoneInfo(tz_name)
+        return datetime.now(tz).date()
+
+def resolve_target_date_from_real(txt: str, real_today: date) -> date:
+    if txt == "today": return real_today
+    elif txt == "tomorrow": return real_today + timedelta(days=1)
+    return real_today + timedelta(days=2)
 
 # --------------- جلب البيانات ---------------
 async def fetch_marine(lat, lon, start, end):
@@ -167,7 +180,7 @@ def moon_phase(d: date) -> str:
     }
     return phases.get(idx, "محاق")
 
-# --------------- المحرك الفيزيائي ---------------
+# --------------- المحرك الفيزيائي (دقة عالية) ---------------
 def safe_float(v):
     if v is None: return 0.0
     try:
@@ -179,13 +192,19 @@ def angle_diff(w, b):
     d = abs(w - b) % 360
     return 360 - d if d > 180 else d
 
-def wind_class(d):
-    if d < 45: return "Onshore"
-    if d > 135: return "Offshore"
-    return "Sideshore"
+def wind_class_detailed(diff):
+    """تصنيف دقيق للرياح بناءً على الزاوية"""
+    if diff < 30: return "بحرية مباشرة (Onshore قوي)"
+    elif diff < 45: return "بحرية خفيفة (Onshore خفيف)"
+    elif diff < 60: return "جانبية مائلة للبحر"
+    elif diff <= 120: return "جانبية"
+    elif diff < 150: return "جانبية مائلة للبر"
+    elif diff < 165: return "برية خفيفة (Offshore خفيف)"
+    else: return "برية مباشرة (Offshore قوي)"
 
 def weather_desc(code):
-    if code <= 1: return "مشمس"
+    if code == 0: return "سماء صافية تماماً"
+    elif code == 1: return "مشمس غالباً مع بعض السحب العالية"
     elif code == 2: return "غائم جزئي"
     elif code == 3: return "غائم"
     elif 45 <= code <= 48: return "ضباب"
@@ -222,10 +241,10 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
 
     wave_power = [0.49 * (h**2) * p for h, p in zip(wave_h, wave_p)]
 
-    wind_classes = []
+    wind_classes_detailed = []
     for wd in wind_dir:
         d = angle_diff(wd, beach_orient)
-        wind_classes.append(wind_class(d))
+        wind_classes_detailed.append(wind_class_detailed(d))
 
     dtimes = []
     for t_str in times:
@@ -242,15 +261,12 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     target_idx = [i for i, dt in enumerate(dtimes) if target_start <= dt < target_end]
 
     if not target_idx:
-        return {
-            "past_avg_power": 0.0, "dominant_wind": "غير معروف", "sustained_hrs": 0,
-            "blocks": [], "red_flags": [], "green_flags": [], "weed_risk": False,
-            "bio": {}, "avg_sst": 0.0, "extra_info": {}
-        }
+        return {"past_avg_power": 0.0, "dominant_wind": "غير معروف", "sustained_hrs": 0,
+                "blocks": [], "red_flags": [], "green_flags": [], "weed_risk": False,
+                "bio": {}, "avg_sst": 0.0, "extra_info": {}}
 
-    # المتغير المحلي يحمل القيمة الصحيحة
     past_avg_power_val = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
-    past_wclass = [wind_classes[i] for i in past_idx]
+    past_wclass = [wind_classes_detailed[i] for i in past_idx]
     dominant = max(set(past_wclass), key=past_wclass.count) if past_wclass else "Offshore"
     sustained_hrs = sum(1 for i in past_idx if wind_kph[i] > 18.5)
 
@@ -284,10 +300,16 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     for key, pd in periods.items():
         idxs = pd["indices"]
         if not idxs: continue
+        # الموج: متوسط، أدنى، أقصى
         avg_h = sum(wave_h[i] for i in idxs)/len(idxs)
+        min_h = min(wave_h[i] for i in idxs)
+        max_h = max(wave_h[i] for i in idxs)
         avg_p = sum(wave_power[i] for i in idxs)/len(idxs)
+        # الرياح: متوسط، أدنى، أقصى
         avg_w = sum(wind_kph[i] for i in idxs)/len(idxs)
-        wc = max(set(wind_classes[i] for i in idxs), key=wind_classes.count)
+        min_w = min(wind_kph[i] for i in idxs)
+        max_w = max(wind_kph[i] for i in idxs)
+        wc = max(set(wind_classes_detailed[i] for i in idxs), key=wind_classes_detailed.count)
         avg_sw_h = sum(swell_h[i] for i in idxs)/len(idxs)
         avg_sw_p = sum(swell_p[i] for i in idxs)/len(idxs)
         avg_air = sum(pd["temps"])/len(pd["temps"]) if pd["temps"] else None
@@ -295,9 +317,14 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         most_common_code = max(set(pd["codes"]), key=pd["codes"].count) if pd["codes"] else 0
         block_list.append({
             "name": pd["label"],
-            "wave_h": round(avg_h,2), "power": round(avg_p,2),
-            "wind_kph": round(avg_w,1), "wind_dir": wc,
-            "swell_h": round(avg_sw_h,2), "swell_period": round(avg_sw_p,2),
+            "wave_h_range": f"{min_h:.2f}-{max_h:.2f}",
+            "avg_wave_h": round(avg_h,2),
+            "power": round(avg_p,2),
+            "wind_kph_range": f"{min_w:.1f}-{max_w:.1f}",
+            "avg_wind_kph": round(avg_w,1),
+            "wind_dir": wc,
+            "swell_h": round(avg_sw_h,2),
+            "swell_period": round(avg_sw_p * 2) / 2,  # تقريب لأقرب 0.5 ثانية
             "air_temp": round(avg_air,1) if avg_air is not None else "غير متوفر",
             "precip_mm": round(total_precip,1),
             "weather": weather_desc(most_common_code)
@@ -316,11 +343,11 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
 
     past_wp_avg = sum(wave_p[i] for i in past_idx) / max(len(past_idx),1)
     past_sh_avg = sum(swell_h[i] for i in past_idx) / max(len(past_idx),1)
-    weed = (past_wp_avg >= 8.0 and past_sh_avg > 1.0 and wind_classes[target_idx[0]] == "Onshore")
+    weed = (past_wp_avg >= 8.0 and past_sh_avg > 1.0 and wind_classes_detailed[target_idx[0]].startswith("بحرية"))
 
     avg_sst = sum(sst[i] for i in target_idx) / max(len(target_idx),1)
     bio = {}
-    if avg_sst < 16 and any(c == "Onshore" for c in [wind_classes[i] for i in target_idx]):
+    if avg_sst < 16 and any(c.startswith("بحرية") for c in [wind_classes_detailed[i] for i in target_idx]):
         bio["high"] = ["قاروص", "سارغ كبير"]
     elif avg_sst > 19:
         bio["high"] = ["دوراد", "ماربري"]
@@ -331,7 +358,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     if beach_type == "sandy":
         bio.setdefault("additional", []).append("بوري")
 
-    # استخدم past_avg_power_val كقيمة مضمونة
     return {
         "past_avg_power": round(past_avg_power_val, 2),
         "dominant_wind": dominant,
@@ -355,7 +381,7 @@ def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     lines = [
         f"الموقع: {req.latitude:.2f}, {req.longitude:.2f}، شاطئ {beach}، اتجاه البحر {req.beach_orientation}°",
-        f"التاريخ المستهدف: {req.target_date} ({tz_name})",
+        f"التاريخ المستهدف: {req.target_date} (توقيت {tz_name})",
         f"حرارة الماء: {agg.get('avg_sst', 'غير معروف')}°م",
         f"متوسط طاقة الموج (48 ساعة الماضية): {agg.get('past_avg_power', 0)} kW/m",
         f"الرياح السائدة: {agg.get('dominant_wind', 'غير معروف')}",
@@ -373,10 +399,11 @@ def build_context(req, agg, tz_name):
         lines.append("تفاصيل الفترات (صباح / ظهر / ليل):")
         for b in agg["blocks"]:
             lines.append(
-                f"- {b['name']}: ارتفاع الموج {b['wave_h']}م, "
-                f"swell {b['swell_h']}م/ {b['swell_period']}ث, طاقة {b['power']} kW/m, "
-                f"رياح {b['wind_kph']} كم/س ({b['wind_dir']}), حرارة الهواء ~{b['air_temp']}°م, "
-                f"أمطار: {b['precip_mm']}مم, الطقس: {b['weather']}"
+                f"- {b['name']}: حالة السماء: {b['weather']}, "
+                f"الموج بين {b['wave_h_range']} متر, swell {b['swell_h']}م كل {b['swell_period']}ث, "
+                f"طاقة {b['power']} kW/m, "
+                f"الرياح {b['wind_kph_range']} كم/س (المتوسط {b['avg_wind_kph']} كم/س, {b['wind_dir']}), "
+                f"حرارة الهواء ~{b['air_temp']}°م, أمطار: {b['precip_mm']}مم"
             )
     if agg.get("red_flags"):
         lines.append("أوقات خطرة: " + "، ".join(agg["red_flags"]))
@@ -389,18 +416,18 @@ def build_context(req, agg, tz_name):
         if bio.get("additional"): lines.append(f"- إضافية: {', '.join(bio['additional'])}")
     return "\n".join(lines)
 
-# --------------- SYSTEM PROMPT ---------------
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري خبير. اكتب تقريراً بحرياً تفصيلياً متكاملاً باللغة العربية والمصطلحات التونسية (المرصاص، اللدونة، التيارات الجارفة، القفلة، دود الكف، القمبري، الشريب، القرابين...). التقرير يجب أن يكون نصاً واحداً متصلاً بدون أي فواصل أو رموز خاصة، وليس على شكل نقاط.
+# --------------- SYSTEM PROMPT (مع تعليمات النطاقات) ---------------
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري خبير. اكتب تقريراً بحرياً تفصيلياً متكاملاً باللغة العربية والمصطلحات التونسية الدارجة (المرصاص، اللدونة، التيارات الجارفة، القفلة، دود الكف، القمبري، الشريب، القرابين...). التقرير يجب أن يكون نصاً واحداً متصلاً، بدون فواصل أو رموز خاصة، وليس على شكل نقاط.
 
-يجب أن يغطي التقرير جميع النقاط التالية، مستخدماً جميع البيانات المعطاة بدقة:
+يجب أن يغطي التقرير جميع النقاط التالية، مستخدماً جميع البيانات المعطاة بدقة. **انتبه لاستخدام النطاقات (min-max) بدلاً من المتوسطات فقط لوصف الموج والرياح.**:
 
-1. **التحليل العام للعوامل البحرية**: الطقس المتوقع صباحاً وظهراً وليلاً، درجة حرارة الهواء في كل فترة، درجة حرارة الماء، مرحلة القمر وتأثيرها على الصيد (خاصة الليلي)، وقت شروق الشمس وغروبها (الساعة الذهبية للصيد).
+1. **التحليل العام للعوامل البحرية**: حالة السماء المتوقعة صباحاً وظهراً وليلاً، درجة حرارة الهواء في كل فترة، درجة حرارة الماء، مرحلة القمر وتأثيرها على الصيد الليلي، وقت شروق الشمس وغروبها (الساعة الذهبية).
 
-2. **تحليل الأمواج والتيارات**: ارتفاع الموج بالمتر، موج البحر الميت (swell) وارتفاعه وفترته، طاقة الأمواج (kW/m)، هل الرصاصة ستثبت في القاع؟ أوصِ بوزن ونوع الرصاص (هرم، مخالب/قرابين، صابونة) مع التعليل، واذكر تأثير نوع القاع (رملي/صخري) على التثبيت.
+2. **تحليل الأمواج والتيارات**: اذكر نطاق ارتفاع الموج (بين كذا وكذا متر)، swell وارتفاعه وفترته، طاقة الأمواج. بناءً على ذلك، هل الرصاصة ستثبت في القاع؟ أوصِ بوزن ونوع الرصاص (هرم، مخالب/قرابين، صابونة) مع التعليل، واذكر تأثير نوع القاع على التثبيت.
 
-3. **تحليل الرياح والأعشاب**: سرعة الرياح كم/س، اتجاهها (برية/بحرية/جانبية)، تأثيرها على الأعشاب ونقاء الماء. حلل تأثير هطول الأمطار (إن وجد) على العكارة وجلب الأكل من الوديان.
+3. **تحليل الرياح والأعشاب**: نطاق سرعة الرياح كم/س، اتجاهها المفصل (بحرية مباشرة، جانبية مائلة، برية، إلخ)، تأثيرها على الأعشاب ونقاء الماء. حلل تأثير هطول الأمطار على العكارة.
 
-4. **تقييم سبوت الصيد**: إيجابيات وسلبيات الظروف، أفضل ساعات الصيد مع التوقيت الدقيق، تكتيك الرمي (المسافة، الزاوية)، الطعوم المناسبة (دود الكف، الشريب، القمبري، السردين)، الأسماك المتوقع حضورها مع احتمالاتها بناءً على حرارة الماء والموسم ونوع القاع. نبه الصياد إلى مراجعة جدول المد والجزر المحلي لتحديد أفضل توقيت لدخول السمك.
+4. **تقييم سبوت الصيد**: إيجابيات وسلبيات الظروف، أفضل ساعات الصيد مع التوقيت الدقيق، تكتيك الرمي (المسافة، الزاوية)، الطعوم المناسبة (دود الكف، الشريب، القمبري، السردين)، الأسماك المتوقع حضورها بناءً على حرارة الماء والموسم ونوع القاع. نبه الصياد إلى مراجعة جدول المد والجزر المحلي.
 
 اكتب التقرير بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات أو أنك ذكاء اصطناعي."""
 
@@ -408,7 +435,7 @@ async def call_gemini(ctx):
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
     try:
         resp = await asyncio.to_thread(model.generate_content, contents=ctx,
-                                       generation_config={"temperature": 0.3, "max_output_tokens": 3000})
+                                       generation_config={"temperature": 0.3, "max_output_tokens": 4000})
         if resp.candidates and resp.candidates[0].content.parts:
             return resp.candidates[0].content.parts[0].text.strip()
         raise SurfError("رد فارغ")
@@ -419,8 +446,10 @@ async def call_gemini(ctx):
 @app.post("/generate-report")
 async def generate_report(req: ReportRequest):
     try:
-        tz = await fetch_timezone(req.latitude, req.longitude)
-        target_dt = target_date_from_str(req.target_date, tz)
+        tz_name, tz_abbr = await fetch_timezone_info(req.latitude, req.longitude)
+        logger.info(f"TZ: {tz_name} ({tz_abbr})")
+
+        target_dt = date.today()
         start_dt = target_dt - timedelta(days=2)
         end_dt = target_dt + timedelta(days=1)
         start_str = start_dt.isoformat()
@@ -430,10 +459,17 @@ async def generate_report(req: ReportRequest):
             fetch_marine(req.latitude, req.longitude, start_str, end_str),
             fetch_weather(req.latitude, req.longitude, start_str, end_str)
         )
-        agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz)
-        ctx = build_context(req, agg, tz)
+
+        real_today = extract_real_date_from_times(marine.get("hourly", {}).get("time", []), tz_name)
+        logger.info(f"Real today: {real_today}")
+        target_dt = resolve_target_date_from_real(req.target_date, real_today)
+        logger.info(f"Target date: {target_dt}")
+
+        agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz_name)
+        ctx = build_context(req, agg, tz_name)
         report = await call_gemini(ctx)
-        return {"report": report, "meta": {"timezone": tz, "target_date": target_dt.isoformat()}}
+
+        return {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
     except Exception as e:
         logger.exception("خطأ")
         raise HTTPException(status_code=500, detail=str(e))
