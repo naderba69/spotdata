@@ -4,19 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Surfcasting Analytics - التحليل البحري</title>
-
-  <!-- Tailwind CSS via CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
       theme: {
         extend: {
           colors: {
-            ocean: {
-              900: '#0b132b',
-              800: '#1a2a4a',
-              700: '#2a3a5a',
-            },
+            ocean: { 900: '#0b132b', 800: '#1a2a4a', 700: '#2a3a5a' },
             neon: '#00e5ff',
             amber: '#f59e0b',
           }
@@ -24,192 +18,103 @@
       }
     }
   </script>
-
-  <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-     crossorigin=""/>
-
-  <!-- Custom Styles -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    body {
-      background-color: #0b132b;
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    }
-    #map {
-      height: 400px;
-      width: 100%;
-      border-radius: 1rem;
-      border: 2px solid #1e3a5f;
-    }
-    /* Leaflet dark mode adjustments */
-    .leaflet-container {
-      background-color: #0b132b;
-    }
+    body { background-color: #0b132b; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    #map { height: 400px; width: 100%; border-radius: 1rem; border: 2px solid #1e3a5f; }
+    .leaflet-container { background-color: #0b132b; }
     .card {
-      background-color: #1a2a4a;
-      border: 1px solid #2a3a5a;
-      border-radius: 1rem;
-      padding: 1.5rem;
+      background-color: #1a2a4a; border: 1px solid #2a3a5a;
+      border-radius: 1rem; padding: 1.5rem;
       box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
+      transition: transform 0.2s, box-shadow 0.2s;
     }
-    .card:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 15px rgba(0,229,255,0.1);
-    }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,229,255,0.1); }
     .btn-primary {
-      background-color: #00e5ff;
-      color: #0b132b;
-      font-weight: bold;
-      padding: 0.75rem 2rem;
-      border-radius: 0.5rem;
-      transition: all 0.3s ease;
-      border: none;
-      cursor: pointer;
+      background-color: #00e5ff; color: #0b132b; font-weight: bold;
+      padding: 0.75rem 2rem; border-radius: 0.5rem; border: none;
+      cursor: pointer; transition: all 0.3s;
     }
-    .btn-primary:hover {
-      background-color: #00b8d4;
-      box-shadow: 0 0 15px rgba(0,229,255,0.4);
-    }
+    .btn-primary:hover { background-color: #00b8d4; box-shadow: 0 0 15px rgba(0,229,255,0.4); }
     .input-field {
-      background-color: #0f1a2e;
-      border: 1px solid #2a3a5a;
-      color: #e0e7ff;
-      border-radius: 0.5rem;
-      padding: 0.75rem;
-      width: 100%;
-      transition: border-color 0.3s;
+      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff;
+      border-radius: 0.5rem; padding: 0.75rem; width: 100%;
     }
-    .input-field:focus {
-      outline: none;
-      border-color: #00e5ff;
-      box-shadow: 0 0 8px rgba(0,229,255,0.3);
-    }
+    .input-field:focus { outline: none; border-color: #00e5ff; box-shadow: 0 0 8px rgba(0,229,255,0.3); }
     .segmented-btn {
-      background-color: #0f1a2e;
-      border: 1px solid #2a3a5a;
-      color: #a0b3d9;
-      padding: 0.5rem 1rem;
-      cursor: pointer;
-      transition: all 0.2s;
+      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #a0b3d9;
+      padding: 0.5rem 1rem; cursor: pointer; transition: all 0.2s; flex: 1;
     }
-    .segmented-btn.active {
-      background-color: #00e5ff;
-      color: #0b132b;
-      font-weight: bold;
-      border-color: #00e5ff;
-    }
-    /* Loading overlay */
+    .segmented-btn.active { background-color: #00e5ff; color: #0b132b; font-weight: bold; border-color: #00e5ff; }
     .loading-overlay {
-      position: fixed;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: rgba(11,19,43,0.9);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      z-index: 1000;
-      backdrop-filter: blur(4px);
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(11,19,43,0.9); display: flex; justify-content: center;
+      align-items: center; z-index: 1000; backdrop-filter: blur(4px);
     }
     .spinner {
-      width: 60px;
-      height: 60px;
-      border: 6px solid rgba(0,229,255,0.2);
-      border-top: 6px solid #00e5ff;
-      border-radius: 50%;
+      width: 60px; height: 60px; border: 6px solid rgba(0,229,255,0.2);
+      border-top: 6px solid #00e5ff; border-radius: 50%;
       animation: spin 1s linear infinite;
     }
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .direction-display {
-      background-color: #0f1a2e;
-      border: 1px solid #2a3a5a;
-      color: #00e5ff;
-      padding: 0.25rem 0.75rem;
-      border-radius: 0.5rem;
-      font-weight: bold;
-      text-align: center;
-      min-width: 120px;
+      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #00e5ff;
+      padding: 0.25rem 0.75rem; border-radius: 0.5rem; font-weight: bold;
+      text-align: center; min-width: 130px;
     }
   </style>
 </head>
 <body class="text-gray-200 p-4 md:p-6">
-
   <div class="max-w-7xl mx-auto">
-    <!-- العنوان -->
     <h1 class="text-3xl md:text-4xl font-bold text-neon mb-8 text-center">
       🎣 Surfcasting Analytics - التحليل البحري للصيد الساحلي
     </h1>
 
-    <!-- القسم العلوي: الخريطة + لوحة التحكم -->
+    <!-- الخريطة + لوحة التحكم -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-      <!-- الخريطة (2/3) -->
-      <div class="lg:col-span-2">
-        <div id="map"></div>
-      </div>
-
-      <!-- لوحة التحكم (1/3) -->
+      <div class="lg:col-span-2"><div id="map"></div></div>
       <div class="card space-y-5">
         <h2 class="text-xl font-bold text-neon mb-4">⚙️ إعدادات الموقع</h2>
-
-        <!-- خط العرض -->
         <div>
-          <label class="block text-sm text-gray-400 mb-1">خط العرض (Latitude)</label>
-          <input type="number" id="latitude" step="any" class="input-field" placeholder="36.7000" value="36.7000">
+          <label class="block text-sm text-gray-400 mb-1">خط العرض</label>
+          <input type="number" id="latitude" step="any" class="input-field" value="36.7000">
         </div>
-
-        <!-- خط الطول -->
         <div>
-          <label class="block text-sm text-gray-400 mb-1">خط الطول (Longitude)</label>
-          <input type="number" id="longitude" step="any" class="input-field" placeholder="10.8000" value="10.8000">
+          <label class="block text-sm text-gray-400 mb-1">خط الطول</label>
+          <input type="number" id="longitude" step="any" class="input-field" value="10.8000">
         </div>
-
-        <!-- اتجاه الشاطئ (Slider) -->
         <div>
-          <label class="block text-sm text-gray-400 mb-1">اتجاه الشاطئ نحو البحر (0° - 360°)</label>
+          <label class="block text-sm text-gray-400 mb-1">اتجاه الشاطئ نحو البحر</label>
           <div class="flex items-center gap-3">
             <input type="range" id="orientation" min="0" max="360" value="45" class="w-full accent-neon">
             <span id="orientationValue" class="direction-display">45° (شمال شرقي)</span>
           </div>
         </div>
-
-        <!-- نوع الشاطئ -->
         <div>
           <label class="block text-sm text-gray-400 mb-1">نوع الشاطئ</label>
           <select id="beachType" class="input-field">
-            <option value="sandy">رملي (Sandy)</option>
-            <option value="rocky">صخري (Rocky)</option>
+            <option value="sandy">رملي</option>
+            <option value="rocky">صخري</option>
           </select>
         </div>
-
-        <!-- التاريخ المستهدف -->
         <div>
           <label class="block text-sm text-gray-400 mb-2">التاريخ المستهدف</label>
           <div class="flex rounded-md overflow-hidden border border-[#2a3a5a]">
-            <button class="segmented-btn flex-1 active" data-date="today">اليوم</button>
-            <button class="segmented-btn flex-1" data-date="tomorrow">غداً</button>
-            <button class="segmented-btn flex-1" data-date="day_after">بعد غد</button>
+            <button class="segmented-btn active" data-date="today">اليوم</button>
+            <button class="segmented-btn" data-date="tomorrow">غداً</button>
+            <button class="segmented-btn" data-date="day_after">بعد غد</button>
           </div>
           <input type="hidden" id="targetDate" value="today">
         </div>
-
-        <!-- زر الإرسال -->
-        <button id="submitBtn" class="btn-primary w-full mt-4">
-          📊 توليد التقرير البحري
-        </button>
-        <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام (بدء تشغيل الخادم)</p>
+        <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
+        <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام</p>
       </div>
     </div>
 
-    <!-- حاوية النتائج (البطاقات الأربع) -->
-    <div id="resultsContainer" class="grid grid-cols-1 md:grid-cols-2 gap-6 hidden">
-      <!-- سيتم ملؤها بواسطة JavaScript -->
-    </div>
+    <!-- نتائج التقرير -->
+    <div id="resultsContainer" class="grid grid-cols-1 md:grid-cols-2 gap-6 hidden"></div>
 
-    <!-- مؤشر التحميل (مخفي افتراضياً) -->
+    <!-- التحميل -->
     <div id="loadingOverlay" class="loading-overlay hidden">
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
@@ -219,82 +124,61 @@
     </div>
   </div>
 
-  <!-- Leaflet JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-     crossorigin=""></script>
-
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ================== الخريطة ==================
-    const defaultLat = 36.7000;
-    const defaultLon = 10.8000;
-    const map = L.map('map').setView([defaultLat, defaultLon], 10);
-
-    // خريطة داكنة من CartoDB
+    // ---------- الخريطة ----------
+    const map = L.map('map').setView([36.7, 10.8], 10);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-      subdomains: 'abcd',
-      maxZoom: 19
+      attribution: '&copy; OSM &copy; CARTO', subdomains: 'abcd', maxZoom: 19
     }).addTo(map);
+    const marker = L.marker([36.7, 10.8], { draggable: true }).addTo(map)
+      .bindPopup('اسحب العلامة').openPopup();
 
-    // علامة قابلة للسحب
-    const marker = L.marker([defaultLat, defaultLon], { draggable: true }).addTo(map)
-      .bindPopup('اسحب العلامة لتحديد الموقع').openPopup();
-
-    // تحديث الحقول عند سحب العلامة
-    marker.on('dragend', function(event) {
-      const position = marker.getLatLng();
-      document.getElementById('latitude').value = position.lat.toFixed(6);
-      document.getElementById('longitude').value = position.lng.toFixed(6);
+    marker.on('dragend', () => {
+      const pos = marker.getLatLng();
+      document.getElementById('latitude').value = pos.lat.toFixed(6);
+      document.getElementById('longitude').value = pos.lng.toFixed(6);
     });
 
-    // تحديث الخريطة عند تغيير الإحداثيات يدوياً
-    function updateMarkerFromInputs() {
-      const lat = parseFloat(document.getElementById('latitude').value) || defaultLat;
-      const lng = parseFloat(document.getElementById('longitude').value) || defaultLon;
+    function updateMarker() {
+      const lat = parseFloat(document.getElementById('latitude').value) || 36.7;
+      const lng = parseFloat(document.getElementById('longitude').value) || 10.8;
       marker.setLatLng([lat, lng]);
       map.setView([lat, lng], 10);
     }
+    document.getElementById('latitude').addEventListener('change', updateMarker);
+    document.getElementById('longitude').addEventListener('change', updateMarker);
 
-    document.getElementById('latitude').addEventListener('change', updateMarkerFromInputs);
-    document.getElementById('longitude').addEventListener('change', updateMarkerFromInputs);
-
-    // ================== تحويل الدرجات إلى اتجاه نصي ==================
-    function degreesToDirection(deg) {
-      const directions = ['شمال', 'شمال شمال شرقي', 'شمال شرقي', 'شرق شمال شرقي',
-                          'شرق', 'شرق جنوب شرقي', 'جنوب شرقي', 'جنوب جنوب شرقي',
-                          'جنوب', 'جنوب جنوب غربي', 'جنوب غربي', 'غرب جنوب غربي',
-                          'غرب', 'غرب شمال غربي', 'شمال غربي', 'شمال شمال غربي'];
-      const index = Math.round(deg / 22.5) % 16;
-      return directions[index];
-    }
-
-    // تحديث عرض الاتجاه عند تغيير slider
+    // ---------- اتجاه الشاطئ ----------
+    const dirs = ['شمال','شمال شمال شرقي','شمال شرقي','شرق شمال شرقي','شرق',
+                  'شرق جنوب شرقي','جنوب شرقي','جنوب جنوب شرقي','جنوب',
+                  'جنوب جنوب غربي','جنوب غربي','غرب جنوب غربي','غرب',
+                  'غرب شمال غربي','شمال غربي','شمال شمال غربي'];
+    function degToDir(d) { return dirs[Math.round(d / 22.5) % 16]; }
     const orientSlider = document.getElementById('orientation');
-    const orientValue = document.getElementById('orientationValue');
-    orientSlider.addEventListener('input', function() {
-      const deg = parseInt(this.value);
-      orientValue.textContent = `${deg}° (${degreesToDirection(deg)})`;
+    const orientVal = document.getElementById('orientationValue');
+    orientSlider.addEventListener('input', () => {
+      const deg = parseInt(orientSlider.value);
+      orientVal.textContent = `${deg}° (${degToDir(deg)})`;
     });
 
-    // ================== أزرار التاريخ ==================
-    const dateButtons = document.querySelectorAll('.segmented-btn');
-    const targetDateInput = document.getElementById('targetDate');
-    dateButtons.forEach(btn => {
+    // ---------- أزرار التاريخ ----------
+    const dateBtns = document.querySelectorAll('.segmented-btn');
+    dateBtns.forEach(btn => {
       btn.addEventListener('click', function() {
-        dateButtons.forEach(b => b.classList.remove('active'));
+        dateBtns.forEach(b => b.classList.remove('active'));
         this.classList.add('active');
-        targetDateInput.value = this.dataset.date;
+        document.getElementById('targetDate').value = this.dataset.date;
       });
     });
 
-    // ================== تقديم الطلب ==================
+    // ---------- إرسال الطلب وعرض النتائج ----------
     const submitBtn = document.getElementById('submitBtn');
     const loadingOverlay = document.getElementById('loadingOverlay');
     const resultsContainer = document.getElementById('resultsContainer');
+    const API_URL = 'https://spotdata.onrender.com/generate-report';
 
     submitBtn.addEventListener('click', async () => {
-      // تجميع البيانات
       const payload = {
         latitude: parseFloat(document.getElementById('latitude').value),
         longitude: parseFloat(document.getElementById('longitude').value),
@@ -303,81 +187,58 @@
         target_date: document.getElementById('targetDate').value
       };
 
-      // إظهار واجهة التحميل
       loadingOverlay.classList.remove('hidden');
       resultsContainer.classList.add('hidden');
 
       try {
-        const response = await fetch('https://spotdata.onrender.com/generate-report', {
+        const response = await fetch(API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
 
         if (!response.ok) {
-          throw new Error(`خطأ في الخادم (${response.status})`);
+          let errMsg = `خطأ في الخادم (${response.status})`;
+          try {
+            const errData = await response.json();
+            errMsg += '\n' + (errData.detail || JSON.stringify(errData));
+          } catch (_) {}
+          throw new Error(errMsg);
         }
 
         const data = await response.json();
         const report = data.report || '';
-
-        // تقسيم التقرير إلى 4 أقسام
         const sections = report.split('---');
-        if (sections.length !== 4) {
-          console.warn('عدد الأقسام ليس 4، تم استلام:', sections.length);
-        }
-
-        // عرض البطاقات
-        displayReportCards(sections);
-
-        // إخفاء التحميل
-        loadingOverlay.classList.add('hidden');
+        displayCards(sections);
         resultsContainer.classList.remove('hidden');
-
-        // تمرير ناعم للنتائج
-        resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        resultsContainer.scrollIntoView({ behavior: 'smooth' });
 
       } catch (error) {
-        loadingOverlay.classList.add('hidden');
-        alert('تعذر جلب التقرير. الرجاء المحاولة مرة أخرى.\n' + error.message);
+        alert('❌ فشل جلب التقرير:\n' + error.message);
         console.error(error);
+      } finally {
+        loadingOverlay.classList.add('hidden');
       }
     });
 
-    // ================== عرض البطاقات ==================
-    function displayReportCards(sections) {
-      const container = document.getElementById('resultsContainer');
-      container.innerHTML = ''; // تفريغ المحتوى السابق
-
+    function displayCards(sections) {
+      resultsContainer.innerHTML = '';
       const titles = [
         '📋 التحليل التاريخي وحالة الماء ونقائه',
         '🌊 تقلبات فترات اليوم بين الصباح والظهر والليل',
-        '⚖️ الجدول الساعي واستراتيجية الرصاص (اللدونة)',
-        '🐟 التكهن الاحتمالي للأسماك والطُعوم وتكتيك الرمي'
+        '⚖️ استراتيجية الرصاص والجدول الساعي',
+        '🐟 التكهن الاحتمالي للأسماك والطُعوم'
       ];
-
-      // نتأكد من وجود 4 أقسام على الأقل (قد يكون بعضها فارغًا)
       for (let i = 0; i < 4; i++) {
         const card = document.createElement('div');
         card.className = 'card';
-
-        const title = document.createElement('h3');
-        title.className = 'text-lg font-bold text-neon mb-3';
-        title.textContent = titles[i] || `القسم ${i+1}`;
-
-        const content = document.createElement('div');
-        content.className = 'text-gray-300 leading-relaxed whitespace-pre-line';
-        content.textContent = (sections[i] || '').trim();
-
-        card.appendChild(title);
-        card.appendChild(content);
-        container.appendChild(card);
+        card.innerHTML = `
+          <h3 class="text-lg font-bold text-neon mb-3">${titles[i]}</h3>
+          <div class="text-gray-300 whitespace-pre-line leading-relaxed">${(sections[i] || '').trim()}</div>
+        `;
+        resultsContainer.appendChild(card);
       }
     }
-
-    // ================== الإعداد الأولي ==================
-    // ضبط القيم الافتراضية
-    document.getElementById('orientationValue').textContent = `45° (شمال شرقي)`;
   </script>
 </body>
 </html>
