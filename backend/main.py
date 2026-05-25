@@ -1,10 +1,9 @@
 """
-Surfcasting Analytics API - Production Ready
-FastAPI Backend for Surfcasting Reports (0% Physics Error)
+Surfcasting Analytics API - Production v3.0
+FastAPI Backend with Gemini 2.5 Flash (0% Physics Error)
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -13,23 +12,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 
-# ================== إعداد السجلات ==================
+# ------------------------- إعداد التسجيل -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
-# ================== التهيئة ==================
-app = FastAPI(title="Surfcasting Analytics", version="2.0.0")
+# ------------------------- التهيئة -------------------------
+app = FastAPI(title="Surfcasting Analytics", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_KEY:
-    raise RuntimeError("GEMINI_API_KEY مطلوب في متغيرات البيئة")
+    raise RuntimeError("GEMINI_API_KEY غير موجود في متغيرات البيئة")
 genai.configure(api_key=GEMINI_KEY)
+
+# استخدام Gemini 2.5 Flash (النموذج الأحدث)
+MODEL_NAME = "models/gemini-2.5-flash"
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
-# ================== النماذج ==================
+# ------------------------- النماذج -------------------------
 class ReportRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -37,7 +39,7 @@ class ReportRequest(BaseModel):
     beach_type: str = Field(..., pattern="^(sandy|rocky)$")
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
 
-# ================== استثناءات مخصصة ==================
+# ------------------------- معالجة الأخطاء -------------------------
 class SurfError(Exception):
     pass
 
@@ -48,9 +50,9 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "gemini": bool(GEMINI_KEY)}
+    return {"status": "ok", "gemini": bool(GEMINI_KEY), "model": MODEL_NAME}
 
-# ================== أدوات المنطقة الزمنية ==================
+# ------------------------- دوال المنطقة الزمنية -------------------------
 async def fetch_timezone(lat: float, lon: float) -> str:
     try:
         async with httpx.AsyncClient() as client:
@@ -60,7 +62,7 @@ async def fetch_timezone(lat: float, lon: float) -> str:
             }, timeout=10)
             r.raise_for_status()
             tz = r.json().get("timezone", "UTC")
-            zoneinfo.ZoneInfo(tz)  # صلاحية
+            zoneinfo.ZoneInfo(tz)  # التحقق من الصلاحية
             return tz
     except Exception:
         return "UTC"
@@ -71,11 +73,13 @@ def target_date_from_str(txt: str, tz_name: str) -> date:
     except Exception:
         tz = zoneinfo.ZoneInfo("UTC")
     now = datetime.now(tz)
-    if txt == "today": return now.date()
-    elif txt == "tomorrow": return now.date() + timedelta(days=1)
+    if txt == "today":
+        return now.date()
+    elif txt == "tomorrow":
+        return now.date() + timedelta(days=1)
     return now.date() + timedelta(days=2)
 
-# ================== جلب البيانات ==================
+# ------------------------- جلب البيانات -------------------------
 async def fetch_marine(lat, lon, start, end):
     async with httpx.AsyncClient() as client:
         r = await client.get(MARINE_URL, params={
@@ -98,7 +102,7 @@ async def fetch_weather(lat, lon, start, end):
         r.raise_for_status()
         return r.json()
 
-# ================== محرك الفيزياء ==================
+# ------------------------- المحرك الفيزيائي -------------------------
 def safe_float(v):
     if v is None: return 0.0
     try:
@@ -136,16 +140,14 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     wind_knots = [v * 0.5399568 for v in wind_speed]
     gust_kph = wind_gust  # أصلاً km/h
 
-    # طاقة الموج
     wave_power = [0.49 * (h**2) * p for h, p in zip(wave_h, wave_p)]
     swell_power = [0.49 * (h**2) * p for h, p in zip(swell_h, swell_p)]
     swell_speed = [p * 5.6 for p in swell_p]
 
-    # تصنيف الرياح
-    wclass = []
+    wind_classes = []
     for wd in wind_dir:
         d = angle_diff(wd, beach_orient)
-        wclass.append(wind_class(d))
+        wind_classes.append(wind_class(d))
 
     # تواريخ واعية بالمنطقة الزمنية
     dtimes = []
@@ -155,7 +157,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             dt = dt.replace(tzinfo=tz)
         dtimes.append(dt)
 
-    # الفترات
+    # الفترات الزمنية
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
     target_end = target_start + timedelta(days=1)
     past_start = target_start - timedelta(hours=48)
@@ -172,7 +174,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
 
     # ملخص 48 ساعة
     past_avg_power = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
-    past_wclass = [wclass[i] for i in past_idx]
+    past_wclass = [wind_classes[i] for i in past_idx]
     dominant = max(set(past_wclass), key=past_wclass.count) if past_wclass else "Offshore"
     sustained_hrs = sum(1 for i in past_idx if wind_knots[i] > 10)
 
@@ -195,12 +197,14 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         avg_h = sum(wave_h[i] for i in idxs)/len(idxs)
         avg_p = sum(wave_power[i] for i in idxs)/len(idxs)
         avg_w = sum(wind_knots[i] for i in idxs)/len(idxs)
-        wc = max(set(wclass[i] for i in idxs), key=wclass.count)
-        block_list.append({"name": blk["label"], "wave_h": round(avg_h,2),
-                           "power": round(avg_p,2), "wind_knots": round(avg_w,1),
-                           "wind_dir": wc})
+        wc = max(set(wind_classes[i] for i in idxs), key=wind_classes.count)
+        block_list.append({
+            "name": blk["label"], "wave_h": round(avg_h,2),
+            "power": round(avg_p,2), "wind_knots": round(avg_w,1),
+            "wind_dir": wc
+        })
 
-    # أعلام
+    # الأعلام
     reds, greens = [], []
     for i in target_idx:
         hh = dtimes[i].strftime("%H:%M")
@@ -223,7 +227,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         bio["high"] = ["دوراد رويال (Gilthead)", "ماربري (Striped)"]
     else:
         bio["high"] = []
-    if beach_type == "rocky" and any(c == "Onshore" for c in wclass):
+    if beach_type == "rocky" and any(c == "Onshore" for c in wind_classes):
         bio.setdefault("additional", []).append("سارغ (بيئة صخرية)")
     if beach_type == "sandy":
         bio.setdefault("additional", []).append("بوري (Mullet) أو ماربري")
@@ -240,7 +244,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         "avg_sst": round(avg_sst,1)
     }
 
-# ================== بناء سياق Gemini ==================
+# ------------------------- بناء سياق Gemini -------------------------
 def build_gemini_text(req: ReportRequest, agg: dict, tz_name: str) -> str:
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     lines = [
@@ -259,10 +263,8 @@ def build_gemini_text(req: ReportRequest, agg: dict, tz_name: str) -> str:
 
     lines.append("\nالأعلام الحمراء:")
     lines.extend([f"- {f}" for f in agg["red_flags"]] if agg["red_flags"] else ["- لا يوجد"])
-
     lines.append("\nالأعلام الخضراء:")
     lines.extend([f"- {f}" for f in agg["green_flags"]] if agg["green_flags"] else ["- لا يوجد"])
-
     lines.append(f"\nخطر الأعشاب: {'موجود' if agg['weed_risk'] else 'غير موجود'}")
     lines.append(f"\nحرارة الماء: {agg['avg_sst']}°م")
     lines.append("الاحتمال البيولوجي:")
@@ -283,7 +285,7 @@ SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف وخبير ف
 حافظ على نبرة خبير، ند للند، عالية الاحترافية، ومرتكزة على الفيزياء باستخدام مصطلحات الصيد العربية الشائعة."""
 
 async def call_gemini(text: str) -> str:
-    model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=SYSTEM_PROMPT)
+    model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
     gen_cfg = {"temperature": 0.2, "max_output_tokens": 2000}
     try:
         resp = await asyncio.to_thread(model.generate_content, contents=text, generation_config=gen_cfg)
@@ -291,7 +293,6 @@ async def call_gemini(text: str) -> str:
             raise SurfError("رد فارغ من Gemini")
         report = resp.candidates[0].content.parts[0].text
         if len(report.split("---")) != 4:
-            # محاولة أخرى
             retry = text + "\n\nتنبيه مهم: أعد كتابة التقرير بالضبط 4 أقسام مفصولة بـ ---"
             resp2 = await asyncio.to_thread(model.generate_content, contents=retry, generation_config=gen_cfg)
             if resp2.candidates and resp2.candidates[0].content.parts:
@@ -303,31 +304,24 @@ async def call_gemini(text: str) -> str:
         logger.error(f"Gemini error: {e}")
         raise SurfError(f"فشل Gemini: {str(e)}")
 
-# ================== نقطة النهاية ==================
+# ------------------------- نقطة النهاية -------------------------
 @app.post("/generate-report")
 async def generate_report(req: ReportRequest):
     try:
         logger.info(f"تقرير لـ {req.latitude},{req.longitude} تاريخ {req.target_date}")
-        # 1. منطقة زمنية
         tz = await fetch_timezone(req.latitude, req.longitude)
-        # 2. تاريخ
         target_dt = target_date_from_str(req.target_date, tz)
-        # 3. نطاق البيانات
         start_dt = target_dt - timedelta(days=2)
         end_dt = target_dt + timedelta(days=1)
         start_str = start_dt.isoformat()
         end_str = end_dt.isoformat()
 
-        # 4. جلب البيانات
         marine, weather = await asyncio.gather(
             fetch_marine(req.latitude, req.longitude, start_str, end_str),
             fetch_weather(req.latitude, req.longitude, start_str, end_str)
         )
-        # 5. الحسابات
         agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz)
-        # 6. سياق Gemini
         context = build_gemini_text(req, agg, tz)
-        # 7. تقرير Gemini
         report = await call_gemini(context)
         return {
             "report": report,
@@ -340,3 +334,8 @@ async def generate_report(req: ReportRequest):
     except Exception as e:
         logger.exception("خطأ غير متوقع")
         raise HTTPException(status_code=500, detail=f"خطأ داخلي: {str(e)}")
+
+# ------------------------- تشغيل -------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
