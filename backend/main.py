@@ -7,8 +7,8 @@ import math
 import asyncio
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Tuple
+import zoneinfo
 
-import pytz
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,7 +68,7 @@ def resolve_target_date(target_str: str, tz_name: str) -> date:
     """
     تحويل today / tomorrow / day_after إلى تاريخ حقيقي بالمنطقة الزمنية المعطاة.
     """
-    tz = pytz.timezone(tz_name)
+    tz = zoneinfo.ZoneInfo(tz_name)
     now = datetime.now(tz)
     if target_str == "today":
         return now.date()
@@ -202,17 +202,17 @@ def calculate_physics_and_aggregate(
         wind_classes.append(classify_wind(diff))
 
     # ========== تحويل الأوقات إلى كائنات datetime واعية بالمنطقة الزمنية ==========
-    tz = pytz.timezone(tz_name)
+    tz = zoneinfo.ZoneInfo(tz_name)
     dtimes = []
     for t_str in times_marine:
         # Open-Meteo يعيد الأوقات بصيغة ISO مع الإزاحة (مثال: 2025-03-10T14:00+01:00)
         dt = datetime.fromisoformat(t_str)
         if dt.tzinfo is None:
-            dt = tz.localize(dt)
+            dt = dt.replace(tzinfo=tz)
         dtimes.append(dt)
 
     # ========== تقسيم الفترات: ماضي (48 ساعة) والهدف (24 ساعة) ==========
-    target_start = tz.localize(datetime.combine(target_date_obj, datetime.min.time()))
+    target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
     target_end = target_start + timedelta(days=1)  # حتى منتصف ليل اليوم التالي
     past_start = target_start - timedelta(hours=48)
 
@@ -221,7 +221,6 @@ def calculate_physics_and_aggregate(
 
     # التعامل مع البيانات المفقودة
     if not target_indices:
-        # إذا لم تتوفر بيانات، نملأ بمتوسطات تقديرية
         past_avg_power = sum(wave_powers[i] for i in past_indices) / max(len(past_indices), 1)
         dominant_wind = max(set(wind_classes), key=wind_classes.count) if wind_classes else "Offshore"
         sustained_wind_hours = 0
