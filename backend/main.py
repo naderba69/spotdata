@@ -1,7 +1,8 @@
 """
-Surfcasting Analytics API - Final v6.0 (Unified Report, Metric Units)
+Surfcasting Analytics API - Final v6.1
+Fixed auto orientation (Tunisian coasts) + rich report prompt
 """
-import os, math, asyncio, logging, traceback, zoneinfo
+import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
 
 import httpx
@@ -14,7 +15,7 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
-app = FastAPI(title="Surfcasting Analytics", version="6.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="6.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -26,7 +27,6 @@ MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-# ------------------------- النماذج -------------------------
 class ReportRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -94,30 +94,63 @@ async def fetch_weather(lat, lon, start, end):
         r.raise_for_status()
         return r.json()
 
-# ------------------------- الاتجاه التلقائي -------------------------
-async def get_auto_orientation(lat, lon):
+# ------------------------- الاتجاه التلقائي (محسّن) -------------------------
+async def get_auto_orientation(lat: float, lon: float) -> int:
+    """
+    تحديد اتجاه الشاطئ نحو البحر باستخدام OpenStreetMap.
+    يبحث عن خط ساحلي في نطاق 5 كم ويعيد الزاوية العمودية باتجاه البحر.
+    """
+    # الاستعلام الأوسع: يبحث عن ways و relations
     query = f"""
     [out:json];
-    (way(around:1000,{lat},{lon})["natural"="coastline"];);
-    out body;
+    (
+      way(around:5000,{lat},{lon})["natural"="coastline"];
+      relation(around:5000,{lat},{lon})["natural"="coastline"];
+    );
+    out geom;
     """
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(OVERPASS_URL, params={"data": query}, timeout=15)
-            r.raise_for_status()
-            els = r.json().get("elements", [])
-            if not els: return 0
-            geom = els[0].get("geometry", [])
-            if len(geom) < 2: return 0
-            dx = geom[-1]["lon"] - geom[0]["lon"]
-            dy = geom[-1]["lat"] - geom[0]["lat"]
-            ang = (math.degrees(math.atan2(dx, dy)) + 360) % 360
-            return int(round((ang + 90) % 360))
-    except: return 0
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(OVERPASS_URL, params={"data": query}, timeout=20.0)
+            resp.raise_for_status()
+            data = resp.json()
+            elements = data.get("elements", [])
+            if not elements:
+                logger.warning("لا يوجد خط ساحلي قريب")
+                return 0
+
+            # نأخذ أول عنصر له هندسة
+            for el in elements:
+                geom = None
+                if el["type"] == "way":
+                    geom = el.get("geometry", [])
+                elif el["type"] == "relation":
+                    # قد تكون الهندسة في الأعضاء
+                    for member in el.get("members", []):
+                        if member.get("type") == "way" and member.get("geometry"):
+                            geom = member["geometry"]
+                            break
+                if geom and len(geom) >= 2:
+                    # نأخذ النقطة الأولى والأخيرة لتحديد الاتجاه العام للخط
+                    p1 = geom[0]
+                    p2 = geom[-1]
+                    dx = p2["lon"] - p1["lon"]
+                    dy = p2["lat"] - p1["lat"]
+                    angle_rad = math.atan2(dx, dy)
+                    angle_deg = (math.degrees(angle_rad) + 360) % 360
+                    sea_angle = (angle_deg + 90) % 360
+                    logger.info(f"تم تحديد الاتجاه: {sea_angle}°")
+                    return int(round(sea_angle))
+
+            return 0
+    except Exception as e:
+        logger.error(f"فشل Overpass: {e}")
+        return 0
 
 @app.post("/auto-orientation")
 async def auto_orientation(req: AutoOrientationRequest):
-    return {"orientation": await get_auto_orientation(req.latitude, req.longitude)}
+    angle = await get_auto_orientation(req.latitude, req.longitude)
+    return {"orientation": angle}
 
 # ------------------------- المحرك الفيزيائي -------------------------
 def safe_float(v):
@@ -153,7 +186,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     wind_gust = [safe_float(x) for x in wh["wind_gusts_10m"]]   # km/h
     pressure = [safe_float(x) for x in wh["pressure_msl"]]
 
-    # نحتفظ بالرياح km/h ولا نحول إلى عقد
     wind_kph = wind_speed
     gust_kph = wind_gust
 
@@ -184,9 +216,8 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     past_avg_power = sum(wave_power[i] for i in past_idx) / max(len(past_idx),1)
     past_wclass = [wind_classes[i] for i in past_idx]
     dominant = max(set(past_wclass), key=past_wclass.count) if past_wclass else "Offshore"
-    sustained_hrs = sum(1 for i in past_idx if wind_kph[i] > 18.5)   # > 10 عقد ≈ 18.5 كم/س
+    sustained_hrs = sum(1 for i in past_idx if wind_kph[i] > 18.5)
 
-    # كتل الفترات
     blocks = {"morning":[], "afternoon":[], "night":[]}
     labels = {"morning":"الصباح (04-11)", "afternoon":"الظهر (12-17)", "night":"الليل (18-03)"}
     for i in target_idx:
@@ -205,13 +236,12 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         block_list.append({"name":labels[k], "wave_h":round(avg_h,2), "power":round(avg_p,2),
                            "wind_kph":round(avg_w,1), "wind_dir":wc})
 
-    # أعلام
     reds, greens = [], []
     for i in target_idx:
         hh = dtimes[i].strftime("%H:%M")
         if wave_power[i] > 3.0 or wave_h[i] > 1.8 or gust_kph[i] > 50 or pressure[i] < 1005:
             reds.append(f"{hh} (طاقة{wave_power[i]:.1f}kW, ارتفاع{wave_h[i]:.1f}م, هبات{gust_kph[i]:.0f}كم/س)")
-        if 0.3 <= wave_h[i] <= 1.0 and 0.1 <= wave_power[i] <= 1.5 and wind_kph[i] < 27.8:   # < 15 عقدة
+        if 0.3 <= wave_h[i] <= 1.0 and 0.1 <= wave_power[i] <= 1.5 and wind_kph[i] < 27.8:
             greens.append(hh)
 
     past_wp_avg = sum(wave_p[i] for i in past_idx)/max(len(past_idx),1)
@@ -243,7 +273,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         "avg_sst": round(avg_sst,1)
     }
 
-# ------------------------- بناء السياق -------------------------
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type=="sandy" else "صخري"
     lines = [
@@ -252,7 +281,7 @@ def build_context(req, agg, tz_name):
         f"حرارة الماء: {agg['avg_sst']}°م",
         f"متوسط طاقة الموج (48 ساعة): {agg['past_avg_power']} kW/m",
         f"الرياح السائدة: {agg['dominant_wind']}",
-        f"ساعات الرياح > 10 عقد: {agg['sustained_hrs']} ساعة",
+        f"ساعات الرياح > 18.5 كم/س: {agg['sustained_hrs']} ساعة",
         f"خطر الأعشاب: {'نعم' if agg['weed_risk'] else 'لا'}"
     ]
     if agg["blocks"]:
@@ -269,20 +298,21 @@ def build_context(req, agg, tz_name):
         if agg["bio"].get("additional"): lines.append(f"- إضافية: {', '.join(agg['bio']['additional'])}")
     return "\n".join(lines)
 
-# ------------------------- Prompt معدل (وحدات متر و كم/س) -------------------------
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف ومحلل بحري. اكتب تقريراً واحداً متكاملاً بالعربية بناءً على البيانات المحسوبة. التقرير يجب أن يتضمن الأقسام التالية (بدون فواصل أو رموز، نص متصل):
-1. التحليل العام للعوامل البحرية (حرارة الماء والهواء، الطقس).
-2. تحليل الأمواج والتيارات – مع ذكر ارتفاع الموج بالمتر، طاقة الأمواج بالكيلوواط/متر، وتأثيرها على ثبات الرصاصة. أوصي بوزن ونوع الرصاص المناسب.
-3. تحليل الرياح والأعشاب – سرعة الرياح بالكيلومتر في الساعة (كم/س)، اتجاهها بالنسبة للشاطئ، ومدى تأثيرها على نقاء الماء والأعشاب.
-4. تقييم سبوت الصيد – إيجابيات/سلبيات، أفضل الأوقات، الأسماك المتوقعة، وتكتيك الرمي والطُعوم.
+# ------------------------- Prompt محسّن لتحليل شامل -------------------------
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري دقيق. اكتب تقريراً بحرياً متكاملاً بالعربية بناءً على البيانات المحسوبة التالية. يجب أن يكون التقرير مفصلاً وغنياً بالمعلومات، بلهجة خبير، ويغطي:
 
-استخدم المصطلحات العربية الدارجة في السرفكاستينغ. لا تذكر أنك تلقيت بيانات. اكتب مباشرة."""
+1. **التحليل العام للعوامل البحرية**: الطقس المتوقع، درجة حرارة الماء، تأثيرها على نشاط الأسماك وسلوكها.
+2. **تحليل الأمواج والتيارات (استقرار الرصاصة)**: ارتفاع الموج بالمتر، طاقة الأمواج بالكيلوواط/متر، هل البحر هادئ أم مضطرب؟ هل تثبت الرصاصة في القاع؟ أوصِ بوزن الرصاصة المناسب (بالغرام) ونوعها (هرم، مخالب/قرابين، صابونة) مع تفسير فيزيائي بسيط.
+3. **تحليل الرياح والأعشاب (نقاء الماء)**: سرعة الرياح بالكيلومتر في الساعة، اتجاهها بالنسبة للشاطئ (برية/بحرية/جانبية)، وهل ستثير الأعشاب أو الأوساخ؟ ما تأثير ذلك على نقاء الماء ومدى جاهزية البقعة؟
+4. **تقييم سبوت الصيد (Surfcasting)**: إيجابيات وسلبيات الظروف البحرية للصيد، أفضل أوقات الصيد (مع ذكر الساعات)، التكتيك المناسب (مكان الرمي، مسافة الرمي)، الطعوم المقترحة، والأسماك المتوقع تواجدها مع ذكر احتمالية حضورها بناءً على حرارة الماء ونوع القاع.
+
+استخدم المصطلحات الدارجة في السرفكاستينغ التونسي (المرصاص، اللدونة، التيارات الجارفة، إلخ). التقرير يجب أن يكون نصاً واحداً بدون فواصل أو رموز خاصة، مباشرة ومفيد. لا تذكر أنك ذكاء اصطناعي أو أنك تلقيت بيانات."""
 
 async def call_gemini(ctx):
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
     try:
         resp = await asyncio.to_thread(model.generate_content, contents=ctx,
-                                       generation_config={"temperature":0.3, "max_output_tokens":1500})
+                                       generation_config={"temperature":0.3, "max_output_tokens":2500})
         if resp.candidates and resp.candidates[0].content.parts:
             return resp.candidates[0].content.parts[0].text.strip()
         raise SurfError("رد فارغ")
