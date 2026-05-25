@@ -3,232 +3,122 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics - التحليل البحري للصيد الساحلي</title>
-  <!-- Tailwind CSS -->
+  <title>Surfcasting Analytics - التحليل البحري</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            ocean: { 900: '#0b132b', 800: '#1a2a4a', 700: '#2a3a5a' },
-            neon: '#00e5ff',
-            amber: '#f59e0b',
-          }
-        }
-      }
-    }
-  </script>
-  <!-- Leaflet CSS -->
+  <script>tailwind.config = { theme: { extend: { colors: { ocean: { 900: '#0b132b', 800: '#1a2a4a', 700: '#2a3a5a' }, neon: '#00e5ff' } } } }</script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     body { background-color: #0b132b; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    #map { height: 400px; width: 100%; border-radius: 1rem; border: 2px solid #1e3a5f; }
-    .leaflet-container { background-color: #0b132b; }
-    .card {
-      background-color: #1a2a4a; border: 1px solid #2a3a5a;
-      border-radius: 1rem; padding: 1.5rem;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,229,255,0.1); }
-    .btn-primary {
-      background-color: #00e5ff; color: #0b132b; font-weight: bold;
-      padding: 0.75rem 2rem; border-radius: 0.5rem; border: none;
-      cursor: pointer; transition: all 0.3s;
-    }
-    .btn-primary:hover { background-color: #00b8d4; box-shadow: 0 0 15px rgba(0,229,255,0.4); }
-    .btn-secondary {
-      background-color: transparent; color: #00e5ff; border: 1px solid #00e5ff;
-      padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; transition: all 0.3s;
-    }
-    .btn-secondary:hover { background-color: rgba(0,229,255,0.1); }
-    .input-field {
-      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff;
-      border-radius: 0.5rem; padding: 0.75rem; width: 100%;
-    }
-    .input-field:focus { outline: none; border-color: #00e5ff; box-shadow: 0 0 8px rgba(0,229,255,0.3); }
-    .segmented-btn {
-      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #a0b3d9;
-      padding: 0.5rem 1rem; cursor: pointer; transition: all 0.2s; flex: 1;
-    }
-    .segmented-btn.active { background-color: #00e5ff; color: #0b132b; font-weight: bold; border-color: #00e5ff; }
-    .loading-overlay {
-      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-      background: rgba(11,19,43,0.9); display: flex; justify-content: center;
-      align-items: center; z-index: 1000; backdrop-filter: blur(4px);
-    }
-    .spinner {
-      width: 60px; height: 60px; border: 6px solid rgba(0,229,255,0.2);
-      border-top: 6px solid #00e5ff; border-radius: 50%;
-      animation: spin 1s linear infinite;
-    }
+    #map { height: 400px; border-radius: 1rem; border: 2px solid #1e3a5f; }
+    .card { background: #1a2a4a; border: 1px solid #2a3a5a; border-radius: 1rem; padding: 1.5rem; }
+    .btn-primary { background: #00e5ff; color: #0b132b; font-weight: bold; padding: 0.75rem 2rem; border-radius: 0.5rem; border: none; cursor: pointer; }
+    .btn-primary:hover { background: #00b8d4; }
+    .btn-secondary { background: transparent; color: #00e5ff; border: 1px solid #00e5ff; padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; }
+    .btn-secondary:hover { background: rgba(0,229,255,0.1); }
+    .input-field { background: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff; padding: 0.75rem; width: 100%; border-radius: 0.5rem; }
+    .segmented-btn { background: #0f1a2e; border: 1px solid #2a3a5a; color: #a0b3d9; padding: 0.5rem 1rem; cursor: pointer; flex: 1; }
+    .segmented-btn.active { background: #00e5ff; color: #0b132b; font-weight: bold; }
+    .loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(11,19,43,0.9); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+    .spinner { width: 60px; height: 60px; border: 6px solid rgba(0,229,255,0.2); border-top: 6px solid #00e5ff; border-radius: 50%; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .direction-display {
-      background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #00e5ff;
-      padding: 0.25rem 0.75rem; border-radius: 0.5rem; font-weight: bold;
-      text-align: center; min-width: 130px;
-    }
-    .report-content {
-      white-space: pre-wrap;
-      line-height: 2;
-      font-size: 1.05rem;
-    }
+    .report-content { white-space: pre-wrap; line-height: 2; font-size: 1.05rem; }
   </style>
 </head>
-<body class="text-gray-200 p-4 md:p-6">
+<body class="text-gray-200 p-4">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-8 text-center">
-      🎣 Surfcasting Analytics - التحليل البحري للصيد الساحلي
-    </h1>
-
-    <!-- الخريطة + لوحة التحكم -->
+    <h1 class="text-3xl font-bold text-neon mb-8 text-center">🎣 Surfcasting Analytics</h1>
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-      <div class="lg:col-span-2">
-        <div id="map"></div>
-      </div>
+      <div class="lg:col-span-2"><div id="map"></div></div>
       <div class="card space-y-5">
-        <h2 class="text-xl font-bold text-neon mb-4">⚙️ إعدادات الموقع</h2>
-        <div>
-          <label class="block text-sm text-gray-400 mb-1">خط العرض</label>
-          <input type="number" id="latitude" step="any" class="input-field" value="36.7000" placeholder="مثال: 36.7000">
+        <h2 class="text-xl font-bold text-neon">⚙️ الإعدادات</h2>
+        <input type="number" id="latitude" step="any" class="input-field" value="36.7000">
+        <input type="number" id="longitude" step="any" class="input-field" value="10.8000">
+        <div class="flex items-center gap-3 mb-2">
+          <input type="range" id="orientation" min="0" max="360" value="45" class="w-full accent-neon">
+          <span id="orientationValue" class="text-neon font-bold">45° (شمال شرقي)</span>
         </div>
-        <div>
-          <label class="block text-sm text-gray-400 mb-1">خط الطول</label>
-          <input type="number" id="longitude" step="any" class="input-field" value="10.8000" placeholder="مثال: 10.8000">
+        <button id="autoOrientBtn" class="btn-secondary w-full">📍 تحديد الاتجاه تلقائياً</button>
+        <select id="beachType" class="input-field"><option value="sandy">رملي</option><option value="rocky">صخري</option></select>
+        <div class="flex rounded-md overflow-hidden border border-[#2a3a5a]">
+          <button class="segmented-btn active" data-date="today">اليوم</button>
+          <button class="segmented-btn" data-date="tomorrow">غداً</button>
+          <button class="segmented-btn" data-date="day_after">بعد غد</button>
         </div>
-        <div>
-          <label class="block text-sm text-gray-400 mb-1">اتجاه الشاطئ نحو البحر</label>
-          <div class="flex items-center gap-3 mb-2">
-            <input type="range" id="orientation" min="0" max="360" value="45" class="w-full accent-neon">
-            <span id="orientationValue" class="direction-display">45° (شمال شرقي)</span>
-          </div>
-          <button id="autoOrientBtn" class="btn-secondary w-full text-sm">📍 تحديد الاتجاه تلقائياً</button>
-        </div>
-        <div>
-          <label class="block text-sm text-gray-400 mb-1">نوع الشاطئ</label>
-          <select id="beachType" class="input-field">
-            <option value="sandy">رملي</option>
-            <option value="rocky">صخري</option>
-          </select>
-        </div>
-        <div>
-          <label class="block text-sm text-gray-400 mb-2">التاريخ المستهدف</label>
-          <div class="flex rounded-md overflow-hidden border border-[#2a3a5a]">
-            <button class="segmented-btn active" data-date="today">اليوم</button>
-            <button class="segmented-btn" data-date="tomorrow">غداً</button>
-            <button class="segmented-btn" data-date="day_after">بعد غد</button>
-          </div>
-          <input type="hidden" id="targetDate" value="today">
-        </div>
-        <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
-        <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام</p>
+        <input type="hidden" id="targetDate" value="today">
+        <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير</button>
+        <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية في أول مرة</p>
       </div>
     </div>
-
-    <!-- التقرير الناتج -->
     <div id="reportCard" class="card hidden">
       <div id="reportContent" class="text-gray-300 report-content"></div>
     </div>
-
-    <!-- طبقة التحميل -->
-    <div id="loadingOverlay" class="loading-overlay hidden">
-      <div class="text-center">
-        <div class="spinner mx-auto mb-4"></div>
-        <p class="text-neon text-lg font-semibold">جاري تحليل البيانات البحرية...</p>
-        <p class="text-gray-400 text-sm mt-2">يتم حساب طاقة الموج، الرياح، والاحتمالات البيولوجية</p>
-      </div>
-    </div>
+    <div id="loadingOverlay" class="loading-overlay hidden"><div class="spinner"></div></div>
   </div>
 
-  <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ---------- إعداد الخريطة ----------
-    const defaultLat = 36.7000;
-    const defaultLon = 10.8000;
-    const map = L.map('map').setView([defaultLat, defaultLon], 10);
+    // خريطة
+    const map = L.map('map').setView([36.7, 10.8], 10);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OSM &copy; CARTO',
-      subdomains: 'abcd',
-      maxZoom: 19
+      attribution: '&copy; OSM &copy; CARTO', subdomains: 'abcd', maxZoom: 19
     }).addTo(map);
-
-    const marker = L.marker([defaultLat, defaultLon], { draggable: true }).addTo(map)
-      .bindPopup('اسحب العلامة لتحديد الموقع').openPopup();
-
+    const marker = L.marker([36.7, 10.8], { draggable: true }).addTo(map).bindPopup('اسحب العلامة').openPopup();
     marker.on('dragend', () => {
       const pos = marker.getLatLng();
       document.getElementById('latitude').value = pos.lat.toFixed(6);
       document.getElementById('longitude').value = pos.lng.toFixed(6);
     });
-
     function updateMarker() {
-      const lat = parseFloat(document.getElementById('latitude').value) || defaultLat;
-      const lng = parseFloat(document.getElementById('longitude').value) || defaultLon;
-      marker.setLatLng([lat, lng]);
-      map.setView([lat, lng], 10);
+      const lat = parseFloat(document.getElementById('latitude').value) || 36.7;
+      const lng = parseFloat(document.getElementById('longitude').value) || 10.8;
+      marker.setLatLng([lat, lng]); map.setView([lat, lng], 10);
     }
     document.getElementById('latitude').addEventListener('change', updateMarker);
     document.getElementById('longitude').addEventListener('change', updateMarker);
 
-    // ---------- تحويل الدرجات إلى اتجاه نصي ----------
+    // اتجاه الشاطئ
     const dirs = ['شمال','شمال شمال شرقي','شمال شرقي','شرق شمال شرقي','شرق',
                   'شرق جنوب شرقي','جنوب شرقي','جنوب جنوب شرقي','جنوب',
                   'جنوب جنوب غربي','جنوب غربي','غرب جنوب غربي','غرب',
                   'غرب شمال غربي','شمال غربي','شمال شمال غربي'];
-    function degToDir(deg) {
-      return dirs[Math.round(deg / 22.5) % 16];
-    }
-
+    function degToDir(d) { return dirs[Math.round(d / 22.5) % 16]; }
     const orientSlider = document.getElementById('orientation');
-    const orientValue = document.getElementById('orientationValue');
+    const orientVal = document.getElementById('orientationValue');
     orientSlider.addEventListener('input', () => {
       const deg = parseInt(orientSlider.value);
-      orientValue.textContent = `${deg}° (${degToDir(deg)})`;
+      orientVal.textContent = `${deg}° (${degToDir(deg)})`;
     });
 
-    // ---------- تحديد الاتجاه تلقائياً ----------
+    // زر تلقائي
     document.getElementById('autoOrientBtn').addEventListener('click', async () => {
       const lat = parseFloat(document.getElementById('latitude').value);
       const lng = parseFloat(document.getElementById('longitude').value);
-      if (isNaN(lat) || isNaN(lng)) {
-        alert('الرجاء إدخال إحداثيات صحيحة');
-        return;
-      }
+      if (isNaN(lat) || isNaN(lng)) return alert('إحداثيات غير صحيحة');
       const btn = document.getElementById('autoOrientBtn');
-      btn.disabled = true;
-      btn.textContent = '⏳ جارٍ تحديد الاتجاه...';
+      btn.disabled = true; btn.textContent = '⏳ جارٍ تحديد الاتجاه...';
       try {
         const resp = await fetch('https://spotdata.onrender.com/auto-orientation', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ latitude: lat, longitude: lng })
         });
-        if (!resp.ok) throw new Error('فشل الطلب');
+        if (!resp.ok) throw new Error('فشل');
         const data = await resp.json();
-        const angle = data.orientation;
-        orientSlider.value = angle;
-        orientValue.textContent = `${angle}° (${degToDir(angle)})`;
-      } catch (e) {
-        alert('تعذر تحديد الاتجاه تلقائياً، يمكنك إدخاله يدوياً');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '📍 تحديد الاتجاه تلقائياً';
-      }
+        orientSlider.value = data.orientation;
+        orientVal.textContent = `${data.orientation}° (${degToDir(data.orientation)})`;
+      } catch(e) { alert('تعذر التحديد التلقائي'); }
+      finally { btn.disabled = false; btn.textContent = '📍 تحديد الاتجاه تلقائياً'; }
     });
 
-    // ---------- أزرار التاريخ ----------
-    const dateBtns = document.querySelectorAll('.segmented-btn');
-    dateBtns.forEach(btn => {
+    // أزرار التاريخ
+    document.querySelectorAll('.segmented-btn').forEach(btn => {
       btn.addEventListener('click', function() {
-        dateBtns.forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.segmented-btn').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
         document.getElementById('targetDate').value = this.dataset.date;
       });
     });
 
-    // ---------- إرسال النموذج وعرض التقرير ----------
+    // إرسال التقرير
     const submitBtn = document.getElementById('submitBtn');
     const loadingOverlay = document.getElementById('loadingOverlay');
     const reportCard = document.getElementById('reportCard');
@@ -244,7 +134,6 @@
         target_date: document.getElementById('targetDate').value
       };
 
-      // إظهار واجهة التحميل
       loadingOverlay.classList.remove('hidden');
       reportCard.classList.add('hidden');
 
@@ -254,27 +143,17 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-
         if (!response.ok) {
-          let errMsg = `خطأ في الخادم (${response.status})`;
-          try {
-            const errData = await response.json();
-            errMsg += '\n' + (errData.detail || JSON.stringify(errData));
-          } catch (_) {}
-          throw new Error(errMsg);
+          let err = `خطأ ${response.status}`;
+          try { const d = await response.json(); err += ': ' + d.detail; } catch(_) {}
+          throw new Error(err);
         }
-
         const data = await response.json();
-        reportContent.textContent = data.report || 'لم يصدر تقرير.';
+        reportContent.textContent = data.report || 'لم يصدر تقرير';
         reportCard.classList.remove('hidden');
         reportCard.scrollIntoView({ behavior: 'smooth' });
-
-      } catch (error) {
-        alert('❌ فشل جلب التقرير:\n' + error.message);
-        console.error(error);
-      } finally {
-        loadingOverlay.classList.add('hidden');
-      }
+      } catch(e) { alert('❌ فشل جلب التقرير:\n' + e.message); }
+      finally { loadingOverlay.classList.add('hidden'); }
     });
   </script>
 </body>
