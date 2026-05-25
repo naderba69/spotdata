@@ -1,6 +1,6 @@
 """
-Surfcasting Analytics API - Final Production v4.0
-FastAPI Backend with Gemini 2.5 Flash & Auto Beach Orientation
+Surfcasting Analytics API - Final Production v5.0
+FastAPI Backend with Gemini 2.5 Flash & Unified Report Style
 """
 import os, math, asyncio, logging, traceback, re, zoneinfo
 from datetime import datetime, timedelta, date
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
 # ------------------------- التهيئة -------------------------
-app = FastAPI(title="Surfcasting Analytics", version="4.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -40,8 +40,8 @@ class ReportRequest(BaseModel):
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
 
 class AutoOrientationRequest(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
+    latitude: float
+    longitude: float
 
 # ------------------------- معالجة الأخطاء -------------------------
 class SurfError(Exception):
@@ -56,7 +56,7 @@ async def global_handler(request: Request, exc: Exception):
 def health():
     return {"status": "ok", "gemini": bool(GEMINI_KEY), "model": MODEL_NAME}
 
-# ------------------------- دوال المنطقة الزمنية -------------------------
+# ------------------------- المنطقة الزمنية -------------------------
 async def fetch_timezone(lat: float, lon: float) -> str:
     try:
         async with httpx.AsyncClient() as client:
@@ -74,13 +74,11 @@ async def fetch_timezone(lat: float, lon: float) -> str:
 def target_date_from_str(txt: str, tz_name: str) -> date:
     try:
         tz = zoneinfo.ZoneInfo(tz_name)
-    except Exception:
+    except:
         tz = zoneinfo.ZoneInfo("UTC")
     now = datetime.now(tz)
-    if txt == "today":
-        return now.date()
-    elif txt == "tomorrow":
-        return now.date() + timedelta(days=1)
+    if txt == "today": return now.date()
+    elif txt == "tomorrow": return now.date() + timedelta(days=1)
     return now.date() + timedelta(days=2)
 
 # ------------------------- جلب البيانات -------------------------
@@ -106,13 +104,9 @@ async def fetch_weather(lat, lon, start, end):
         r.raise_for_status()
         return r.json()
 
-# ------------------------- الاتجاه التلقائي للشاطئ -------------------------
+# ------------------------- الاتجاه التلقائي -------------------------
 async def get_auto_orientation(lat: float, lon: float) -> int:
-    """
-    يستخدم OpenStreetMap Overpass API لإيجاد أقرب خط ساحلي
-    ويعيد الزاوية العمودية باتجاه البحر (0-360).
-    """
-    radius = 1000  # متر
+    radius = 1000
     query = f"""
     [out:json];
     (
@@ -125,32 +119,22 @@ async def get_auto_orientation(lat: float, lon: float) -> int:
             resp = await client.get(OVERPASS_URL, params={"data": query}, timeout=15.0)
             resp.raise_for_status()
             data = resp.json()
-
             elements = data.get("elements", [])
             if not elements:
-                logger.warning("لم يتم العثور على خط ساحلي، نستخدم 0°")
                 return 0
-
-            # نأخذ أول قطعة خط ساحلي
             way = elements[0]
             nodes = way.get("geometry", [])
             if len(nodes) < 2:
                 return 0
-
-            # نأخذ أقرب نقطتين لنا لحساب الاتجاه
-            p1 = nodes[0]
-            p2 = nodes[-1]
+            p1, p2 = nodes[0], nodes[-1]
             dx = p2["lon"] - p1["lon"]
             dy = p2["lat"] - p1["lat"]
-            angle_rad = math.atan2(dx, dy)  # اتجاه الخط
+            angle_rad = math.atan2(dx, dy)
             angle_deg = (math.degrees(angle_rad) + 360) % 360
-
-            # الاتجاه نحو البحر هو العمودي +90 درجة (يمكن توجيهه حسب الموقع)
             sea_angle = (angle_deg + 90) % 360
             return int(round(sea_angle))
-
     except Exception as e:
-        logger.error(f"فشل في حساب الاتجاه التلقائي: {e}")
+        logger.error(f"Auto orientation error: {e}")
         return 0
 
 @app.post("/auto-orientation")
@@ -158,7 +142,7 @@ async def auto_orientation(req: AutoOrientationRequest):
     angle = await get_auto_orientation(req.latitude, req.longitude)
     return {"orientation": angle}
 
-# ------------------------- المحرك الفيزيائي -------------------------
+# ------------------------- المحرك الفيزيائي (كما هو) -------------------------
 def safe_float(v):
     if v is None: return 0.0
     try:
@@ -230,6 +214,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     dominant = max(set(past_wclass), key=past_wclass.count) if past_wclass else "Offshore"
     sustained_hrs = sum(1 for i in past_idx if wind_knots[i] > 10)
 
+    # كتل اليوم
     blocks = {
         "morning": {"indices": [], "label": "الصباح (04-11)"},
         "afternoon": {"indices": [], "label": "الظهر (12-17)"},
@@ -255,6 +240,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             "wind_dir": wc
         })
 
+    # أعلام
     reds, greens = [], []
     for i in target_idx:
         hh = dtimes[i].strftime("%H:%M")
@@ -263,6 +249,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         if (0.3 <= wave_h[i] <= 1.0 and 0.1 <= wave_power[i] <= 1.5 and wind_knots[i] < 15):
             greens.append(hh)
 
+    # أعشاب
     past_wp_avg = sum(wave_p[i] for i in past_idx)/max(len(past_idx),1)
     past_sh_avg = sum(swell_h[i] for i in past_idx)/max(len(past_idx),1)
     weed = (past_wp_avg >= 8.0 and past_sh_avg > 1.0 and dominant == "Onshore")
@@ -292,85 +279,58 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         "avg_sst": round(avg_sst,1)
     }
 
-# ------------------------- بناء سياق Gemini -------------------------
-def build_gemini_text(req: ReportRequest, agg: dict, tz_name: str) -> str:
+# ------------------------- بناء السياق (معلومات منظمة) -------------------------
+def build_context(req: ReportRequest, agg: dict, tz_name: str) -> str:
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     lines = [
-        f"الموقع: خط عرض {req.latitude:.2f}, خط طول {req.longitude:.2f}, شاطئ {beach}, اتجاه الشاطئ {req.beach_orientation}°",
-        f"التاريخ المستهدف: {req.target_date} (المنطقة الزمنية {tz_name})",
+        f"الموقع: {req.latitude:.2f}، {req.longitude:.2f}، شاطئ {beach}، اتجاه الشاطئ نحو البحر {req.beach_orientation}°",
+        f"التاريخ: {req.target_date} (توقيت {tz_name})",
         "",
-        "الملخص التاريخي (48 ساعة الماضية):",
-        f"- متوسط طاقة الموج: {agg['past_avg_power']} kW/m",
-        f"- الرياح السائدة: {agg['dominant_wind']}",
-        f"- مدة الرياح > 10 عقدة: {agg['sustained_hrs']} ساعة",
-        "",
-        "كتل الفترات:"
+        "--- البيانات المحسوبة (للاستخدام في التقرير) ---",
+        f"متوسط طاقة الموج خلال 48 ساعة الماضية: {agg['past_avg_power']} kW/m",
+        f"الرياح السائدة في آخر 48 ساعة: {agg['dominant_wind']}",
+        f"ساعات الرياح المستمرة > 10 عقد: {agg['sustained_hrs']} ساعة",
+        f"حرارة الماء المتوسطة: {agg['avg_sst']}°م",
+        f"خطر الأعشاب: {'نعم' if agg['weed_risk'] else 'لا'}",
     ]
-    for b in agg["blocks"]:
-        lines.append(f"- {b['name']}: ارتفاع {b['wave_h']}م, طاقة {b['power']} kW/m, رياح {b['wind_knots']} عقدة ({b['wind_dir']})")
 
-    lines.append("\nالأعلام الحمراء:")
-    lines.extend([f"- {f}" for f in agg["red_flags"]] if agg["red_flags"] else ["- لا يوجد"])
-    lines.append("\nالأعلام الخضراء:")
-    lines.extend([f"- {f}" for f in agg["green_flags"]] if agg["green_flags"] else ["- لا يوجد"])
-    lines.append(f"\nخطر الأعشاب: {'موجود' if agg['weed_risk'] else 'غير موجود'}")
-    lines.append(f"\nحرارة الماء: {agg['avg_sst']}°م")
-    lines.append("الاحتمال البيولوجي:")
-    if agg["bio"].get("high"):
-        lines.append(f"- مرتفع: {', '.join(agg['bio']['high'])}")
-    if agg["bio"].get("additional"):
-        lines.append(f"- إضافي: {', '.join(agg['bio']['additional'])}")
+    if agg["blocks"]:
+        lines.append("تفاصيل الفترات:")
+        for b in agg["blocks"]:
+            lines.append(f"- {b['name']}: ارتفاع الموج {b['wave_h']}م, طاقة {b['power']} kW/m, رياح {b['wind_knots']} عقدة ({b['wind_dir']})")
+
+    if agg["red_flags"]:
+        lines.append("أوقات خطرة: " + "، ".join(agg["red_flags"]))
+    if agg["green_flags"]:
+        lines.append("أوقات مناسبة: " + "، ".join(agg["green_flags"]))
+
+    if agg["bio"].get("high") or agg["bio"].get("additional"):
+        lines.append("الأسماك المتوقعة:")
+        if agg["bio"].get("high"):
+            lines.append(f"- احتمالية عالية: {', '.join(agg['bio']['high'])}")
+        if agg["bio"].get("additional"):
+            lines.append(f"- احتمالية إضافية: {', '.join(agg['bio']['additional'])}")
+
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف وخبير في التحليلات البحرية. مهمتك الوحيدة هي ترجمة المتغيرات الفيزيائية المُحتسبة مسبقاً والخطوط التاريخية والاحتمالات البيولوجية إلى تقرير صيد تكتيكي عملي مكتوب بالكامل باللغة العربية.
+# ------------------------- النظام الجديد للـ Prompt -------------------------
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف ومحلل بحري خبير. ستتلقى بيانات فيزيائية محسوبة بدقة عن حالة البحر والرياح ودرجة الحرارة. مهمتك كتابة تقرير صيد تكتيكي باللغة العربية، بأسلوب احترافي وواضح، يحتوي على الأقسام التالية (بدون استخدام فواصل أو رموز خاصة، فقط فقرات متسلسلة):
 
-تعليمات صارمة للتنسيق:
-- يجب أن تكتب التقرير مكوناً من 4 أقسام بالضبط.
-- كل قسم يجب أن يُفصل عن الآخر بالفاصل '---' (ثلاث شرطات) في سطر مستقل.
-- لا تضيف أي عناوين جانبية أو أرقام أو نصوص قبل أو بعد الفواصل.
-- لا تكتب أي شيء قبل القسم الأول ولا بعد القسم الرابع.
-- مثال للهيكل المطلوب:
-نص القسم الأول
----
-نص القسم الثاني
----
-نص القسم الثالث
----
-نص القسم الرابع
+1. التحليل العام للعوامل البحرية: اذكر حالة الطقس المتوقعة، درجة حرارة الهواء، درجة حرارة الماء، وتأثيرها على نشاط الأسماك.
+2. تحليل الأمواج والتيارات البحرية: صف ارتفاع الموج، طاقة الأمواج، فترة الموج، ومدى تأثيرها على ثبات الرصاصة (اللدونة). أوصي بوزن الرصاص المناسب ونوعه (هرم، مخالب، صابونة) بناءً على القيم.
+3. تحليل الرياح والأعشاب: حدد اتجاه الرياح (بالنسبة للشاطئ) وسرعتها، وهل ستسبب خروج أعشاب أو أوساخ تؤثر على الخيط.
+4. تقييم السبوت للصيد (Surfcasting): اذكر الإيجابيات والسلبيات، أفضل الأوقات للصيد (مع الساعات المناسبة)، والتكتيك المناسب (مكان الرمي، الطعوم، التركيبات). أذكر الأسماك المتوقع حضورها بناءً على حرارة الماء ونوع القاع.
 
-الآن اكتب التقرير وفق البيانات المرفقة."""
+استخدم المصطلحات العربية الشائعة في صيد السرفكاستينغ (الرصاصة، اللدونة، التيارات الجارفة، الأعشاب، إلخ). كن دقيقاً، عملياً، وموجزاً. لا تذكر أنك تلقيت بيانات أو أن هذه حسابات، فقط اكتب التقرير النهائي مباشرة."""
 
-async def call_gemini(text: str) -> str:
+async def call_gemini(context_text: str) -> str:
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-    gen_cfg = {"temperature": 0.2, "max_output_tokens": 2000}
+    gen_cfg = {"temperature": 0.3, "max_output_tokens": 1500}
     try:
-        resp = await asyncio.to_thread(model.generate_content, contents=text, generation_config=gen_cfg)
-        if not resp.candidates or not resp.candidates[0].content.parts:
-            raise SurfError("رد فارغ من Gemini")
-        report = resp.candidates[0].content.parts[0].text
-        # تنظيف وتقسيم صارم
-        sections = re.split(r'\n?---\n?', report.strip())
-        if len(sections) != 4:
-            # محاولة إصلاح: ربما أضاف عناوين، نحاول تجاهل الأسطر التي تبدأ بـ "القسم"
-            clean_sections = []
-            for s in sections:
-                # إزالة عنوان "القسم X:" إذا وجد
-                s = re.sub(r'^القسم\s*\d+[:\-]?\s*', '', s.strip())
-                clean_sections.append(s)
-            if len(clean_sections) == 4:
-                return "---".join(clean_sections)
-            else:
-                # فشل الإصلاح، نعيد المحاولة
-                retry_text = text + "\n\nتنبيه مهم جداً: أعد كتابة التقرير بstrict 4 أقسام مفصولة بـ --- فقط، بدون أي نصوص إضافية."
-                resp2 = await asyncio.to_thread(model.generate_content, contents=retry_text, generation_config=gen_cfg)
-                if resp2.candidates and resp2.candidates[0].content.parts:
-                    report2 = resp2.candidates[0].content.parts[0].text
-                    sections2 = re.split(r'\n?---\n?', report2.strip())
-                    if len(sections2) == 4:
-                        return "---".join(sections2)
-                # إذا فشل كل شيء، نعيد التقرير الأصلي مع فواصل واضحة
-                return report
-        return "---".join(sections)
+        resp = await asyncio.to_thread(model.generate_content, contents=context_text, generation_config=gen_cfg)
+        if resp.candidates and resp.candidates[0].content.parts:
+            return resp.candidates[0].content.parts[0].text.strip()
+        raise SurfError("رد فارغ من Gemini")
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         raise SurfError(f"فشل Gemini: {str(e)}")
@@ -379,21 +339,20 @@ async def call_gemini(text: str) -> str:
 @app.post("/generate-report")
 async def generate_report(req: ReportRequest):
     try:
-        logger.info(f"تقرير لـ {req.latitude},{req.longitude} اتجاه {req.beach_orientation}")
+        logger.info(f"طلب تقرير: {req.latitude},{req.longitude} اتجاه {req.beach_orientation}")
         tz = await fetch_timezone(req.latitude, req.longitude)
         target_dt = target_date_from_str(req.target_date, tz)
         start_dt = target_dt - timedelta(days=2)
         end_dt = target_dt + timedelta(days=1)
-        start_str = start_dt.isoformat()
-        end_str = end_dt.isoformat()
 
         marine, weather = await asyncio.gather(
-            fetch_marine(req.latitude, req.longitude, start_str, end_str),
-            fetch_weather(req.latitude, req.longitude, start_str, end_str)
+            fetch_marine(req.latitude, req.longitude, start_dt.isoformat(), end_dt.isoformat()),
+            fetch_weather(req.latitude, req.longitude, start_dt.isoformat(), end_dt.isoformat())
         )
         agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz)
-        context = build_gemini_text(req, agg, tz)
+        context = build_context(req, agg, tz)
         report = await call_gemini(context)
+
         return {
             "report": report,
             "meta": {"timezone": tz, "target_date": target_dt.isoformat()}
