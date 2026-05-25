@@ -1,8 +1,8 @@
 """
-Surfcasting Analytics API - Production v3.0
-FastAPI Backend with Gemini 2.5 Flash (0% Physics Error)
+Surfcasting Analytics API - Final Production v4.0
+FastAPI Backend with Gemini 2.5 Flash & Auto Beach Orientation
 """
-import os, math, asyncio, logging, traceback, zoneinfo
+import os, math, asyncio, logging, traceback, re, zoneinfo
 from datetime import datetime, timedelta, date
 
 import httpx
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
 # ------------------------- التهيئة -------------------------
-app = FastAPI(title="Surfcasting Analytics", version="3.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -25,11 +25,11 @@ if not GEMINI_KEY:
     raise RuntimeError("GEMINI_API_KEY غير موجود في متغيرات البيئة")
 genai.configure(api_key=GEMINI_KEY)
 
-# استخدام Gemini 2.5 Flash (النموذج الأحدث)
 MODEL_NAME = "models/gemini-2.5-flash"
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 # ------------------------- النماذج -------------------------
 class ReportRequest(BaseModel):
@@ -38,6 +38,10 @@ class ReportRequest(BaseModel):
     beach_orientation: int = Field(..., ge=0, le=360)
     beach_type: str = Field(..., pattern="^(sandy|rocky)$")
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
+
+class AutoOrientationRequest(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
 
 # ------------------------- معالجة الأخطاء -------------------------
 class SurfError(Exception):
@@ -62,7 +66,7 @@ async def fetch_timezone(lat: float, lon: float) -> str:
             }, timeout=10)
             r.raise_for_status()
             tz = r.json().get("timezone", "UTC")
-            zoneinfo.ZoneInfo(tz)  # التحقق من الصلاحية
+            zoneinfo.ZoneInfo(tz)
             return tz
     except Exception:
         return "UTC"
@@ -102,6 +106,58 @@ async def fetch_weather(lat, lon, start, end):
         r.raise_for_status()
         return r.json()
 
+# ------------------------- الاتجاه التلقائي للشاطئ -------------------------
+async def get_auto_orientation(lat: float, lon: float) -> int:
+    """
+    يستخدم OpenStreetMap Overpass API لإيجاد أقرب خط ساحلي
+    ويعيد الزاوية العمودية باتجاه البحر (0-360).
+    """
+    radius = 1000  # متر
+    query = f"""
+    [out:json];
+    (
+      way(around:{radius},{lat},{lon})["natural"="coastline"];
+    );
+    out body;
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(OVERPASS_URL, params={"data": query}, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
+
+            elements = data.get("elements", [])
+            if not elements:
+                logger.warning("لم يتم العثور على خط ساحلي، نستخدم 0°")
+                return 0
+
+            # نأخذ أول قطعة خط ساحلي
+            way = elements[0]
+            nodes = way.get("geometry", [])
+            if len(nodes) < 2:
+                return 0
+
+            # نأخذ أقرب نقطتين لنا لحساب الاتجاه
+            p1 = nodes[0]
+            p2 = nodes[-1]
+            dx = p2["lon"] - p1["lon"]
+            dy = p2["lat"] - p1["lat"]
+            angle_rad = math.atan2(dx, dy)  # اتجاه الخط
+            angle_deg = (math.degrees(angle_rad) + 360) % 360
+
+            # الاتجاه نحو البحر هو العمودي +90 درجة (يمكن توجيهه حسب الموقع)
+            sea_angle = (angle_deg + 90) % 360
+            return int(round(sea_angle))
+
+    except Exception as e:
+        logger.error(f"فشل في حساب الاتجاه التلقائي: {e}")
+        return 0
+
+@app.post("/auto-orientation")
+async def auto_orientation(req: AutoOrientationRequest):
+    angle = await get_auto_orientation(req.latitude, req.longitude)
+    return {"orientation": angle}
+
 # ------------------------- المحرك الفيزيائي -------------------------
 def safe_float(v):
     if v is None: return 0.0
@@ -131,14 +187,13 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     swell_p = [safe_float(x) for x in mh["swell_wave_period"]]
     sst = [safe_float(x) for x in mh["sea_surface_temperature"]]
 
-    wind_speed = [safe_float(x) for x in wh["wind_speed_10m"]]   # km/h
+    wind_speed = [safe_float(x) for x in wh["wind_speed_10m"]]
     wind_dir = [safe_float(x) for x in wh["wind_direction_10m"]]
-    wind_gust = [safe_float(x) for x in wh["wind_gusts_10m"]]   # km/h
+    wind_gust = [safe_float(x) for x in wh["wind_gusts_10m"]]
     pressure = [safe_float(x) for x in wh["pressure_msl"]]
 
-    # تصحيح الوحدات: سرعة الرياح إلى عُقد
     wind_knots = [v * 0.5399568 for v in wind_speed]
-    gust_kph = wind_gust  # أصلاً km/h
+    gust_kph = wind_gust
 
     wave_power = [0.49 * (h**2) * p for h, p in zip(wave_h, wave_p)]
     swell_power = [0.49 * (h**2) * p for h, p in zip(swell_h, swell_p)]
@@ -149,7 +204,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         d = angle_diff(wd, beach_orient)
         wind_classes.append(wind_class(d))
 
-    # تواريخ واعية بالمنطقة الزمنية
     dtimes = []
     for t_str in times:
         dt = datetime.fromisoformat(t_str)
@@ -157,7 +211,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             dt = dt.replace(tzinfo=tz)
         dtimes.append(dt)
 
-    # الفترات الزمنية
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
     target_end = target_start + timedelta(days=1)
     past_start = target_start - timedelta(hours=48)
@@ -172,13 +225,11 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             "bio": {}, "avg_sst": 0.0
         }
 
-    # ملخص 48 ساعة
     past_avg_power = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
     past_wclass = [wind_classes[i] for i in past_idx]
     dominant = max(set(past_wclass), key=past_wclass.count) if past_wclass else "Offshore"
     sustained_hrs = sum(1 for i in past_idx if wind_knots[i] > 10)
 
-    # كتل اليوم
     blocks = {
         "morning": {"indices": [], "label": "الصباح (04-11)"},
         "afternoon": {"indices": [], "label": "الظهر (12-17)"},
@@ -204,7 +255,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             "wind_dir": wc
         })
 
-    # الأعلام
     reds, greens = [], []
     for i in target_idx:
         hh = dtimes[i].strftime("%H:%M")
@@ -213,12 +263,10 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         if (0.3 <= wave_h[i] <= 1.0 and 0.1 <= wave_power[i] <= 1.5 and wind_knots[i] < 15):
             greens.append(hh)
 
-    # خطر الأعشاب
     past_wp_avg = sum(wave_p[i] for i in past_idx)/max(len(past_idx),1)
     past_sh_avg = sum(swell_h[i] for i in past_idx)/max(len(past_idx),1)
     weed = (past_wp_avg >= 8.0 and past_sh_avg > 1.0 and dominant == "Onshore")
 
-    # بيولوجيا
     avg_sst = sum(sst[i] for i in target_idx)/max(len(target_idx),1)
     bio = {}
     if avg_sst < 16 and dominant == "Onshore":
@@ -274,15 +322,23 @@ def build_gemini_text(req: ReportRequest, agg: dict, tz_name: str) -> str:
         lines.append(f"- إضافي: {', '.join(agg['bio']['additional'])}")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف وخبير في التحليلات البحرية. مهمتك الوحيدة هي ترجمة المتغيرات الفيزيائية المُحتسبة مسبقاً والخطوط التاريخية والاحتمالات البيولوجية إلى تقرير صيد تكتيكي عملي مكتوب بالكامل باللغة العربية. لا تقم بأي عمليات حسابية. يجب تنسيق المخرجات بالضبط في 4 أقسام منفصلة بفاصل صارم '---' (بدون رموز إضافية) بحيث تستطيع الواجهة الأمامية تحليلها إلى بطاقات منفصلة:
-القسم 1: التحليل التاريخي وحالة الماء ونقائه وعلاقته بآخر 48 ساعة.
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ محترف وخبير في التحليلات البحرية. مهمتك الوحيدة هي ترجمة المتغيرات الفيزيائية المُحتسبة مسبقاً والخطوط التاريخية والاحتمالات البيولوجية إلى تقرير صيد تكتيكي عملي مكتوب بالكامل باللغة العربية.
+
+تعليمات صارمة للتنسيق:
+- يجب أن تكتب التقرير مكوناً من 4 أقسام بالضبط.
+- كل قسم يجب أن يُفصل عن الآخر بالفاصل '---' (ثلاث شرطات) في سطر مستقل.
+- لا تضيف أي عناوين جانبية أو أرقام أو نصوص قبل أو بعد الفواصل.
+- لا تكتب أي شيء قبل القسم الأول ولا بعد القسم الرابع.
+- مثال للهيكل المطلوب:
+نص القسم الأول
 ---
-القسم 2: تقلبات فترات اليوم وحركة التغيرات الفيزيائية بين الصباح والظهر والليل.
+نص القسم الثاني
 ---
-القسم 3: الجدول الساعي واستراتيجية المرصاص (اللدونة)، هل الرصاصة ستثبت في القاع بناءً على قيمة الطاقة المحسوبة أم ستخرج؟ وما هو الوزن ونوع الرصاص الأنسب (الهرم، المخالب Grappin، الصابونة)؟
+نص القسم الثالث
 ---
-القسم 4: التكهن الاحتمالي للأسماك المتوقع حضورها بناءً على حرارة الماء والموسم الحالي وقاع البحر مع تحديد الطعوم المناسبة لها وتكتيك الرمي.
-حافظ على نبرة خبير، ند للند، عالية الاحترافية، ومرتكزة على الفيزياء باستخدام مصطلحات الصيد العربية الشائعة."""
+نص القسم الرابع
+
+الآن اكتب التقرير وفق البيانات المرفقة."""
 
 async def call_gemini(text: str) -> str:
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
@@ -292,14 +348,29 @@ async def call_gemini(text: str) -> str:
         if not resp.candidates or not resp.candidates[0].content.parts:
             raise SurfError("رد فارغ من Gemini")
         report = resp.candidates[0].content.parts[0].text
-        if len(report.split("---")) != 4:
-            retry = text + "\n\nتنبيه مهم: أعد كتابة التقرير بالضبط 4 أقسام مفصولة بـ ---"
-            resp2 = await asyncio.to_thread(model.generate_content, contents=retry, generation_config=gen_cfg)
-            if resp2.candidates and resp2.candidates[0].content.parts:
-                report2 = resp2.candidates[0].content.parts[0].text
-                if len(report2.split("---")) == 4:
-                    return report2
-        return report
+        # تنظيف وتقسيم صارم
+        sections = re.split(r'\n?---\n?', report.strip())
+        if len(sections) != 4:
+            # محاولة إصلاح: ربما أضاف عناوين، نحاول تجاهل الأسطر التي تبدأ بـ "القسم"
+            clean_sections = []
+            for s in sections:
+                # إزالة عنوان "القسم X:" إذا وجد
+                s = re.sub(r'^القسم\s*\d+[:\-]?\s*', '', s.strip())
+                clean_sections.append(s)
+            if len(clean_sections) == 4:
+                return "---".join(clean_sections)
+            else:
+                # فشل الإصلاح، نعيد المحاولة
+                retry_text = text + "\n\nتنبيه مهم جداً: أعد كتابة التقرير بstrict 4 أقسام مفصولة بـ --- فقط، بدون أي نصوص إضافية."
+                resp2 = await asyncio.to_thread(model.generate_content, contents=retry_text, generation_config=gen_cfg)
+                if resp2.candidates and resp2.candidates[0].content.parts:
+                    report2 = resp2.candidates[0].content.parts[0].text
+                    sections2 = re.split(r'\n?---\n?', report2.strip())
+                    if len(sections2) == 4:
+                        return "---".join(sections2)
+                # إذا فشل كل شيء، نعيد التقرير الأصلي مع فواصل واضحة
+                return report
+        return "---".join(sections)
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         raise SurfError(f"فشل Gemini: {str(e)}")
@@ -308,7 +379,7 @@ async def call_gemini(text: str) -> str:
 @app.post("/generate-report")
 async def generate_report(req: ReportRequest):
     try:
-        logger.info(f"تقرير لـ {req.latitude},{req.longitude} تاريخ {req.target_date}")
+        logger.info(f"تقرير لـ {req.latitude},{req.longitude} اتجاه {req.beach_orientation}")
         tz = await fetch_timezone(req.latitude, req.longitude)
         target_dt = target_date_from_str(req.target_date, tz)
         start_dt = target_dt - timedelta(days=2)
@@ -335,7 +406,6 @@ async def generate_report(req: ReportRequest):
         logger.exception("خطأ غير متوقع")
         raise HTTPException(status_code=500, detail=f"خطأ داخلي: {str(e)}")
 
-# ------------------------- تشغيل -------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=10000)
