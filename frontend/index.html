@@ -36,6 +36,11 @@
       cursor: pointer; transition: all 0.3s;
     }
     .btn-primary:hover { background-color: #00b8d4; box-shadow: 0 0 15px rgba(0,229,255,0.4); }
+    .btn-secondary {
+      background-color: transparent; color: #00e5ff; border: 1px solid #00e5ff;
+      padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; transition: all 0.3s;
+    }
+    .btn-secondary:hover { background-color: rgba(0,229,255,0.1); }
     .input-field {
       background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff;
       border-radius: 0.5rem; padding: 0.75rem; width: 100%;
@@ -85,10 +90,11 @@
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1">اتجاه الشاطئ نحو البحر</label>
-          <div class="flex items-center gap-3">
+          <div class="flex items-center gap-3 mb-2">
             <input type="range" id="orientation" min="0" max="360" value="45" class="w-full accent-neon">
             <span id="orientationValue" class="direction-display">45° (شمال شرقي)</span>
           </div>
+          <button id="autoOrientBtn" class="btn-secondary w-full text-sm">📍 تحديد الاتجاه تلقائياً</button>
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1">نوع الشاطئ</label>
@@ -162,6 +168,33 @@
       orientVal.textContent = `${deg}° (${degToDir(deg)})`;
     });
 
+    // زر تحديد الاتجاه تلقائياً
+    document.getElementById('autoOrientBtn').addEventListener('click', async () => {
+      const lat = parseFloat(document.getElementById('latitude').value);
+      const lng = parseFloat(document.getElementById('longitude').value);
+      if (isNaN(lat) || isNaN(lng)) return alert('الرجاء إدخال إحداثيات صحيحة');
+      const btn = document.getElementById('autoOrientBtn');
+      btn.disabled = true;
+      btn.textContent = '⏳ جارٍ تحديد الاتجاه...';
+      try {
+        const resp = await fetch('https://spotdata.onrender.com/auto-orientation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ latitude: lat, longitude: lng })
+        });
+        if (!resp.ok) throw new Error('فشل');
+        const data = await resp.json();
+        const angle = data.orientation;
+        orientSlider.value = angle;
+        orientVal.textContent = `${angle}° (${degToDir(angle)})`;
+      } catch(e) {
+        alert('تعذر تحديد الاتجاه تلقائياً. يمكنك إدخاله يدوياً.');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '📍 تحديد الاتجاه تلقائياً';
+      }
+    });
+
     // ---------- أزرار التاريخ ----------
     const dateBtns = document.querySelectorAll('.segmented-btn');
     dateBtns.forEach(btn => {
@@ -208,7 +241,8 @@
 
         const data = await response.json();
         const report = data.report || '';
-        const sections = report.split('---');
+        // تقسيم محسّن
+        const sections = report.split(/---\s*/).filter(s => s.trim() !== '');
         displayCards(sections);
         resultsContainer.classList.remove('hidden');
         resultsContainer.scrollIntoView({ behavior: 'smooth' });
@@ -232,9 +266,10 @@
       for (let i = 0; i < 4; i++) {
         const card = document.createElement('div');
         card.className = 'card';
+        const content = (sections[i] || 'غير متوفر').trim();
         card.innerHTML = `
           <h3 class="text-lg font-bold text-neon mb-3">${titles[i]}</h3>
-          <div class="text-gray-300 whitespace-pre-line leading-relaxed">${(sections[i] || '').trim()}</div>
+          <div class="text-gray-300 whitespace-pre-line leading-relaxed">${content}</div>
         `;
         resultsContainer.appendChild(card);
       }
