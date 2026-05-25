@@ -27,9 +27,7 @@
       background-color: #1a2a4a; border: 1px solid #2a3a5a;
       border-radius: 1rem; padding: 1.5rem;
       box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-      transition: transform 0.2s, box-shadow 0.2s;
     }
-    .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,229,255,0.1); }
     .btn-primary {
       background-color: #00e5ff; color: #0b132b; font-weight: bold;
       padding: 0.75rem 2rem; border-radius: 0.5rem; border: none;
@@ -45,7 +43,7 @@
       background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff;
       border-radius: 0.5rem; padding: 0.75rem; width: 100%;
     }
-    .input-field:focus { outline: none; border-color: #00e5ff; box-shadow: 0 0 8px rgba(0,229,255,0.3); }
+    .input-field:focus { outline: none; border-color: #00e5ff; }
     .segmented-btn {
       background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #a0b3d9;
       padding: 0.5rem 1rem; cursor: pointer; transition: all 0.2s; flex: 1;
@@ -66,6 +64,10 @@
       background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #00e5ff;
       padding: 0.25rem 0.75rem; border-radius: 0.5rem; font-weight: bold;
       text-align: center; min-width: 130px;
+    }
+    .report-content {
+      white-space: pre-wrap;
+      line-height: 1.8;
     }
   </style>
 </head>
@@ -117,45 +119,43 @@
       </div>
     </div>
 
-    <!-- نتائج التقرير -->
-    <div id="resultsContainer" class="grid grid-cols-1 md:grid-cols-2 gap-6 hidden"></div>
+    <!-- التقرير الكامل -->
+    <div id="reportCard" class="card hidden">
+      <div id="reportContent" class="text-gray-300 report-content"></div>
+    </div>
 
     <!-- التحميل -->
     <div id="loadingOverlay" class="loading-overlay hidden">
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
         <p class="text-neon text-lg font-semibold">جاري تحليل البيانات البحرية...</p>
-        <p class="text-gray-400 text-sm mt-2">يتم حساب طاقة الموج، الرياح، والاحتمالات البيولوجية</p>
       </div>
     </div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ---------- الخريطة ----------
+    // الخريطة
     const map = L.map('map').setView([36.7, 10.8], 10);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution: '&copy; OSM &copy; CARTO', subdomains: 'abcd', maxZoom: 19
     }).addTo(map);
-    const marker = L.marker([36.7, 10.8], { draggable: true }).addTo(map)
-      .bindPopup('اسحب العلامة').openPopup();
+    const marker = L.marker([36.7, 10.8], { draggable: true }).addTo(map).bindPopup('اسحب العلامة').openPopup();
 
     marker.on('dragend', () => {
       const pos = marker.getLatLng();
       document.getElementById('latitude').value = pos.lat.toFixed(6);
       document.getElementById('longitude').value = pos.lng.toFixed(6);
     });
-
     function updateMarker() {
       const lat = parseFloat(document.getElementById('latitude').value) || 36.7;
       const lng = parseFloat(document.getElementById('longitude').value) || 10.8;
-      marker.setLatLng([lat, lng]);
-      map.setView([lat, lng], 10);
+      marker.setLatLng([lat, lng]); map.setView([lat, lng], 10);
     }
     document.getElementById('latitude').addEventListener('change', updateMarker);
     document.getElementById('longitude').addEventListener('change', updateMarker);
 
-    // ---------- اتجاه الشاطئ ----------
+    // اتجاه الشاطئ
     const dirs = ['شمال','شمال شمال شرقي','شمال شرقي','شرق شمال شرقي','شرق',
                   'شرق جنوب شرقي','جنوب شرقي','جنوب جنوب شرقي','جنوب',
                   'جنوب جنوب غربي','جنوب غربي','غرب جنوب غربي','غرب',
@@ -168,14 +168,12 @@
       orientVal.textContent = `${deg}° (${degToDir(deg)})`;
     });
 
-    // زر تحديد الاتجاه تلقائياً
     document.getElementById('autoOrientBtn').addEventListener('click', async () => {
       const lat = parseFloat(document.getElementById('latitude').value);
       const lng = parseFloat(document.getElementById('longitude').value);
       if (isNaN(lat) || isNaN(lng)) return alert('الرجاء إدخال إحداثيات صحيحة');
       const btn = document.getElementById('autoOrientBtn');
-      btn.disabled = true;
-      btn.textContent = '⏳ جارٍ تحديد الاتجاه...';
+      btn.disabled = true; btn.textContent = '⏳ جارٍ تحديد الاتجاه...';
       try {
         const resp = await fetch('https://spotdata.onrender.com/auto-orientation', {
           method: 'POST',
@@ -190,12 +188,11 @@
       } catch(e) {
         alert('تعذر تحديد الاتجاه تلقائياً. يمكنك إدخاله يدوياً.');
       } finally {
-        btn.disabled = false;
-        btn.textContent = '📍 تحديد الاتجاه تلقائياً';
+        btn.disabled = false; btn.textContent = '📍 تحديد الاتجاه تلقائياً';
       }
     });
 
-    // ---------- أزرار التاريخ ----------
+    // أزرار التاريخ
     const dateBtns = document.querySelectorAll('.segmented-btn');
     dateBtns.forEach(btn => {
       btn.addEventListener('click', function() {
@@ -205,10 +202,11 @@
       });
     });
 
-    // ---------- إرسال الطلب وعرض النتائج ----------
+    // إرسال الطلب
     const submitBtn = document.getElementById('submitBtn');
     const loadingOverlay = document.getElementById('loadingOverlay');
-    const resultsContainer = document.getElementById('resultsContainer');
+    const reportCard = document.getElementById('reportCard');
+    const reportContent = document.getElementById('reportContent');
     const API_URL = 'https://spotdata.onrender.com/generate-report';
 
     submitBtn.addEventListener('click', async () => {
@@ -221,59 +219,32 @@
       };
 
       loadingOverlay.classList.remove('hidden');
-      resultsContainer.classList.add('hidden');
+      reportCard.classList.add('hidden');
 
       try {
-        const response = await fetch(API_URL, {
+        const resp = await fetch(API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-
-        if (!response.ok) {
-          let errMsg = `خطأ في الخادم (${response.status})`;
+        if (!resp.ok) {
+          let errMsg = `خطأ في الخادم (${resp.status})`;
           try {
-            const errData = await response.json();
-            errMsg += '\n' + (errData.detail || JSON.stringify(errData));
-          } catch (_) {}
+            const err = await resp.json();
+            errMsg += '\n' + (err.detail || '');
+          } catch(_) {}
           throw new Error(errMsg);
         }
-
-        const data = await response.json();
-        const report = data.report || '';
-        // تقسيم محسّن
-        const sections = report.split(/---\s*/).filter(s => s.trim() !== '');
-        displayCards(sections);
-        resultsContainer.classList.remove('hidden');
-        resultsContainer.scrollIntoView({ behavior: 'smooth' });
-
-      } catch (error) {
-        alert('❌ فشل جلب التقرير:\n' + error.message);
-        console.error(error);
+        const data = await resp.json();
+        reportContent.textContent = data.report || 'لم يتم استلام تقرير.';
+        reportCard.classList.remove('hidden');
+        reportCard.scrollIntoView({ behavior: 'smooth' });
+      } catch(e) {
+        alert('❌ فشل جلب التقرير:\n' + e.message);
       } finally {
         loadingOverlay.classList.add('hidden');
       }
     });
-
-    function displayCards(sections) {
-      resultsContainer.innerHTML = '';
-      const titles = [
-        '📋 التحليل التاريخي وحالة الماء ونقائه',
-        '🌊 تقلبات فترات اليوم بين الصباح والظهر والليل',
-        '⚖️ استراتيجية الرصاص والجدول الساعي',
-        '🐟 التكهن الاحتمالي للأسماك والطُعوم'
-      ];
-      for (let i = 0; i < 4; i++) {
-        const card = document.createElement('div');
-        card.className = 'card';
-        const content = (sections[i] || 'غير متوفر').trim();
-        card.innerHTML = `
-          <h3 class="text-lg font-bold text-neon mb-3">${titles[i]}</h3>
-          <div class="text-gray-300 whitespace-pre-line leading-relaxed">${content}</div>
-        `;
-        resultsContainer.appendChild(card);
-      }
-    }
   </script>
 </body>
 </html>
