@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – v2.1</title>
+  <title>Surfcasting Analytics – v2.2</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -72,7 +72,7 @@
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
     <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">
-      🎣 Surfcasting Analytics – v2.1
+      🎣 Surfcasting Analytics – v2.2
     </h1>
 
     <!-- تبويب: تقرير فردي / مسح الشواطئ -->
@@ -81,9 +81,7 @@
       <button id="tabScan" class="btn-secondary rounded-lg">🔍 مسح الشواطئ</button>
     </div>
 
-    <!-- ================================================================ -->
-    <!--                        التبويب الأول: بقعة واحدة                        -->
-    <!-- ================================================================ -->
+    <!-- =================== التبويب الأول =================== -->
     <div id="panelSingle">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
         <div class="lg:col-span-2"><div id="map"></div></div>
@@ -122,7 +120,7 @@
             <input type="hidden" id="targetDate" value="today">
           </div>
           <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
-          <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام</p>
+          <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام (إيقاظ الخادم)</p>
         </div>
       </div>
 
@@ -132,9 +130,7 @@
       </div>
     </div>
 
-    <!-- ================================================================ -->
-    <!--                     التبويب الثاني: مسح الشواطئ                      -->
-    <!-- ================================================================ -->
+    <!-- =================== التبويب الثاني =================== -->
     <div id="panelScan" class="hidden">
       <div class="card mb-8">
         <h2 class="text-xl font-bold text-neon mb-4">🗺️ اختر الولايات الساحلية</h2>
@@ -176,8 +172,8 @@
     <div id="loadingOverlay" class="loading-overlay hidden">
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
-        <p class="text-neon text-lg font-semibold">جاري تحليل البيانات البحرية...</p>
-        <p class="text-gray-400 text-sm mt-2">يتم حساب طاقة الموج، الرياح، والاحتمالات البيولوجية</p>
+        <p id="loadingMsg" class="text-neon text-lg font-semibold">جاري تحليل البيانات البحرية...</p>
+        <p class="text-gray-400 text-sm mt-2">يتم إيقاظ الخادم، الرجاء الانتظار حتى 90 ثانية</p>
       </div>
     </div>
   </div>
@@ -203,7 +199,6 @@
       tabSingle.className = 'btn-secondary rounded-lg';
       panelScan.classList.remove('hidden');
       panelSingle.classList.add('hidden');
-      // تهيئة قائمة الولايات مرة واحدة فقط إذا لم تكن موجودة
       if (document.getElementById('governorateCheckboxes').children.length === 0) {
         buildGovernorateCheckboxes();
       }
@@ -291,15 +286,27 @@
     });
 
     // ========================
-    //   تقديم تقرير بقعة واحدة
+    //   دالة الإرسال مع مهلة طويلة وإعادة محاولة
     // ========================
-    const submitBtn = document.getElementById('submitBtn');
-    const loadingOverlay = document.getElementById('loadingOverlay');
-    const reportCard = document.getElementById('reportCard');
-    const reportContent = document.getElementById('reportContent');
     const API_URL = 'https://spotdata.onrender.com/generate-report';
 
-    submitBtn.addEventListener('click', async () => {
+    async function fetchWithTimeout(url, options, timeout = 90000) {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+      } catch (error) {
+        clearTimeout(id);
+        if (error.name === 'AbortError') {
+          throw new Error('انتهت مهلة الانتظار (90 ثانية). الخادم يحتاج وقتاً أطول للإقلاع، حاول مرة أخرى.');
+        }
+        throw error;
+      }
+    }
+
+    async function submitReport(retry = true) {
       const payload = {
         latitude: parseFloat(document.getElementById('latitude').value),
         longitude: parseFloat(document.getElementById('longitude').value),
@@ -310,9 +317,10 @@
 
       loadingOverlay.classList.remove('hidden');
       reportCard.classList.add('hidden');
+      document.getElementById('loadingMsg').textContent = retry ? 'جاري إعادة المحاولة...' : 'جاري تحليل البيانات البحرية...';
 
       try {
-        const response = await fetch(API_URL, {
+        const response = await fetchWithTimeout(API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -328,20 +336,28 @@
         }
 
         const data = await response.json();
-        reportContent.textContent = data.report || 'لم يصدر تقرير.';
+        document.getElementById('reportContent').textContent = data.report || 'لم يصدر تقرير.';
         reportCard.classList.remove('hidden');
         reportCard.scrollIntoView({ behavior: 'smooth' });
 
       } catch (error) {
+        // إذا كان الخطأ شبكة أو مهلة، نحاول مرة واحدة تلقائياً
+        if (retry && (error.message.includes('Failed to fetch') || error.message.includes('انتهت مهلة الانتظار'))) {
+          document.getElementById('loadingMsg').textContent = 'الخادم يستيقظ... إعادة المحاولة خلال ثوانٍ';
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          return submitReport(false); // إعادة المحاولة مرة واحدة بدون تكرار لانهائي
+        }
         alert('❌ فشل جلب التقرير:\n' + error.message);
         console.error(error);
       } finally {
         loadingOverlay.classList.add('hidden');
       }
-    });
+    }
+
+    document.getElementById('submitBtn').addEventListener('click', () => submitReport(true));
 
     // ========================
-    //     مسح الشواطئ
+    //     مسح الشواطئ (مع نفس المهلة)
     // ========================
     const governorates = ["بنزرت","أريانة","تونس","بن عروس","نابل","سوسة","المنستير","المهدية","صفاقس","قابس","مدنين"];
 
@@ -364,18 +380,18 @@
       if (selectedGovs.length === 0) return alert('اختر ولاية واحدة على الأقل');
 
       const targetDate = document.getElementById('scanDate').value;
-
       loadingOverlay.classList.remove('hidden');
       document.getElementById('scanResults').classList.add('hidden');
+      document.getElementById('loadingMsg').textContent = 'جاري مسح الشواطئ...';
 
       try {
-        const resp = await fetch('https://spotdata.onrender.com/scan-best', {
+        const response = await fetchWithTimeout('https://spotdata.onrender.com/scan-best', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ governorates: selectedGovs, target_date: targetDate })
         });
-        if (!resp.ok) throw new Error(await resp.text());
-        const data = await resp.json();
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
         const top10 = data.top10;
         const tbody = document.getElementById('scanTableBody');
         tbody.innerHTML = '';
