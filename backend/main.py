@@ -1,8 +1,8 @@
 """
-Surfcasting Analytics API – Final Production v2.1
-- Unified spot report with all enriched factors (pressure, rain, moon, sun, detailed wind).
+Surfcasting Analytics API – Final Production v2.2
+- Unified spot report with all enriched factors.
 - Multi‑beach scanning & ranking (top 10).
-- Intelligent Gemini retry on quota exceeded (429).
+- Intelligent Gemini retry + split into 4 sections to avoid truncation.
 - 0% physics error – all calculations server‑side.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
@@ -25,7 +25,7 @@ logger = logging.getLogger("surfcasting")
 # ---------------------------------------------------------------------------- #
 #                                      التهيئة                                      #
 # ---------------------------------------------------------------------------- #
-app = FastAPI(title="Surfcasting Analytics", version="2.1.0")
+app = FastAPI(title="Surfcasting Analytics", version="2.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -457,14 +457,15 @@ SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف و
 اكتب التقرير بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات أو أنك ذكاء اصطناعي."""
 
 # ---------------------------------------------------------------------------- #
-#                     استدعاء Gemini مع إعادة المحاولة عند الحصة                     #
+#                استدعاء Gemini الأساسي (لطلب واحد مع إعادة المحاولة)                #
 # ---------------------------------------------------------------------------- #
-async def call_gemini(ctx):
+async def call_gemini_single(prompt_text: str) -> str:
+    """استدعاء Gemini مع إعادة المحاولة عند تجاوز الحصة (429)."""
     model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-    gen_cfg = {"temperature": 0.3, "max_output_tokens": 2000}
+    gen_cfg = {"temperature": 0.3, "max_output_tokens": 4000}
 
     async def _attempt():
-        resp = await asyncio.to_thread(model.generate_content, contents=ctx, generation_config=gen_cfg)
+        resp = await asyncio.to_thread(model.generate_content, contents=prompt_text, generation_config=gen_cfg)
         if resp.candidates and resp.candidates[0].content.parts:
             return resp.candidates[0].content.parts[0].text.strip()
         raise SurfError("رد فارغ من Gemini")
@@ -486,6 +487,33 @@ async def call_gemini(ctx):
                     "أو ترقية مفتاح API الخاص بك."
                 )
         raise SurfError(f"فشل Gemini: {err_str}")
+
+# ---------------------------------------------------------------------------- #
+#              استراتيجية التقسيم إلى 4 أجزاء لتجنب انقطاع النص (الحل النهائي)              #
+# ---------------------------------------------------------------------------- #
+async def call_gemini(ctx: str) -> str:
+    """
+    يطلب من Gemini كتابة التقرير على 4 أقسام منفصلة، ثم يجمعهم.
+    هذا يمنع انقطاع النص في النسخة المجانية.
+    """
+    sections_prompts = [
+        "اكتب فقط القسم 1 من التقرير: التحليل العام للعوامل البحرية وحالة الماء ونقائه.",
+        "اكتب فقط القسم 2 من التقرير: تحليل الأمواج والتيارات (هل تثبت الرصاصة؟).",
+        "اكتب فقط القسم 3 من التقرير: تحليل الرياح والأعشاب واستراتيجية الرصاص.",
+        "اكتب فقط القسم 4 من التقرير: تقييم سبوت الصيد والتكهن الاحتمالي للأسماك والطُعوم."
+    ]
+
+    full_report_parts = []
+    for i, section_prompt in enumerate(sections_prompts):
+        try:
+            section_text = await call_gemini_single(ctx + "\n\n" + section_prompt)
+            full_report_parts.append(section_text)
+            logger.info(f"Section {i+1}/4 generated ({len(section_text)} chars)")
+        except Exception as e:
+            logger.warning(f"Section {i+1} failed: {e}")
+            full_report_parts.append(f"[القسم {i+1} غير متوفر حالياً]")
+
+    return "\n\n".join(full_report_parts)
 
 # ---------------------------------------------------------------------------- #
 #                           نقطة نهاية التقرير الفردي                           #
