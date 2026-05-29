@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – v2.5</title>
+  <title>Surfcasting Analytics – v2.7</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -41,7 +41,7 @@
 </head>
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v2.5</h1>
+    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v2.7</h1>
 
     <div class="flex justify-center gap-4 mb-8">
       <button id="tabSingle" class="btn-primary rounded-lg">📍 تقرير بقعة</button>
@@ -160,14 +160,37 @@
       const p=marker.getLatLng();
       document.getElementById('latitude').value=p.lat.toFixed(6);
       document.getElementById('longitude').value=p.lng.toFixed(6);
+      updateBottomType(); // تحديث نوع القاع تلقائياً
     });
     function updateMarker(){
       const lat=parseFloat(document.getElementById('latitude').value)||36.7;
       const lng=parseFloat(document.getElementById('longitude').value)||10.8;
       marker.setLatLng([lat,lng]); map.setView([lat,lng],10);
     }
-    document.getElementById('latitude').addEventListener('change',updateMarker);
-    document.getElementById('longitude').addEventListener('change',updateMarker);
+    document.getElementById('latitude').addEventListener('change', updateMarker);
+    document.getElementById('longitude').addEventListener('change', updateMarker);
+    document.getElementById('latitude').addEventListener('change', updateBottomType);
+    document.getElementById('longitude').addEventListener('change', updateBottomType);
+
+    // ---------- تحديد نوع القاع تلقائياً ----------
+    async function updateBottomType() {
+      const lat = parseFloat(document.getElementById('latitude').value);
+      const lng = parseFloat(document.getElementById('longitude').value);
+      if (isNaN(lat) || isNaN(lng)) return;
+      try {
+        const resp = await fetch('https://spotdata.onrender.com/detect-bottom-type', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ latitude: lat, longitude: lng })
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const type = data.bottom_type;
+        document.getElementById('beachType').value = type === 'rocky' ? 'rocky' : 'sandy';
+      } catch (e) {
+        // فشل صامت
+      }
+    }
 
     // ---------- اتجاه الشاطئ ----------
     const dirs = ['شمال','شمال شمال شرقي','شمال شرقي','شرق شمال شرقي','شرق','شرق جنوب شرقي','جنوب شرقي','جنوب جنوب شرقي','جنوب','جنوب جنوب غربي','جنوب غربي','غرب جنوب غربي','غرب','غرب شمال غربي','شمال غربي','شمال شمال غربي'];
