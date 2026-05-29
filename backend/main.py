@@ -32,7 +32,7 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "openrouter/quasar-alpha"  # نموذج مجاني بسياق 1M رمز
+MODEL_NAME = "google/gemini-2.5-flash"  # نموذج مجاني بسياق 1M رمز
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
