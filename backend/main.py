@@ -1,7 +1,7 @@
 """
-Surfcasting Analytics API – Production v2.5 (Complete)
-Features: rate limit, caching, scan-best with target species,
-golden hour bonus, detailed beach DB, enhanced prompt.
+Surfcasting Analytics API – Production v2.6 (OpenRouter)
+Uses OpenRouter free models to avoid Gemini geographic restrictions.
+All features preserved.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, time
 from datetime import datetime, timedelta, date
@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-import google.generativeai as genai
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -23,17 +22,17 @@ logger = logging.getLogger("surfcasting")
 
 # --------------- Rate Limiter ---------------
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="2.5.0")
+app = FastAPI(title="Surfcasting Analytics", version="2.6.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_KEY:
-    raise RuntimeError("GEMINI_API_KEY مفقود")
-genai.configure(api_key=GEMINI_KEY)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
-MODEL_NAME = "models/gemini-2.5-flash"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_NAME = "openrouter/quasar-alpha"  # نموذج مجاني بسياق 1M رمز
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -68,7 +67,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "gemini": bool(GEMINI_KEY), "model": MODEL_NAME}
+    return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME}
 
 # --------------- دوال مساعدة ---------------
 async def fetch_timezone_info(lat, lon):
@@ -512,7 +511,6 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
         if diff > 1: press_trend = "في ارتفاع"
         elif diff < -1: press_trend = "في انخفاض"
 
-    # تجميع الفترات (صباح/ظهر/ليل)
     periods = defaultdict(lambda: {"indices":[], "temps":[], "precip":[], "codes":[]})
     for i in target_idx:
         h = dtimes[i].hour
@@ -577,17 +575,14 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     if beach_type == "rocky": bio.setdefault("additional", []).append("سارغ")
     if beach_type == "sandy": bio.setdefault("additional", []).append("بوري")
 
-    # توجيه القمر
     mp = moon_phase(target_date_obj)
     moon_guidance = ""
     if "محاق" in mp: moon_guidance = "المحاق ينشط أسماك القاع ليلاً (قاروص، سارغ)."
     elif "بدر" in mp: moon_guidance = "البدر ينشط الأسماك السطحية نهاراً (دوراد، بوري)."
 
-    # swell range يومي
     swell_day = [swell_h[i] for i in target_idx]
     swell_range = f"{min(swell_day):.2f}-{max(swell_day):.2f}"
 
-    # تغير الضغط
     press_vals = [pressure[i] for i in target_idx]
     p3 = press_vals[-1] - press_vals[0] if len(press_vals) > 1 else 0
     p6 = press_vals[-1] - press_vals[0] if len(press_vals) > 2 else 0
@@ -656,16 +651,27 @@ SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي خبير. ا�
 
 اكتب بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات."""
 
-async def call_gemini(ctx):
-    model = genai.GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
-    try:
-        resp = await asyncio.to_thread(model.generate_content, contents=ctx,
-                                       generation_config={"temperature":0.3, "max_output_tokens":7000})
-        if resp.candidates and resp.candidates[0].content.parts:
-            return resp.candidates[0].content.parts[0].text.strip()
-        raise SurfError("رد فارغ")
-    except Exception as e:
-        raise SurfError(f"فشل Gemini: {str(e)}")
+async def call_openrouter(ctx):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ctx}
+        ],
+        "max_tokens": 7000,
+        "temperature": 0.3
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        raise SurfError("استجابة OpenRouter فارغة")
 
 # --------------- نقطة نهاية التقرير الفردي ---------------
 @app.post("/generate-report")
@@ -687,7 +693,7 @@ async def generate_report(request: Request, req: ReportRequest):
         target_dt = resolve_target_date(req.target_date, real_today)
         agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz_name)
         ctx = build_context(req, agg, tz_name)
-        report = await call_gemini(ctx)
+        report = await call_openrouter(ctx)
         result = {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
         cache[cache_key] = {"ts": time.time(), "data": result}
         return result
