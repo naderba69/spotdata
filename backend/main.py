@@ -1,5 +1,6 @@
 """
-Surfcasting Analytics API – v2.7 (Tunisian Dialect + Auto Bottom Type)
+Surfcasting Analytics API – v3.0 (Final Production)
+Tunisian dialect, moon phases (حمل/فساد), seasonal tips, pressure bonus, scan, etc.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, time
 from datetime import datetime, timedelta, date
@@ -19,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="2.7.0")
+app = FastAPI(title="Surfcasting Analytics", version="3.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -180,17 +181,6 @@ async def get_auto_orientation(lat, lon):
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     return {"orientation": await get_auto_orientation(req.latitude, req.longitude)}
 
-def moon_phase(d: date) -> str:
-    y, m, day = d.year, d.month, d.day
-    if m < 3:
-        y -= 1; m += 12
-    a = int(y/100)
-    b = 2 - a + int(a/4)
-    jd = int(365.25*(y+4716)) + int(30.6001*(m+1)) + day + b - 1524.5
-    days = jd - 2451550.1
-    idx = int((days % 29.53058867) / 29.53058867 * 8) % 8
-    return ["محاق","هلال أول","تربيع أول","أحدب متزايد","بدر","أحدب متناقص","تربيع ثاني","هلال آخر"][idx]
-
 def safe_float(v):
     try: return 0.0 if math.isnan(float(v)) else float(v)
     except: return 0.0
@@ -259,6 +249,53 @@ SPECIES_PREFERENCES = {
     }
 }
 
+# --------------- مراحل القمر وأيام الحمل/الفساد ---------------
+def moon_phase_detail(d: date) -> dict:
+    y, m, day = d.year, d.month, d.day
+    if m < 3:
+        y -= 1
+        m += 12
+    a = int(y / 100)
+    b = 2 - a + int(a / 4)
+    jd = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + day + b - 1524.5
+    new_moon_jd = 2451550.1
+    days_since_new = jd - new_moon_jd
+    lunar_month = 29.53058867
+    phase = (days_since_new % lunar_month) / lunar_month
+    idx = int(phase * 8) % 8
+    phases = {
+        0: "محاق", 1: "هلال أول", 2: "تربيع أول", 3: "أحدب متزايد",
+        4: "بدر", 5: "أحدب متناقص", 6: "تربيع ثاني", 7: "هلال آخر"
+    }
+    name = phases.get(idx, "محاق")
+    if 0.0 <= phase < 0.125 or 0.875 <= phase <= 1.0:
+        status = "أيام متوسطة (محاق / هلال آخر)"
+        activity = "ينشط القاع ليلاً بشكل خاص، والنهار يكون متوسط"
+    elif 0.125 <= phase < 0.5:
+        status = "أيام حمل"
+        activity = "الأسماك نشيطة طوال اليوم، والصيد ممتاز ليلاً ونهاراً"
+    else:
+        status = "أيام فساد"
+        activity = "الأسماك أقل نشاطاً، يُفضّل الصيد في الساعات الذهبية (الشروق والغروب)"
+    return {"name": name, "status": status, "activity": activity, "phase": round(phase, 3)}
+
+def moon_fishing_guidance(d: date) -> str:
+    detail = moon_phase_detail(d)
+    name = detail["name"]
+    status = detail["status"]
+    if "محاق" in name:
+        return f"{status}. ركز على الصيد الليلي للقاروص والسارغ باستعمال طعوم بروائح قوية."
+    elif "هلال أول" in name or "تربيع أول" in name:
+        return f"{status}. فرصة ممتازة لكل الأنواع، استهدف القاروص نهاراً والدوراد عند الغروب."
+    elif "أحدب متزايد" in name:
+        return f"{status}. البوري والدوراد نشيطين نهاراً، القاروص ينشط ليلاً."
+    elif "بدر" in name:
+        return f"{status}. الأسماك السطحية (الدوراد، البوري) نشيطة نهاراً، والصيد الليلي ضعيف."
+    elif "أحدب متناقص" in name or "تربيع ثاني" in name:
+        return f"{status}. الصيد متوسط، استعمل الطعوم القوية (الشريب، دود الكف) في الفجر والغروب."
+    else:
+        return f"{status}. الصيد مقبول، لكن الأفضل في الساعات الذهبية."
+
 def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, target_species=None):
     mh = marine.get("hourly", {})
     wh = weather.get("hourly", {})
@@ -311,7 +348,12 @@ def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, 
     avg_power = sum(0.49 * (wave_h[i]**2) * wave_p[i] for i in range(N)) / N
     avg_wind = sum(wind_speed) / N
     avg_sst = sum(sst) / N
+    avg_press = sum(pressure) / N
     dominant_wind = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
+
+    # مكافأة الضغط المستقر
+    if 1015 <= avg_press <= 1025:
+        score += 8
 
     if target_species and target_species in SPECIES_PREFERENCES:
         prefs = SPECIES_PREFERENCES[target_species]
@@ -348,6 +390,7 @@ def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, 
     }
     return round(normalized, 1), summary
 
+# --------------- قاعدة بيانات الشواطئ ---------------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name": "شاطئ الكورنيش (بنزرت)", "lat": 37.2744, "lon": 9.8739, "orientation": 45, "type": "sandy"},
@@ -417,16 +460,20 @@ TUNISIAN_BEACHES = {
 }
 
 SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري قدير. اكتب تقريراً بحرياً كاملاً باللغة العربية والمصطلحات التونسية الدارجة (المرصاص، اللدونة، التيارات الجارفة، القفلة، دود الكف، القمبري، الشريب، القرابين، الصابونة...). التقرير نص واحد متصل بلا نقاط أو رموز، يغطي:
-1. تحليل عام: حالة السماء، حرارة الهواء والماء، القمر وتأثيره (المحاق ينشط أسماك القاع ليلاً، البدر ينشط السطحية نهاراً)، الشروق والغروب.
+1. تحليل عام: حالة السماء، حرارة الهواء والماء، القمر وتأثيره (أيام الحمل/الفساد، المحاق، البدر...)، الشروق والغروب. **استخدم معلومات حالة القمر للصيد والتوجيه لتحدد بالضبط متى يكون النشاط أفضل (نهار/ليل) وما هي الأسماك المستهدفة في كل فترة.**
 2. الأمواج والتيارات: نطاق الموج و swell، الطاقة. بناءً عليها:
    - وزن ونوع الرصاصة (صابونة، هرم، قرابين) مع تعليل. إذا الموج أقل من 0.5م استعمل صابونة 80-100غ وارم بعيداً، وإذا بين 0.5-1م استعمل هرم 100-120غ وارم أقرب. للصخور استعمل قرابين (مخالب) حتى لا تعلق.
    - اقترح تركيبة (Montage): "بكرة بمخالب" للصخور، "صابونة جارية" للرمل، "كراتين" للبوري.
+   - خطة طوارئ: إذا ارتفع الموج فجأة، غيّر الرصاصة إلى مخالب فوراً وقصّر مسافة الرمي.
 3. الرياح والأعشاب: سرعة واتجاه الرياح (بحرية مباشرة، برية، جانبية...)، تأثيرها على الأعشاب ونقاء الماء، الأمطار. تكتيك الرمي: إذا الرياح بحرية، ارمِ بزاوية 45° عكس الريح. وإذا برية، ارمِ مع الريح لمسافة أطول. إذا جانبية، ارمِ بعكس التيار.
 4. التقييم والتوصيات:
-   - أفضل الأوقات بدقة مع وصف سلوك السمك (يقترب للشاطئ عند الفجر، يبتعد عند الظهر...).
+   - أفضل الأوقات بدقة مع تكتيك متقدم: قبل الشروق استعمل طعوم رائحة قوية (دود الكف، الشريب)، بعد الشروق طعوم بصرية (القمبري، السردين)، في الليل استعمل طعوم لامعة ومسافات أقرب مع مصباح رأس للسلامة.
+   - استراتيجية خاصة للبوري: إذا كنت تستهدف البوري، استعمل تركيب الكراتين بعجينة الخبز ودود الكف، وارمِ لمسافة 80-100م.
    - الطعوم حسب القاع (دود الكف للرمل، القمبري للصخور، الشريب للماء البارد).
    - إذا أمطار، نبه لمصبات الوديان.
-   - تحذير سلامة إذا تجاوزت الرياح 30 كم/س أو الموج 1.5م.
+   - تحذير سلامة إذا تجاوزت الرياح 30 كم/س أو الموج 1.5م. أضف نصائح سلامة ليلية (مصباح رأس، إخبار أحد بمكانك).
+   - علامات الصياد المحترف: راقب تغير لون الماء، تجمع الطيور، القفزات الصغيرة.
+   - نصيحة موسمية حسب الشهر الحالي (الشتاء، الربيع، الصيف، الخريف) واذكر الطعوم المناسبة.
    - قارن سريعاً مع الأيام الماضية (هل البحر يهدأ أم يضطرب؟).
    - اختم بسؤال للصياد: "أي نوع سمك تستهدف اليوم؟" أو "هل جربت الشريب هذا الموسم؟"
    - تذكير بمراجعة جدول المد المحلي (آخر ساعتين من المد هي الأفضل).
@@ -632,10 +679,8 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     if beach_type == "rocky": bio.setdefault("additional", []).append("سارغ")
     elif beach_type == "sandy": bio.setdefault("additional", []).append("بوري")
 
-    mp = moon_phase(target_date_obj)
-    moon_guidance = ""
-    if "محاق" in mp: moon_guidance = "المحاق ينشط أسماك القاع ليلاً."
-    elif "بدر" in mp: moon_guidance = "البدر ينشط الأسماك السطحية نهاراً."
+    moon_detail = moon_phase_detail(target_date_obj)
+    moon_guidance = moon_fishing_guidance(target_date_obj)
 
     swell_day = [swell_h[i] for i in target_idx]
     swell_range = f"{min(swell_day):.2f}-{max(swell_day):.2f}"
@@ -660,7 +705,9 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             "pressure_change_6h": round(p6,1),
             "sunrise": sunrise,
             "sunset": sunset,
-            "moon_phase": mp,
+            "moon_phase": moon_detail["name"],
+            "moon_status": moon_detail["status"],
+            "moon_activity": moon_detail["activity"],
             "moon_guidance": moon_guidance,
             "swell_range_day": swell_range
         }
@@ -680,7 +727,8 @@ def build_context(req, agg, tz_name):
     if extra:
         lines.append(f"الضغط الجوي: {extra.get('pressure_avg','')} hPa (تغير 3س: {extra.get('pressure_change_3h','')}, 6س: {extra.get('pressure_change_6h','')})")
         lines.append(f"الشروق: {extra.get('sunrise','')} | الغروب: {extra.get('sunset','')}")
-        lines.append(f"القمر: {extra.get('moon_phase','')} - {extra.get('moon_guidance','')}")
+        lines.append(f"حالة القمر للصيد: {extra.get('moon_status','')} - {extra.get('moon_activity','')}")
+        lines.append(f"توجيه: {extra.get('moon_guidance','')}")
         lines.append(f"Swell اليومي: {extra.get('swell_range_day','')} م")
 
     if agg.get("blocks"):
@@ -696,6 +744,25 @@ def build_context(req, agg, tz_name):
     if agg.get("bio"):
         bio = agg["bio"]
         lines.append("الأسماك المتوقعة: " + ", ".join(bio.get("high",[]) + bio.get("additional",[])))
+    # نصيحة موسمية
+    month = req.target_date if isinstance(req.target_date, date) else date.today().month
+    try:
+        if isinstance(req.target_date, str):
+            # محاولة استخراج الشهر إذا كان النص 'today' أو ما شابه
+            month = date.today().month
+        else:
+            month = req.target_date.month
+    except:
+        month = date.today().month
+    if month in [12, 1, 2]:
+        lines.append("نصيحة موسمية: الشتاء ممتاز للقاروص والسارغ، استعمل الشريب والسردين المجمد.")
+    elif month in [3, 4, 5]:
+        lines.append("نصيحة موسمية: الربيع مثالي للبوري والدوراد، استعمل دود الكف والقمبري.")
+    elif month in [6, 7, 8]:
+        lines.append("نصيحة موسمية: الصيف تكثر فيه الأسماك السطحية، استعمل السردين الطازج والطعم الحي.")
+    else:
+        lines.append("نصيحة موسمية: الخريف يعود القاروص بقوة، جرب الشريب المخمّر.")
+
     lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل.")
     return "\n".join(lines)
 
