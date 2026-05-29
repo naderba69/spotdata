@@ -1,7 +1,5 @@
 """
-Surfcasting Analytics API – Production v2.6 (OpenRouter)
-Uses OpenRouter free models to avoid Gemini geographic restrictions.
-All features preserved.
+Surfcasting Analytics API – v2.7 (Tunisian Dialect + Auto Bottom Type)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, time
 from datetime import datetime, timedelta, date
@@ -20,9 +18,8 @@ from slowapi.errors import RateLimitExceeded
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
-# --------------- Rate Limiter ---------------
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="2.6.0")
+app = FastAPI(title="Surfcasting Analytics", version="2.7.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -32,13 +29,12 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash"  # نموذج مجاني بسياق 1M رمز
+MODEL_NAME = "google/gemini-2.5-flash"
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-# --------------- تخزين مؤقت ---------------
 cache = {}
 CACHE_TTL = 3600
 
@@ -120,6 +116,41 @@ async def fetch_weather(lat, lon, start, end):
         r.raise_for_status()
         return r.json()
 
+async def get_bottom_type(lat: float, lon: float) -> str:
+    query = f"""
+    [out:json];
+    (
+      node(around:500,{lat},{lon})["surface"="sand"];
+      node(around:500,{lat},{lon})["natural"="beach"];
+      node(around:500,{lat},{lon})["surface"="gravel"];
+      node(around:500,{lat},{lon})["surface"="rock"];
+    );
+    out body;
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(OVERPASS_URL, params={"data": query}, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
+            elements = data.get("elements", [])
+            if not elements:
+                return "sandy"
+            for el in elements:
+                tags = el.get("tags", {})
+                surface = tags.get("surface", "").lower()
+                if "rock" in surface or "gravel" in surface or "pebbles" in surface:
+                    return "rocky"
+            return "sandy"
+    except Exception as e:
+        logger.error(f"Bottom type detection error: {e}")
+        return "sandy"
+
+@app.post("/detect-bottom-type")
+@limiter.limit("10/minute")
+async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
+    bottom = await get_bottom_type(req.latitude, req.longitude)
+    return {"bottom_type": bottom}
+
 async def get_auto_orientation(lat, lon):
     query = f"""
     [out:json];
@@ -196,44 +227,38 @@ SPECIES_PREFERENCES = {
         "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية مائلة للبحر"],
         "ideal_wave_range": (0.5, 1.5),
         "ideal_power_range": (0.5, 2.0),
-        "bottom_type": "sandy",
-        "description": "يفضل الماء البارد والأمواج المتوسطة مع رياح بحرية، خاصة حول المصبات."
+        "bottom_type": "sandy"
     },
     "دوراد": {
         "ideal_sst": (19, 26),
         "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية مائلة للبر"],
         "ideal_wave_range": (0.3, 0.8),
         "ideal_power_range": (0.1, 1.0),
-        "bottom_type": "sandy",
-        "description": "يحب الماء الدافئ والرياح البرية التي تصفي الماء، قرب الشواطئ الرملية."
+        "bottom_type": "sandy"
     },
     "سارغ": {
         "ideal_sst": (16, 22),
         "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية"],
         "ideal_wave_range": (0.5, 1.2),
         "ideal_power_range": (0.3, 1.5),
-        "bottom_type": "rocky",
-        "description": "يوجد بكثرة قرب الصخور والأمواج المتوسطة، يحب الرغوة."
+        "bottom_type": "rocky"
     },
     "بوري": {
         "ideal_sst": (15, 28),
         "preferred_wind": ["جانبية", "برية خفيفة", "بحرية خفيفة"],
         "ideal_wave_range": (0.1, 0.6),
         "ideal_power_range": (0.0, 0.5),
-        "bottom_type": "sandy",
-        "description": "قرب الشواطئ الرملية جداً والمياه الهادئة، يتغذى على الديدان."
+        "bottom_type": "sandy"
     },
     "ماربري": {
         "ideal_sst": (18, 24),
         "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية"],
         "ideal_wave_range": (0.3, 0.8),
         "ideal_power_range": (0.1, 0.8),
-        "bottom_type": "sandy",
-        "description": "الماء الدافئ والرياح البرية مع القاع الرملي."
+        "bottom_type": "sandy"
     }
 }
 
-# --------------- دالة التقييم الذكية ---------------
 def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, target_species=None):
     mh = marine.get("hourly", {})
     wh = weather.get("hourly", {})
@@ -270,7 +295,6 @@ def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, 
         elif 0.3 <= wave_h[i] <= 1.0 and 0.1 <= power <= 1.5 and wind_speed[i] < 27.8:
             green_hours += 1
             score += 10
-            # مكافأة التوقيت الذهبي
             dt = datetime.fromisoformat(times[i])
             h = dt.hour
             if abs(h - sr_h) <= 2 or abs(h - ss_h) <= 2:
@@ -289,7 +313,6 @@ def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, 
     avg_sst = sum(sst) / N
     dominant_wind = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
 
-    # عامل التفضيل إذا وُجدت سمكة مستهدفة
     if target_species and target_species in SPECIES_PREFERENCES:
         prefs = SPECIES_PREFERENCES[target_species]
         match_score = 0
@@ -325,7 +348,6 @@ def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, 
     }
     return round(normalized, 1), summary
 
-# --------------- قاعدة الشواطئ الشاملة ---------------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name": "شاطئ الكورنيش (بنزرت)", "lat": 37.2744, "lon": 9.8739, "orientation": 45, "type": "sandy"},
@@ -394,7 +416,45 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# --------------- مسح الشواطئ (Scan Best) ---------------
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري قدير. اكتب تقريراً بحرياً كاملاً باللغة العربية والمصطلحات التونسية الدارجة (المرصاص، اللدونة، التيارات الجارفة، القفلة، دود الكف، القمبري، الشريب، القرابين، الصابونة...). التقرير نص واحد متصل بلا نقاط أو رموز، يغطي:
+1. تحليل عام: حالة السماء، حرارة الهواء والماء، القمر وتأثيره (المحاق ينشط أسماك القاع ليلاً، البدر ينشط السطحية نهاراً)، الشروق والغروب.
+2. الأمواج والتيارات: نطاق الموج و swell، الطاقة. بناءً عليها:
+   - وزن ونوع الرصاصة (صابونة، هرم، قرابين) مع تعليل. إذا الموج أقل من 0.5م استعمل صابونة 80-100غ وارم بعيداً، وإذا بين 0.5-1م استعمل هرم 100-120غ وارم أقرب. للصخور استعمل قرابين (مخالب) حتى لا تعلق.
+   - اقترح تركيبة (Montage): "بكرة بمخالب" للصخور، "صابونة جارية" للرمل، "كراتين" للبوري.
+3. الرياح والأعشاب: سرعة واتجاه الرياح (بحرية مباشرة، برية، جانبية...)، تأثيرها على الأعشاب ونقاء الماء، الأمطار. تكتيك الرمي: إذا الرياح بحرية، ارمِ بزاوية 45° عكس الريح. وإذا برية، ارمِ مع الريح لمسافة أطول. إذا جانبية، ارمِ بعكس التيار.
+4. التقييم والتوصيات:
+   - أفضل الأوقات بدقة مع وصف سلوك السمك (يقترب للشاطئ عند الفجر، يبتعد عند الظهر...).
+   - الطعوم حسب القاع (دود الكف للرمل، القمبري للصخور، الشريب للماء البارد).
+   - إذا أمطار، نبه لمصبات الوديان.
+   - تحذير سلامة إذا تجاوزت الرياح 30 كم/س أو الموج 1.5م.
+   - قارن سريعاً مع الأيام الماضية (هل البحر يهدأ أم يضطرب؟).
+   - اختم بسؤال للصياد: "أي نوع سمك تستهدف اليوم؟" أو "هل جربت الشريب هذا الموسم؟"
+   - تذكير بمراجعة جدول المد المحلي (آخر ساعتين من المد هي الأفضل).
+
+اكتب بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات أو أنك ذكاء اصطناعي."""
+
+async def call_openrouter(ctx):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ctx}
+        ],
+        "max_tokens": 7000,
+        "temperature": 0.3
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        raise SurfError("استجابة OpenRouter فارغة")
+
 @app.post("/scan-best")
 @limiter.limit("5/minute")
 async def scan_best_spots(request: Request, req: ScanRequest):
@@ -449,7 +509,6 @@ async def scan_best_spots(request: Request, req: ScanRequest):
     valid.sort(key=lambda x: x["score"], reverse=True)
     return {"target_date": target_dt.isoformat(), "top10": valid[:10]}
 
-# --------------- التقرير الفردي ---------------
 def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj, tz_name):
     tz = zoneinfo.ZoneInfo(tz_name) if tz_name else zoneinfo.ZoneInfo("UTC")
     mh = marine.get("hourly", {})
@@ -492,9 +551,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     target_idx = [i for i, dt in enumerate(dtimes) if target_start <= dt < target_end]
 
     if not target_idx:
-        return {"past_avg_power":0, "dominant_wind":"غير معروف", "sustained_hrs":0,
-                "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False,
-                "bio":{}, "avg_sst":0, "extra_info":{}}
+        return {"past_avg_power":0, "dominant_wind":"غير معروف", "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False, "bio":{}, "avg_sst":0, "extra_info":{}}
 
     past_avg_power_val = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
     dominant = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
@@ -569,16 +626,16 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
 
     avg_sst = sum(sst[i] for i in target_idx)/len(target_idx)
     bio = {}
-    if avg_sst < 16: bio["high"] = ["قاروص", "سارغ كبير"]
+    if avg_sst < 16: bio["high"] = ["قاروص", "سارغ"]
     elif avg_sst > 19: bio["high"] = ["دوراد", "ماربري"]
     else: bio["high"] = []
     if beach_type == "rocky": bio.setdefault("additional", []).append("سارغ")
-    if beach_type == "sandy": bio.setdefault("additional", []).append("بوري")
+    elif beach_type == "sandy": bio.setdefault("additional", []).append("بوري")
 
     mp = moon_phase(target_date_obj)
     moon_guidance = ""
-    if "محاق" in mp: moon_guidance = "المحاق ينشط أسماك القاع ليلاً (قاروص، سارغ)."
-    elif "بدر" in mp: moon_guidance = "البدر ينشط الأسماك السطحية نهاراً (دوراد، بوري)."
+    if "محاق" in mp: moon_guidance = "المحاق ينشط أسماك القاع ليلاً."
+    elif "بدر" in mp: moon_guidance = "البدر ينشط الأسماك السطحية نهاراً."
 
     swell_day = [swell_h[i] for i in target_idx]
     swell_range = f"{min(swell_day):.2f}-{max(swell_day):.2f}"
@@ -639,41 +696,9 @@ def build_context(req, agg, tz_name):
     if agg.get("bio"):
         bio = agg["bio"]
         lines.append("الأسماك المتوقعة: " + ", ".join(bio.get("high",[]) + bio.get("additional",[])))
-    lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل لدخول السمك للشاطئ.")
+    lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل.")
     return "\n".join(lines)
 
-# --------------- SYSTEM PROMPT ---------------
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي خبير. اكتب تقريراً بحرياً كاملاً بالعربية والدارجة التونسية، بناءً على البيانات أدناه. التقرير نص واحد متصل بلا نقاط أو رموز، يغطي:
-1. تحليل عام: الطقس، حرارة الهواء والماء، القمر وتأثيره (خاصة توجيه المحاق/البدر)، الشروق/الغروب.
-2. الأمواج: نطاق الموج و swell، الطاقة. بناءً عليها: وزن ونوع الرصاصة (صابونة/هرم/مخالب) مع تفسير، مع مراعاة نوع القاع (رملي/صخري). إذا الموج <0.5م استعمل صابونة 80-100غ وارم بعيداً، وإذا بين 0.5-1م استعمل هرم 100-120غ وارم أقرب.
-3. الرياح والأعشاب: سرعة واتجاه الرياح، تأثيرها على الأعشاب، الأمطار.
-4. التقييم: أفضل الأوقات، تكتيك الرمي (المسافة والزاوية)، الطعوم (دود الكف، الشريب، القمبري...)، الأسماك المتوقعة. انتبه لتغير الضغط (إذا منخفض سريعاً > ينشط السمك). نبه لمراجعة جدول المد المحلي (آخر ساعتين من المد مثالية).
-
-اكتب بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات."""
-
-async def call_openrouter(ctx):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": ctx}
-        ],
-        "max_tokens": 7000,
-        "temperature": 0.3
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        raise SurfError("استجابة OpenRouter فارغة")
-
-# --------------- نقطة نهاية التقرير الفردي ---------------
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: ReportRequest):
