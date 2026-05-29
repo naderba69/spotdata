@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – v2.7</title>
+  <title>Surfcasting Analytics – v3.0</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -41,7 +41,7 @@
 </head>
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v2.7</h1>
+    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v3.0</h1>
 
     <div class="flex justify-center gap-4 mb-8">
       <button id="tabSingle" class="btn-primary rounded-lg">📍 تقرير بقعة</button>
@@ -78,7 +78,13 @@
           <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام</p>
         </div>
       </div>
-      <div id="reportCard" class="card hidden"><div id="reportContent" class="text-gray-300 whitespace-pre-line leading-loose text-base"></div></div>
+      <div id="reportCard" class="card hidden">
+        <div id="reportContent" class="text-gray-300 whitespace-pre-line leading-loose text-base"></div>
+        <div class="flex gap-2 mt-4">
+          <button onclick="copyReport()" class="btn-secondary text-sm">📋 نسخ التقرير</button>
+          <button onclick="shareWhatsApp()" class="btn-secondary text-sm">💬 مشاركة واتساب</button>
+        </div>
+      </div>
     </div>
 
     <!-- لوحة مسح الشواطئ -->
@@ -160,7 +166,7 @@
       const p=marker.getLatLng();
       document.getElementById('latitude').value=p.lat.toFixed(6);
       document.getElementById('longitude').value=p.lng.toFixed(6);
-      updateBottomType(); // تحديث نوع القاع تلقائياً
+      updateBottomType();
     });
     function updateMarker(){
       const lat=parseFloat(document.getElementById('latitude').value)||36.7;
@@ -172,7 +178,6 @@
     document.getElementById('latitude').addEventListener('change', updateBottomType);
     document.getElementById('longitude').addEventListener('change', updateBottomType);
 
-    // ---------- تحديد نوع القاع تلقائياً ----------
     async function updateBottomType() {
       const lat = parseFloat(document.getElementById('latitude').value);
       const lng = parseFloat(document.getElementById('longitude').value);
@@ -185,11 +190,8 @@
         });
         if (!resp.ok) return;
         const data = await resp.json();
-        const type = data.bottom_type;
-        document.getElementById('beachType').value = type === 'rocky' ? 'rocky' : 'sandy';
-      } catch (e) {
-        // فشل صامت
-      }
+        document.getElementById('beachType').value = data.bottom_type === 'rocky' ? 'rocky' : 'sandy';
+      } catch (e) {}
     }
 
     // ---------- اتجاه الشاطئ ----------
@@ -255,6 +257,15 @@
       }catch(e){alert('❌ فشل جلب التقرير:\n'+e.message);}
       finally{loadingOverlay.classList.add('hidden');}
     });
+
+    function copyReport() {
+      const text = document.getElementById('reportContent').textContent;
+      navigator.clipboard.writeText(text).then(() => alert('تم نسخ التقرير!'));
+    }
+    function shareWhatsApp() {
+      const text = encodeURIComponent(document.getElementById('reportContent').textContent);
+      window.open(`https://wa.me/?text=${text}`, '_blank');
+    }
 
     // ---------- مسح الشواطئ ----------
     const governorates = ["بنزرت","أريانة","تونس","بن عروس","نابل","سوسة","المنستير","المهدية","صفاقس","قابس","مدنين"];
