@@ -1,6 +1,5 @@
 """
-Surfcasting Analytics API – v3.0 (Final Production)
-Tunisian dialect, moon phases (حمل/فساد), seasonal tips, pressure bonus, scan, etc.
+Surfcasting Analytics API – v3.0 (Tunisian timezone fix)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, time
 from datetime import datetime, timedelta, date
@@ -434,7 +433,6 @@ TUNISIAN_BEACHES = {
         {"name": "شاطئ قرطاج", "lat": 36.8528, "lon": 10.3264, "orientation": 90, "type": "sandy"},
         {"name": "شاطئ المرسى", "lat": 36.8764, "lon": 10.3253, "orientation": 45, "type": "sandy"},
         {"name": "شاطئ روّاد", "lat": 36.9667, "lon": 10.1833, "orientation": 45, "type": "sandy"},
-        {"name": "شاطئ قلعة الأندلس", "lat": 36.9167, "lon": 10.1667, "orientation": 0, "type": "sandy"},
     ],
     "سوسة": [
         {"name": "شاطئ بوجعفر", "lat": 35.8333, "lon": 10.6333, "orientation": 90, "type": "sandy"},
@@ -598,7 +596,7 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
     target_idx = [i for i, dt in enumerate(dtimes) if target_start <= dt < target_end]
 
     if not target_idx:
-        return {"past_avg_power":0, "dominant_wind":"غير معروف", "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False, "bio":{}, "avg_sst":0, "extra_info":{}}
+        return {"past_avg_power":0, "dominant_wind":"غير معروف", "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False, "bio":{}, "avg_sst":0, "extra_info":{}, "target_date_obj": target_date_obj}
 
     past_avg_power_val = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
     dominant = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
@@ -710,11 +708,14 @@ def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj
             "moon_activity": moon_detail["activity"],
             "moon_guidance": moon_guidance,
             "swell_range_day": swell_range
-        }
+        },
+        "target_date_obj": target_date_obj
     }
 
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type=="sandy" else "صخري"
+    target_date_obj = agg.get("target_date_obj")
+
     lines = [
         f"الموقع: {req.latitude:.2f},{req.longitude:.2f}، شاطئ {beach}، اتجاه البحر {req.beach_orientation}°",
         f"التاريخ: {req.target_date} (توقيت {tz_name})",
@@ -744,24 +745,17 @@ def build_context(req, agg, tz_name):
     if agg.get("bio"):
         bio = agg["bio"]
         lines.append("الأسماك المتوقعة: " + ", ".join(bio.get("high",[]) + bio.get("additional",[])))
-    # نصيحة موسمية
-    month = req.target_date if isinstance(req.target_date, date) else date.today().month
-    try:
-        if isinstance(req.target_date, str):
-            # محاولة استخراج الشهر إذا كان النص 'today' أو ما شابه
-            month = date.today().month
+
+    if target_date_obj:
+        month = target_date_obj.month
+        if month in [12, 1, 2]:
+            lines.append("نصيحة موسمية: الشتاء ممتاز للقاروص والسارغ، استعمل الشريب والسردين المجمد.")
+        elif month in [3, 4, 5]:
+            lines.append("نصيحة موسمية: الربيع مثالي للبوري والدوراد، استعمل دود الكف والقمبري.")
+        elif month in [6, 7, 8]:
+            lines.append("نصيحة موسمية: الصيف تكثر فيه الأسماك السطحية، استعمل السردين الطازج والطعم الحي.")
         else:
-            month = req.target_date.month
-    except:
-        month = date.today().month
-    if month in [12, 1, 2]:
-        lines.append("نصيحة موسمية: الشتاء ممتاز للقاروص والسارغ، استعمل الشريب والسردين المجمد.")
-    elif month in [3, 4, 5]:
-        lines.append("نصيحة موسمية: الربيع مثالي للبوري والدوراد، استعمل دود الكف والقمبري.")
-    elif month in [6, 7, 8]:
-        lines.append("نصيحة موسمية: الصيف تكثر فيه الأسماك السطحية، استعمل السردين الطازج والطعم الحي.")
-    else:
-        lines.append("نصيحة موسمية: الخريف يعود القاروص بقوة، جرب الشريب المخمّر.")
+            lines.append("نصيحة موسمية: الخريف يعود القاروص بقوة، جرب الشريب المخمّر.")
 
     lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل.")
     return "\n".join(lines)
@@ -774,7 +768,10 @@ async def generate_report(request: Request, req: ReportRequest):
         return cache[cache_key]["data"]
     try:
         tz_name = await fetch_timezone_info(req.latitude, req.longitude)
-        target_dt = date.today()
+        # ---- التصحيح الجذري: استعمل توقيت تونس بدل UTC ----
+        tz_tn = zoneinfo.ZoneInfo("Africa/Tunis")
+        target_dt = datetime.now(tz_tn).date()
+        # -------------------------------------------------
         start = target_dt - timedelta(days=2)
         end = target_dt + timedelta(days=1)
         marine, weather = await asyncio.gather(
