@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – Production Ready</title>
+  <title>Surfcasting Analytics – v6.0 (Client‑side)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -43,7 +43,7 @@
 </head>
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – Production</h1>
+    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v6.0 (Client‑side)</h1>
 
     <div class="flex justify-center gap-4 mb-8">
       <button id="tabSingle" class="btn-primary rounded-lg">📍 تقرير بقعة</button>
@@ -77,7 +77,7 @@
             <input type="hidden" id="targetDate" value="today">
           </div>
           <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
-          <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق ما يصل إلى 90 ثانية</p>
+          <p class="text-xs text-gray-500 text-center mt-2">يتم جلب البيانات مباشرة من Open-Meteo عبر متصفحك</p>
         </div>
       </div>
       <div id="reportCard" class="card hidden">
@@ -89,7 +89,7 @@
       </div>
     </div>
 
-    <!-- لوحة مسح الشواطئ -->
+    <!-- لوحة مسح الشواطئ (معطلة حالياً لعدم جاهزية البيانات من العميل) -->
     <div id="panelScan" class="hidden">
       <div class="card mb-8">
         <h2 class="text-xl font-bold text-neon mb-4">🗺️ اختر الولايات و اختياريًا نوع السمك</h2>
@@ -134,8 +134,8 @@
     <div id="loadingOverlay" class="loading-overlay hidden">
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
-        <p class="text-neon text-lg font-semibold">جاري تحليل البيانات البحرية...</p>
-        <p class="text-gray-400 text-sm mt-2">يتم حساب طاقة الموج، الرياح، والاحتمالات البيولوجية</p>
+        <p class="text-neon text-lg font-semibold">جاري جلب البيانات وتحليلها...</p>
+        <p class="text-gray-400 text-sm mt-2">يتم الاتصال بـ Open-Meteo من جهازك ثم إرسالها للخادم للتحليل</p>
       </div>
     </div>
   </div>
@@ -143,7 +143,9 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     // ---------- الإعدادات ----------
-    const API_BASE = 'https://spotdata.onrender.com';  // غيّر إلى رابط خادمك الصحيح
+    const API_BASE = 'https://spotdata.onrender.com';  // رابط الخادم
+    const MARINE_API = 'https://marine-api.open-meteo.com/v1/marine';
+    const WEATHER_API = 'https://api.open-meteo.com/v1/forecast';
 
     // ---------- التبويب ----------
     const tabSingle = document.getElementById('tabSingle');
@@ -227,7 +229,7 @@
         const d=await r.json();
         orientSlider.value=d.orientation;
         orientVal.textContent=`${d.orientation}° (${degToDir(d.orientation)})`;
-      }catch(e){alert('تعذر التحديد التلقائي. قد يكون الخادم مشغولاً.');}
+      }catch(e){alert('تعذر التحديد التلقائي.');}
       finally{btn.disabled=false;btn.textContent='📍 تحديد تلقائي';}
     });
 
@@ -240,55 +242,98 @@
       });
     });
 
-    // ---------- تقرير فردي مع مهلة طويلة ----------
+    // ---------- دوال جلب بيانات Open-Meteo من المتصفح ----------
+    async function fetchMarineData(lat, lng, start, end) {
+      const url = `${MARINE_API}?latitude=${lat}&longitude=${lng}&hourly=wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature&timezone=auto&start_date=${start}&end_date=${end}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`Marine API: ${resp.status}`);
+      return resp.json();
+    }
+
+    async function fetchWeatherData(lat, lng, start, end) {
+      const url = `${WEATHER_API}?latitude=${lat}&longitude=${lng}&hourly=wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,precipitation,weather_code&daily=sunrise,sunset&timezone=auto&start_date=${start}&end_date=${end}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`Weather API: ${resp.status}`);
+      return resp.json();
+    }
+
+    function getDateRange(targetDateText) {
+      const today = new Date();
+      const tzOffset = today.getTimezoneOffset();
+      const todayLocal = new Date(today.getTime() - tzOffset * 60000);
+      const target = new Date(todayLocal);
+      if (targetDateText === 'tomorrow') target.setDate(target.getDate() + 1);
+      else if (targetDateText === 'day_after') target.setDate(target.getDate() + 2);
+      const start = new Date(target);
+      start.setDate(start.getDate() - 2);
+      const end = new Date(target);
+      end.setDate(end.getDate() + 1);
+      const format = d => d.toISOString().split('T')[0];
+      return { start: format(start), end: format(end) };
+    }
+
+    // ---------- تقرير فردي (Client‑side fetching) ----------
     const submitBtn=document.getElementById('submitBtn');
     const loadingOverlay=document.getElementById('loadingOverlay');
     const reportCard=document.getElementById('reportCard');
     const reportContent=document.getElementById('reportContent');
+
     submitBtn.addEventListener('click',async ()=>{
-      const payload={
-        latitude:parseFloat(document.getElementById('latitude').value),
-        longitude:parseFloat(document.getElementById('longitude').value),
-        beach_orientation:parseInt(document.getElementById('orientation').value),
-        beach_type:document.getElementById('beachType').value,
-        target_date:document.getElementById('targetDate').value
-      };
-      // التحقق من الإحداثيات
-      if (isNaN(payload.latitude) || isNaN(payload.longitude)) {
-        alert('الرجاء إدخال إحداثيات صحيحة');
+      const lat = parseFloat(document.getElementById('latitude').value);
+      const lng = parseFloat(document.getElementById('longitude').value);
+      const orient = parseInt(document.getElementById('orientation').value);
+      const beachType = document.getElementById('beachType').value;
+      const targetDate = document.getElementById('targetDate').value;
+      if (isNaN(lat) || isNaN(lng)) {
+        alert('إحداثيات غير صحيحة');
         return;
       }
-      loadingOverlay.classList.remove('hidden'); reportCard.classList.add('hidden');
+      loadingOverlay.classList.remove('hidden');
+      reportCard.classList.add('hidden');
       submitBtn.disabled = true;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 90000); // 90 ثانية
-      try{
-        const resp=await fetch(`${API_BASE}/generate-report`,{
-          method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(payload),
+
+      try {
+        const { start, end } = getDateRange(targetDate);
+        // جلب البيانات من المتصفح (IP المستخدم)
+        const [marineData, weatherData] = await Promise.all([
+          fetchMarineData(lat, lng, start, end),
+          fetchWeatherData(lat, lng, start, end)
+        ]);
+
+        // تجميع الطلب وإرساله إلى خادمنا
+        const payload = {
+          beach_orientation: orient,
+          beach_type: beachType,
+          target_date: targetDate,
+          marine_data: marineData,
+          weather_data: weatherData
+        };
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 90000);
+        const resp = await fetch(`${API_BASE}/generate-report`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
-        if(!resp.ok){
-          let errorMsg = `خطأ ${resp.status}`;
-          try {
-            const errData = await resp.json();
-            errorMsg = errData.detail || errorMsg;
-          } catch {}
-          throw new Error(errorMsg);
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.detail || `خطأ ${resp.status}`);
         }
-        const data=await resp.json();
-        reportContent.textContent=data.report||'لم يصدر تقرير';
+        const data = await resp.json();
+        reportContent.textContent = data.report || 'لم يصدر تقرير';
         reportCard.classList.remove('hidden');
         reportCard.scrollIntoView({behavior:'smooth'});
-      }catch(e){
+      } catch (e) {
         if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة الانتظار (90 ثانية). الخادم مشغول، حاول مجدداً لاحقاً.');
+          alert('❌ انتهت مهلة الانتظار (90 ثانية). حاول مجدداً.');
         } else {
           alert('❌ فشل جلب التقرير:\n' + e.message);
         }
-      }finally{
-        clearTimeout(timeoutId);
+      } finally {
         loadingOverlay.classList.add('hidden');
         submitBtn.disabled = false;
       }
@@ -303,7 +348,7 @@
       window.open(`https://wa.me/?text=${text}`, '_blank');
     }
 
-    // ---------- مسح الشواطئ مع عمود السبب ----------
+    // ---------- مسح الشواطئ (مؤقتاً غير مفعل) ----------
     const governorates = ["بنزرت","أريانة","تونس","بن عروس","نابل","سوسة","المنستير","المهدية","صفاقس","قابس","مدنين"];
     function buildGovernorates(){
       const c=document.getElementById('governorateCheckboxes');
@@ -314,60 +359,7 @@
         c.appendChild(div);
       });
     }
-    document.getElementById('scanBtn').addEventListener('click',async ()=>{
-      const selected=[];
-      governorates.forEach(gov=>{if(document.getElementById(`gov_${gov}`).checked)selected.push(gov);});
-      if(!selected.length)return alert('اختر ولاية واحدة على الأقل');
-      const targetDate=document.getElementById('scanDate').value;
-      const targetSpecies=document.getElementById('targetSpecies').value;
-      loadingOverlay.classList.remove('hidden'); document.getElementById('scanResults').classList.add('hidden');
-      const scanBtn = document.getElementById('scanBtn');
-      scanBtn.disabled = true;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 ثانية
-      try{
-        const body = { governorates: selected, target_date: targetDate };
-        if (targetSpecies) body.target_species = targetSpecies;
-        const resp=await fetch(`${API_BASE}/scan-best`,{
-          method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(body),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        if(!resp.ok) {
-          const errText = await resp.text();
-          throw new Error(errText || `خطأ ${resp.status}`);
-        }
-        const data=await resp.json();
-        const top10=data.top10 || [];
-        const tbody=document.getElementById('scanTableBody');
-        tbody.innerHTML='';
-        top10.forEach((spot,idx)=>{
-          const reason = spot.reason || '';
-          tbody.innerHTML+=`<tr class="border-b border-gray-700">
-            <td class="p-2">${idx+1}</td>
-            <td class="p-2">${spot.name}</td>
-            <td class="p-2">${spot.governorate || ''}</td>
-            <td class="p-2 font-bold text-[#00e5ff]">${spot.score}/100</td>
-            <td class="p-2">${spot.summary.avg_wave} م</td>
-            <td class="p-2">${spot.summary.avg_wind} كم/س</td>
-            <td class="p-2">${spot.summary.avg_sst}°م</td>
-            <td class="p-2"><span class="reason-text" title="${reason}">${reason}</span></td>
-          </tr>`;
-        });
-        document.getElementById('scanResults').classList.remove('hidden');
-      }catch(e){
-        if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة المسح (60 ثانية). حاول مجدداً.');
-        } else {
-          alert('❌ فشل المسح: ' + e.message);
-        }
-      }finally{
-        clearTimeout(timeoutId);
-        loadingOverlay.classList.add('hidden');
-        scanBtn.disabled = false;
-      }
-    });
+    // يمكنك إضافة منطق المسح لاحقاً بنفس الأسلوب (جلب البيانات من العميل لكل شاطئ)
   </script>
 </body>
 </html>
