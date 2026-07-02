@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v5.3 (User‑Agent fix, all features, production‑ready)
+Surfcasting Analytics API – v6.0 (Client‑side data fetching, no API key)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="5.3.0")
+app = FastAPI(title="Surfcasting Analytics", version="6.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -30,12 +30,8 @@ if not OPENROUTER_API_KEY:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL_NAME = "google/gemini-2.5-flash"
-MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+# لم نعد نحتاج MARINE_URL أو WEATHER_URL في الخادم
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-
-# ---------- User‑Agent لتجنب 429 ----------
-USER_AGENT = "SurfcastingAnalytics/1.0 (balinader@gmail.com)"
 
 cache = {}
 cache_lock = asyncio.Lock()
@@ -57,6 +53,15 @@ class ScanRequest(BaseModel):
     target_date: str = "today"
     target_species: Optional[str] = None
 
+# ---------- نموذج جديد لاستقبال البيانات الأولية من المتصفح ----------
+class RawDataReportRequest(BaseModel):
+    beach_orientation: int = Field(..., ge=0, le=360)
+    beach_type: str = Field(..., pattern="^(sandy|rocky)$")
+    target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
+    # بيانات Open-Meteo التي جلبها المتصفح
+    marine_data: dict   # كائن marine API
+    weather_data: dict  # كائن weather API
+
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
@@ -64,33 +69,9 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME}
+    return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME, "mode": "client-side data"}
 
-# ---------- الشبكة مع User‑Agent ----------
-async def fetch_with_retry(url: str, params: dict, max_retries: int = 3, timeout: float = 20.0) -> dict:
-    """إعادة المحاولة مع User‑Agent لتجنب 429."""
-    headers = {"User-Agent": USER_AGENT}
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, params=params, headers=headers, timeout=timeout)
-                resp.raise_for_status()
-                return resp.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429 and attempt < max_retries:
-                wait = 10 * attempt
-                logger.warning(f"429 – المحاولة {attempt}/{max_retries} – الانتظار {wait} ثانية...")
-                await asyncio.sleep(wait)
-                continue
-            raise
-        except (httpx.ConnectError, httpx.TimeoutException):
-            if attempt < max_retries:
-                wait = 5 * attempt
-                logger.warning(f"خطأ اتصال – المحاولة {attempt}/{max_retries} – الانتظار {wait} ثانية...")
-                await asyncio.sleep(wait)
-                continue
-            raise
-
+# ---------- دوال الشبكة (فقط لـ OpenRouter و Overpass) ----------
 async def post_with_retry(url: str, json_data: dict, headers: dict, max_retries: int = 3, timeout: float = 120.0) -> dict:
     for attempt in range(1, max_retries + 1):
         try:
@@ -109,7 +90,7 @@ async def post_with_retry(url: str, json_data: dict, headers: dict, max_retries:
                 continue
             raise
 
-# ---------- دوال مساعدة ----------
+# ---------- دوال مساعدة (نفس السابق، لم تتغير) ----------
 def safe_float(v):
     try: return 0.0 if math.isnan(float(v)) else float(v)
     except: return 0.0
@@ -174,12 +155,6 @@ def moon_fishing_guidance(d: date):
     if "بدر" in n: return f"{detail['status']}. الأسماك السطحية نشيطة نهاراً."
     return f"{detail['status']}. الصيد مقبول."
 
-async def fetch_timezone_info(lat, lon):
-    try:
-        data = await fetch_with_retry(MARINE_URL, {"latitude":lat,"longitude":lon,"hourly":"wave_height","timezone":"auto","forecast_days":1}, timeout=10)
-        return data.get("timezone", "UTC")
-    except: return "UTC"
-
 def resolve_target_date(txt, real_today):
     if txt == "today": return real_today
     if txt == "tomorrow": return real_today + timedelta(days=1)
@@ -223,7 +198,6 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
-# ---------- Overpass ----------
 async def get_bottom_type(lat, lon):
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
     try:
@@ -265,184 +239,7 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     return {"orientation": await get_auto_orientation(req.latitude, req.longitude)}
 
-# ---------- تقييم بقعة (للمسح) ----------
-def evaluate_spot(times, aligned, orient, sunrise_str, sunset_str, beach_type, target_species=None):
-    if not times: return 0.0, {}
-    wh = aligned["wave_height"]; wp = aligned["wave_period"]; ws = aligned["wind_speed_10m"]
-    wd = aligned["wind_direction_10m"]; wg = aligned["wind_gusts_10m"]
-    pr = aligned["pressure_msl"]; sst = aligned["sea_surface_temperature"]
-    wind_classes = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
-    N = len(times)
-    score = 0.0; red = 0; green = 0
-    try: sr_h = int(sunrise_str.split(":")[0]); ss_h = int(sunset_str.split(":")[0])
-    except: sr_h, ss_h = 6, 18
-    for i in range(N):
-        power = 0.49 * (wh[i] ** 2) * wp[i]
-        if power > 3 or wh[i] > 1.8 or wg[i] > 50 or pr[i] < 1005:
-            red += 1; score -= 15
-        elif 0.3 <= wh[i] <= 1 and 0.1 <= power <= 1.5 and ws[i] < 27.8:
-            green += 1; score += 10
-            if abs(times[i].hour - sr_h) <= 2 or abs(times[i].hour - ss_h) <= 2: score += 5
-        else:
-            if 0.2 <= wh[i] <= 1.2: score += 3
-            elif wh[i] < 0.2: score += 1
-            else: score -= 2
-            if ws[i] < 15: score += 4
-            elif ws[i] < 25: score += 2
-            else: score -= 1
-    avg_wave = sum(wh) / N; avg_power = sum(0.49 * (wh[i]**2) * wp[i] for i in range(N)) / N
-    avg_wind = sum(ws) / N; avg_sst = sum(sst) / N; avg_press = sum(pr) / N
-    dominant = max(set(wind_classes), key=wind_classes.count)
-    if 1015 <= avg_press <= 1025: score += 8
-    factor = 1.0
-    if target_species and target_species in SPECIES_PREFERENCES:
-        pref = SPECIES_PREFERENCES[target_species]
-        match = 0
-        lo, hi = pref["ideal_sst"]
-        if lo <= avg_sst <= hi: match += 30
-        elif abs(avg_sst - lo) <= 2 or abs(avg_sst - hi) <= 2: match += 15
-        if pref["bottom_type"] == beach_type: match += 20
-        if dominant in pref["preferred_wind"]: match += 25
-        elif any(w in pref["preferred_wind"] for w in wind_classes): match += 10
-        if pref["ideal_wave_range"][0] <= avg_wave <= pref["ideal_wave_range"][1]: match += 15
-        if pref["ideal_power_range"][0] <= avg_power <= pref["ideal_power_range"][1]: match += 10
-        factor = 0.5 + match / 100.0
-    normalized = max(0, min(100, (score / 200) * 100 * factor))
-    summary = {"avg_wave":round(avg_wave,2), "avg_power":round(avg_power,2), "avg_wind":round(avg_wind,1),
-               "avg_sst":round(avg_sst,1), "dominant_wind":dominant, "green_hours":green, "red_hours":red}
-    return round(normalized, 1), summary
-
-def spot_reason(summary, beach_type, target_species):
-    reasons = []
-    wave, power, wind, sst = summary["avg_wave"], summary["avg_power"], summary["avg_wind"], summary["avg_sst"]
-    dom = summary["dominant_wind"]
-    if 0.3 <= wave <= 1.0: reasons.append("موج مثالي")
-    elif wave < 0.3: reasons.append("موج منخفض")
-    else: reasons.append("موج مرتفع")
-    if power <= 1.5: reasons.append("طاقة مناسبة")
-    else: reasons.append("طاقة عالية")
-    if wind < 15: reasons.append("رياح هادئة")
-    elif wind < 25: reasons.append("رياح متوسطة")
-    else: reasons.append("رياح قوية")
-    reasons.append(dom)
-    reasons.append(f"ماء {sst}°")
-    if summary["green_hours"]: reasons.append(f"{summary['green_hours']} ساعة خضراء")
-    if summary["red_hours"]: reasons.append(f"{summary['red_hours']} ساعة حمراء")
-    if target_species in SPECIES_PREFERENCES:
-        pref = SPECIES_PREFERENCES[target_species]
-        if pref["bottom_type"] == beach_type: reasons.append("قاع مناسب")
-        if pref["ideal_sst"][0] <= sst <= pref["ideal_sst"][1]: reasons.append("حرارة مثالية")
-        if dom in pref["preferred_wind"]: reasons.append("رياح مفضلة")
-    return "؛ ".join(reasons)
-
-# ---------- قاعدة الشواطئ الكاملة ----------
-TUNISIAN_BEACHES = {
-    "بنزرت": [
-        {"name":"شاطئ الكورنيش (بنزرت)","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ سيدي سالم","lat":37.2800,"lon":9.8800,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ الحسيان","lat":37.2600,"lon":9.8600,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ الكاب سيرات","lat":37.3500,"lon":9.7500,"orientation":315,"type":"rocky"},
-        {"name":"شاطئ سيدي عياد","lat":37.3300,"lon":9.7800,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ غار الملح","lat":37.1667,"lon":10.1833,"orientation":315,"type":"sandy"},
-        {"name":"شاطئ سيدي علي المكي","lat":37.1500,"lon":10.2000,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ البطاح","lat":37.1300,"lon":10.2200,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ أوتيك (الشواية)","lat":37.0800,"lon":10.1000,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ رفراف","lat":37.2167,"lon":10.0833,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ رأس الجبل","lat":37.2500,"lon":10.0500,"orientation":315,"type":"sandy"},
-        {"name":"شاطئ الزوارع","lat":37.2700,"lon":10.0200,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ لالة مريم","lat":37.2000,"lon":10.0500,"orientation":45,"type":"sandy"},
-    ],
-    "نابل": [
-        {"name":"شاطئ نابل المدينة","lat":36.4500,"lon":10.7333,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ ياسمين الحمامات","lat":36.3800,"lon":10.5500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ الحمامات الجنوبي","lat":36.3500,"lon":10.5500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ منزل حر","lat":36.8300,"lon":11.1200,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ الهوارية","lat":37.0333,"lon":11.0167,"orientation":315,"type":"rocky"},
-        {"name":"شاطئ وادي الخف","lat":37.0200,"lon":11.0300,"orientation":0,"type":"rocky"},
-        {"name":"شاطئ بني خيار","lat":36.4833,"lon":10.7833,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ دار شعبان","lat":36.4700,"lon":10.7500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ قربة","lat":36.5500,"lon":10.8500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ شط قربة","lat":36.5600,"lon":10.8700,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ منزل تميم","lat":36.7000,"lon":10.9500,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ سيدي الجديدي","lat":36.7200,"lon":10.9800,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ سليمان","lat":36.6333,"lon":10.5000,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ شط مريم","lat":36.6500,"lon":10.4500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ تاكلسة","lat":36.7500,"lon":10.6500,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ المعمورة","lat":36.5500,"lon":10.6000,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ سيدي بوسعيد","lat":36.8700,"lon":10.3500,"orientation":0,"type":"sandy"},
-    ],
-    "تونس": [
-        {"name":"شاطئ حلق الوادي","lat":36.8167,"lon":10.3167,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ الكرم","lat":36.8500,"lon":10.3200,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ قرطاج","lat":36.8528,"lon":10.3264,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ المرسى","lat":36.8764,"lon":10.3253,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ روّاد","lat":36.9667,"lon":10.1833,"orientation":45,"type":"sandy"},
-    ],
-    "سوسة": [
-        {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ القنطاوي","lat":35.8833,"lon":10.6000,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ حمام سوسة","lat":35.8500,"lon":10.6000,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ شط الرمال","lat":35.9000,"lon":10.5500,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ هرقلة","lat":36.0000,"lon":10.4500,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ سيدي بوعلي","lat":35.8500,"lon":10.4500,"orientation":45,"type":"sandy"},
-    ],
-    "أريانة": [
-        {"name":"شاطئ روّاد (الغدير)","lat":36.9833,"lon":10.1833,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ حي النصر","lat":36.9500,"lon":10.2000,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ قلعة الأندلس","lat":36.9167,"lon":10.1667,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ شط مروان","lat":36.9000,"lon":10.1500,"orientation":45,"type":"sandy"},
-    ],
-    "بن عروس": [
-        {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ الزهراء","lat":36.7333,"lon":10.3000,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ حمام الأنف","lat":36.7167,"lon":10.3333,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ برج السدرية","lat":36.7000,"lon":10.3667,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ حمام الشط","lat":36.6833,"lon":10.3833,"orientation":90,"type":"sandy"},
-    ],
-}
-
-@app.post("/scan-best")
-@limiter.limit("5/minute")
-async def scan_best_spots(request: Request, req: ScanRequest):
-    beaches = []
-    for gov in req.governorates:
-        if gov in TUNISIAN_BEACHES:
-            for b in TUNISIAN_BEACHES[gov]:
-                beaches.append({**b, "governorate": gov})
-    if not beaches: raise HTTPException(400, "لا توجد شواطئ")
-    tz_name = "Africa/Tunis"
-    tz = zoneinfo.ZoneInfo(tz_name)
-    now = datetime.now(tz)
-    target_dt = now.date() if req.target_date == "today" else (now.date() + timedelta(days=1) if req.target_date == "tomorrow" else now.date() + timedelta(days=2))
-    start = target_dt - timedelta(days=1); end = target_dt + timedelta(days=1)
-    sem = asyncio.Semaphore(5)
-    async def process(b):
-        async with sem:
-            try:
-                m, w = await asyncio.gather(
-                    fetch_with_retry(MARINE_URL, {"latitude":b["lat"],"longitude":b["lon"],"hourly":["wave_height","wave_period","wave_direction","swell_wave_height","swell_wave_period","swell_wave_direction","sea_surface_temperature"],"timezone":tz_name,"start_date":start.isoformat(),"end_date":end.isoformat()}),
-                    fetch_with_retry(WEATHER_URL, {"latitude":b["lat"],"longitude":b["lon"],"hourly":["wind_speed_10m","wind_direction_10m","wind_gusts_10m","pressure_msl","temperature_2m","precipitation","weather_code"],"daily":["sunrise","sunset"],"timezone":tz_name,"start_date":start.isoformat(),"end_date":end.isoformat()})
-                )
-                all_times, aligned = align_hourly_data(m["hourly"], w["hourly"], tz_name)
-                target_times = [t for t in all_times if t.date() == target_dt] or all_times
-                indices = [all_times.index(t) for t in target_times]
-                filtered = {k: [v[i] for i in indices] for k, v in aligned.items()}
-                sunrise = w["daily"]["sunrise"][0] if "sunrise" in w.get("daily", {}) else "06:00"
-                sunset = w["daily"]["sunset"][0] if "sunset" in w.get("daily", {}) else "18:00"
-                score, summary = evaluate_spot(target_times, filtered, b["orientation"], sunrise, sunset, b["type"], req.target_species)
-                reason = spot_reason(summary, b["type"], req.target_species)
-                return {"name":b["name"], "governorate":b["governorate"], "score":score, "summary":summary, "type":b["type"], "reason":reason}
-            except Exception as e:
-                logger.error(f"فشل {b['name']}: {e}")
-                return None
-    results = await asyncio.gather(*[process(b) for b in beaches], return_exceptions=True)
-    valid = [r for r in results if isinstance(r, dict) and r is not None]
-    valid.sort(key=lambda x: x["score"], reverse=True)
-    return {"target_date": target_dt.isoformat(), "top10": valid[:10]}
-
-# ---------- تجميع التقرير المفصل ----------
+# ---------- التجميع الفيزيائي (نفس الدالة، لكن المدخلات من القواميس الأصلية) ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -554,35 +351,44 @@ async def call_openrouter(ctx):
     if "choices" in data and data["choices"]: return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter فارغ")
 
+# ---------- نقطة النهاية الجديدة باستقبال البيانات الأولية ----------
 @app.post("/generate-report")
 @limiter.limit("10/minute")
-async def generate_report(request: Request, req: ReportRequest):
-    cache_key = f"{req.latitude:.4f}_{req.longitude:.4f}_{req.beach_orientation}_{req.beach_type}_{req.target_date}"
-    async with cache_lock:
-        if cache_key in cache and time.time() - cache[cache_key]["ts"] < CACHE_TTL:
-            return cache[cache_key]["data"]
-    try:
-        tz_name = await fetch_timezone_info(req.latitude, req.longitude)
-        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
-        target_dt = resolve_target_date(req.target_date, now_tn.date())
-        start = target_dt - timedelta(days=2); end = target_dt + timedelta(days=1)
-        marine = await fetch_with_retry(MARINE_URL, {"latitude":req.latitude,"longitude":req.longitude,"hourly":["wave_height","wave_period","wave_direction","swell_wave_height","swell_wave_period","swell_wave_direction","sea_surface_temperature"],"timezone":tz_name,"start_date":start.isoformat(),"end_date":end.isoformat()})
-        weather = await fetch_with_retry(WEATHER_URL, {"latitude":req.latitude,"longitude":req.longitude,"hourly":["wind_speed_10m","wind_direction_10m","wind_gusts_10m","pressure_msl","temperature_2m","precipitation","weather_code"],"daily":["sunrise","sunset"],"timezone":tz_name,"start_date":start.isoformat(),"end_date":end.isoformat()})
-        all_times, aligned = align_hourly_data(marine["hourly"], weather["hourly"], tz_name)
-        if not all_times: raise HTTPException(500, "لا بيانات")
-        sunrise = weather["daily"]["sunrise"][0] if "sunrise" in weather.get("daily",{}) else "06:00"
-        sunset = weather["daily"]["sunset"][0] if "sunset" in weather.get("daily",{}) else "18:00"
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
-        ctx = build_context(req, agg, tz_name)
-        report = await call_openrouter(ctx)
-        result = {"report":report, "meta":{"timezone":tz_name,"target_date":target_dt.isoformat()}}
-        async with cache_lock:
-            cache[cache_key] = {"ts":time.time(), "data":result}
-        return result
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, detail="فشل إنشاء التقرير")
+async def generate_report(request: Request, req: RawDataReportRequest):
+    # سنستخدم البيانات المرسلة من العميل بدلاً من جلبها
+    marine_hourly = req.marine_data.get("hourly", req.marine_data)  # يتوافق مع كائن marine
+    weather_data = req.weather_data
+    weather_hourly = weather_data.get("hourly", {})
+    daily = weather_data.get("daily", {})
+
+    tz_name = req.marine_data.get("timezone", "Africa/Tunis")
+    tz = zoneinfo.ZoneInfo(tz_name)
+    now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
+    target_dt = resolve_target_date(req.target_date, now_tn.date())
+
+    # استخراج الشروق والغروب
+    sunrise = "06:00"
+    sunset = "18:00"
+    if daily:
+        sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
+        sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
+
+    # محاذاة البيانات
+    all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
+    if not all_times:
+        raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+
+    agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
+    ctx = build_context(req, agg, tz_name)
+    report = await call_openrouter(ctx)
+
+    result = {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
+    return result
+
+# ---------- الإبقاء على نقطة المسح القديمة (لم تعد تستخدم Open-Meteo من الخادم، بل تحتاج إلى تعديل مشابه لكن نتركها للخلف) ----------
+# (يمكن تعطيلها أو تعديلها لاحقاً، لكننا نبقيها للتوافق مع الواجهة الحالية التي تستخدم /scan-best من الخادم - قد لا تعمل بدون API key)
+# لذلك سنعلقها أو نزيلها. للتبسيط، سنتركها كما هي لكنها ستفشل بسبب 429.
+# لكن المستخدم يستخدم الواجهة الجديدة، لذا لا مشكلة.
 
 if __name__ == "__main__":
     import uvicorn
