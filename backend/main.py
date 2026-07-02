@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v5.0 (صارم، دقيق، جاهز للإنتاج)
+Surfcasting Analytics API – v3.0 (Tunisian timezone fix)
 """
-import os, math, asyncio, logging, traceback, zoneinfo, time
+import os, math, asyncio, logging, traceback, zoneinfo, re, time
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional
 from collections import defaultdict
 
 import httpx
@@ -15,13 +15,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# ========== إعداد السجل ==========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("surfcasting")
 
-# ========== التطبيق ==========
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="5.0.0", description="API متقدم لتحليل ظروف الصيد بالسرفكاستينغ في تونس")
+app = FastAPI(title="Surfcasting Analytics", version="3.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -37,17 +35,15 @@ MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-cache: Dict[str, Dict[str, Any]] = {}
-cache_lock = asyncio.Lock()
+cache = {}
 CACHE_TTL = 3600
 
-# ========== نماذج ==========
 class ReportRequest(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90, description="خط العرض")
-    longitude: float = Field(..., ge=-180, le=180, description="خط الطول")
-    beach_orientation: int = Field(..., ge=0, le=360, description="اتجاه الشاطئ بالدرجات (0=شمال)")
-    beach_type: str = Field(..., pattern="^(sandy|rocky)$", description="نوع القاع: رملي أو صخري")
-    target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$", description="اليوم المستهدف")
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    beach_orientation: int = Field(..., ge=0, le=360)
+    beach_type: str = Field(..., pattern="^(sandy|rocky)$")
+    target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
 
 class AutoOrientationRequest(BaseModel):
     latitude: float
@@ -58,141 +54,68 @@ class ScanRequest(BaseModel):
     target_date: str = "today"
     target_species: Optional[str] = None
 
+class SurfError(Exception): pass
+
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 @app.get("/health")
 def health():
     return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME}
 
-# ========== أدوات الشبكة ==========
-async def fetch_with_retry(url: str, params: dict, max_retries: int = 3, timeout: float = 20.0) -> dict:
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, params=params, timeout=timeout)
-                resp.raise_for_status()
-                return resp.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429 and attempt < max_retries:
-                wait = 5 * attempt
-                logger.warning(f"429 - إعادة المحاولة بعد {wait} ثانية...")
-                await asyncio.sleep(wait)
-            else:
-                raise
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning(f"فشل اتصال ({e}) - إعادة المحاولة بعد {wait} ثانية...")
-                await asyncio.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("فشل الطلب بعد كل المحاولات")
-
-async def post_with_retry(url: str, json: dict, headers: dict, max_retries: int = 3, timeout: float = 120.0) -> dict:
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json=json, headers=headers, timeout=timeout)
-                resp.raise_for_status()
-                return resp.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429 and attempt < max_retries:
-                wait = 5 * attempt
-                logger.warning(f"429 POST - إعادة المحاولة بعد {wait} ثانية...")
-                await asyncio.sleep(wait)
-            else:
-                raise
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning(f"فشل اتصال POST ({e}) - إعادة المحاولة بعد {wait} ثانية...")
-                await asyncio.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("فشل POST بعد كل المحاولات")
-
-# ========== الزمن والمساعدة ==========
-async def fetch_timezone_info(lat: float, lon: float) -> str:
+# --------------- دوال مساعدة ---------------
+async def fetch_timezone_info(lat, lon):
     try:
-        data = await fetch_with_retry(MARINE_URL, {
-            "latitude": lat, "longitude": lon,
-            "hourly": "wave_height", "timezone": "auto", "forecast_days": 1
-        }, timeout=10)
-        tz = data.get("timezone", "UTC")
-        zoneinfo.ZoneInfo(tz)
-        return tz
-    except Exception:
-        return "UTC"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(MARINE_URL, params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "wave_height", "timezone": "auto", "forecast_days": 1
+            }, timeout=10)
+            r.raise_for_status()
+            tz = r.json().get("timezone", "UTC")
+            zoneinfo.ZoneInfo(tz)
+            return tz
+    except: return "UTC"
 
-def resolve_target_date(txt: str, real_today: date) -> date:
-    if txt == "today":
-        return real_today
-    elif txt == "tomorrow":
-        return real_today + timedelta(days=1)
+def extract_real_date_from_times(times, tz_name):
+    if not times:
+        return datetime.now(zoneinfo.ZoneInfo(tz_name)).date()
+    dt = datetime.fromisoformat(times[0])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+    return dt.date()
+
+def resolve_target_date(txt, real_today):
+    if txt == "today": return real_today
+    elif txt == "tomorrow": return real_today + timedelta(days=1)
     return real_today + timedelta(days=2)
 
-def align_hourly_data(marine_hourly: dict, weather_hourly: dict, tz: zoneinfo.ZoneInfo) -> Tuple[List[datetime], dict]:
-    """
-    دمج مصفوفات البحر والطقس على أساس الوقت المشترك.
-    يعيد قائمة datetime وقاموساً بكل المتغيرات المتزامنة.
-    """
-    marine_times = marine_hourly.get("time", [])
-    weather_times = weather_hourly.get("time", [])
-    if not marine_times or not weather_times:
-        return [], {}
+async def fetch_marine(lat, lon, start, end):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(MARINE_URL, params={
+            "latitude": lat, "longitude": lon,
+            "hourly": ["wave_height","wave_period","wave_direction",
+                      "swell_wave_height","swell_wave_period","swell_wave_direction",
+                      "sea_surface_temperature"],
+            "timezone": "auto", "start_date": start, "end_date": end
+        }, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
-    marine_map = {}
-    for i, t in enumerate(marine_times):
-        dt = datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=tz)
-        marine_map[dt] = i
+async def fetch_weather(lat, lon, start, end):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(WEATHER_URL, params={
+            "latitude": lat, "longitude": lon,
+            "hourly": ["wind_speed_10m","wind_direction_10m","wind_gusts_10m",
+                      "pressure_msl","temperature_2m","precipitation","weather_code"],
+            "daily": ["sunrise","sunset"],
+            "timezone": "auto", "start_date": start, "end_date": end
+        }, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
-    weather_map = {}
-    for i, t in enumerate(weather_times):
-        dt = datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=tz)
-        weather_map[dt] = i
-
-    common_times = sorted(set(marine_map.keys()) & set(weather_map.keys()))
-    if not common_times:
-        return [], {}
-
-    def extract(key: str, source: dict, idx_map: dict):
-        arr = source.get(key, [])
-        return [arr[idx_map[t]] if arr and idx_map[t] < len(arr) else 0.0 for t in common_times]
-
-    aligned = {
-        "wave_height": extract("wave_height", marine_hourly, marine_map),
-        "wave_period": extract("wave_period", marine_hourly, marine_map),
-        "wave_direction": extract("wave_direction", marine_hourly, marine_map),
-        "swell_wave_height": extract("swell_wave_height", marine_hourly, marine_map),
-        "swell_wave_period": extract("swell_wave_period", marine_hourly, marine_map),
-        "swell_wave_direction": extract("swell_wave_direction", marine_hourly, marine_map),
-        "sea_surface_temperature": extract("sea_surface_temperature", marine_hourly, marine_map),
-        "wind_speed_10m": extract("wind_speed_10m", weather_hourly, weather_map),
-        "wind_direction_10m": extract("wind_direction_10m", weather_hourly, weather_map),
-        "wind_gusts_10m": extract("wind_gusts_10m", weather_hourly, weather_map),
-        "pressure_msl": extract("pressure_msl", weather_hourly, weather_map),
-        "temperature_2m": extract("temperature_2m", weather_hourly, weather_map),
-        "precipitation": extract("precipitation", weather_hourly, weather_map),
-        "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, weather_map)]
-    }
-    return common_times, aligned
-
-def get_daily_value(daily_data: dict, target_date: date, key: str, default: str = "غير معروف") -> str:
-    times = daily_data.get("time", [])
-    values = daily_data.get(key, [])
-    for i, t in enumerate(times):
-        if date.fromisoformat(t) == target_date:
-            return values[i] if i < len(values) else default
-    return default
-
-# ========== استعلامات الشاطئ ==========
 async def get_bottom_type(lat: float, lon: float) -> str:
     query = f"""
     [out:json];
@@ -225,22 +148,22 @@ async def get_bottom_type(lat: float, lon: float) -> str:
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
-    return {"bottom_type": await get_bottom_type(req.latitude, req.longitude)}
+    bottom = await get_bottom_type(req.latitude, req.longitude)
+    return {"bottom_type": bottom}
 
-async def get_auto_orientation(lat: float, lon: float) -> int:
+async def get_auto_orientation(lat, lon):
     query = f"""
     [out:json];
     (way(around:5000,{lat},{lon})["natural"="coastline"];);
     out geom;
     """
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(OVERPASS_URL, params={"data": query}, timeout=20.0)
-            resp.raise_for_status()
-            data = resp.json()
+        async with httpx.AsyncClient() as c:
+            r = await c.get(OVERPASS_URL, params={"data": query}, timeout=20)
+            r.raise_for_status()
+            data = r.json()
             els = data.get("elements", [])
-            if not els:
-                return 0
+            if not els: return 0
             for el in els:
                 geom = el.get("geometry", [])
                 if geom and len(geom) >= 2:
@@ -250,20 +173,16 @@ async def get_auto_orientation(lat: float, lon: float) -> int:
                     angle = (math.degrees(math.atan2(dx, dy)) + 360) % 360
                     return int(round((angle + 90) % 360))
             return 0
-    except Exception:
-        return 0
+    except: return 0
 
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     return {"orientation": await get_auto_orientation(req.latitude, req.longitude)}
 
-# ========== دوال رياضية ==========
 def safe_float(v):
-    try:
-        return 0.0 if math.isnan(float(v)) else float(v)
-    except:
-        return 0.0
+    try: return 0.0 if math.isnan(float(v)) else float(v)
+    except: return 0.0
 
 def angle_diff(w, b):
     d = abs(w - b) % 360
@@ -271,35 +190,65 @@ def angle_diff(w, b):
 
 def wind_class_detailed(diff):
     if diff < 30: return "بحرية مباشرة"
-    if diff < 45: return "بحرية خفيفة"
-    if diff < 60: return "جانبية مائلة للبحر"
-    if diff <= 120: return "جانبية"
-    if diff < 150: return "جانبية مائلة للبر"
-    if diff < 165: return "برية خفيفة"
-    return "برية مباشرة"
+    elif diff < 45: return "بحرية خفيفة"
+    elif diff < 60: return "جانبية مائلة للبحر"
+    elif diff <= 120: return "جانبية"
+    elif diff < 150: return "جانبية مائلة للبر"
+    elif diff < 165: return "برية خفيفة"
+    else: return "برية مباشرة"
 
 def weather_desc(code):
     if code <= 1: return "صافية"
-    if code == 2: return "غائمة جزئياً"
-    if code == 3: return "غائمة"
-    if code <= 48: return "ضباب"
-    if code <= 55: return "رذاذ"
-    if code <= 65: return "مطر"
-    if code <= 77: return "ثلج"
-    if code <= 82: return "زخات مطر"
-    if code <= 99: return "عواصف"
+    elif code == 2: return "غائمة جزئياً"
+    elif code == 3: return "غائمة"
+    elif code <= 48: return "ضباب"
+    elif code <= 55: return "رذاذ"
+    elif code <= 65: return "مطر"
+    elif code <= 77: return "ثلج"
+    elif code <= 82: return "زخات مطر"
+    elif code <= 99: return "عواصف"
     return "غير معروف"
 
-# ========== تفضيلات الأسماك ==========
+# --------------- تفضيلات الأسماك ---------------
 SPECIES_PREFERENCES = {
-    "قاروص": {"ideal_sst": (14, 18), "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية مائلة للبحر"], "ideal_wave_range": (0.5, 1.5), "ideal_power_range": (0.5, 2.0), "bottom_type": "sandy"},
-    "دوراد": {"ideal_sst": (19, 26), "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية مائلة للبر"], "ideal_wave_range": (0.3, 0.8), "ideal_power_range": (0.1, 1.0), "bottom_type": "sandy"},
-    "سارغ": {"ideal_sst": (16, 22), "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية"], "ideal_wave_range": (0.5, 1.2), "ideal_power_range": (0.3, 1.5), "bottom_type": "rocky"},
-    "بوري": {"ideal_sst": (15, 28), "preferred_wind": ["جانبية", "برية خفيفة", "بحرية خفيفة"], "ideal_wave_range": (0.1, 0.6), "ideal_power_range": (0.0, 0.5), "bottom_type": "sandy"},
-    "ماربري": {"ideal_sst": (18, 24), "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية"], "ideal_wave_range": (0.3, 0.8), "ideal_power_range": (0.1, 0.8), "bottom_type": "sandy"}
+    "قاروص": {
+        "ideal_sst": (14, 18),
+        "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية مائلة للبحر"],
+        "ideal_wave_range": (0.5, 1.5),
+        "ideal_power_range": (0.5, 2.0),
+        "bottom_type": "sandy"
+    },
+    "دوراد": {
+        "ideal_sst": (19, 26),
+        "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية مائلة للبر"],
+        "ideal_wave_range": (0.3, 0.8),
+        "ideal_power_range": (0.1, 1.0),
+        "bottom_type": "sandy"
+    },
+    "سارغ": {
+        "ideal_sst": (16, 22),
+        "preferred_wind": ["بحرية مباشرة", "بحرية خفيفة", "جانبية"],
+        "ideal_wave_range": (0.5, 1.2),
+        "ideal_power_range": (0.3, 1.5),
+        "bottom_type": "rocky"
+    },
+    "بوري": {
+        "ideal_sst": (15, 28),
+        "preferred_wind": ["جانبية", "برية خفيفة", "بحرية خفيفة"],
+        "ideal_wave_range": (0.1, 0.6),
+        "ideal_power_range": (0.0, 0.5),
+        "bottom_type": "sandy"
+    },
+    "ماربري": {
+        "ideal_sst": (18, 24),
+        "preferred_wind": ["برية مباشرة", "برية خفيفة", "جانبية"],
+        "ideal_wave_range": (0.3, 0.8),
+        "ideal_power_range": (0.1, 0.8),
+        "bottom_type": "sandy"
+    }
 }
 
-# ========== القمر ==========
+# --------------- مراحل القمر وأيام الحمل/الفساد ---------------
 def moon_phase_detail(d: date) -> dict:
     y, m, day = d.year, d.month, d.day
     if m < 3:
@@ -313,7 +262,10 @@ def moon_phase_detail(d: date) -> dict:
     lunar_month = 29.53058867
     phase = (days_since_new % lunar_month) / lunar_month
     idx = int(phase * 8) % 8
-    phases = {0: "محاق", 1: "هلال أول", 2: "تربيع أول", 3: "أحدب متزايد", 4: "بدر", 5: "أحدب متناقص", 6: "تربيع ثاني", 7: "هلال آخر"}
+    phases = {
+        0: "محاق", 1: "هلال أول", 2: "تربيع أول", 3: "أحدب متزايد",
+        4: "بدر", 5: "أحدب متناقص", 6: "تربيع ثاني", 7: "هلال آخر"
+    }
     name = phases.get(idx, "محاق")
     if 0.0 <= phase < 0.125 or 0.875 <= phase <= 1.0:
         status = "أيام متوسطة (محاق / هلال آخر)"
@@ -343,25 +295,27 @@ def moon_fishing_guidance(d: date) -> str:
     else:
         return f"{status}. الصيد مقبول، لكن الأفضل في الساعات الذهبية."
 
-# ========== تقييم بقعة (للمسح) ==========
-def evaluate_spot(times: List[datetime], aligned: dict, orient: int, sunrise_str: str, sunset_str: str,
-                  beach_type: str, target_species: Optional[str] = None) -> Tuple[float, dict]:
+def evaluate_spot(marine, weather, orient, sunrise_str, sunset_str, beach_type, target_species=None):
+    mh = marine.get("hourly", {})
+    wh = weather.get("hourly", {})
+    times = mh.get("time", [])
     if not times:
         return 0.0, {}
 
-    wave_h = aligned["wave_height"]
-    wave_p = aligned["wave_period"]
-    wind_speed = aligned["wind_speed_10m"]
-    wind_dir = aligned["wind_direction_10m"]
-    wind_gust = aligned["wind_gusts_10m"]
-    pressure = aligned["pressure_msl"]
-    sst = aligned["sea_surface_temperature"]
+    wave_h = [safe_float(x) for x in mh.get("wave_height", [])]
+    wave_p = [safe_float(x) for x in mh.get("wave_period", [])]
+    wind_speed = [safe_float(x) for x in wh.get("wind_speed_10m", [])]
+    wind_dir_vals = [safe_float(x) for x in wh.get("wind_direction_10m", [])]
+    wind_gust = [safe_float(x) for x in wh.get("wind_gusts_10m", [])]
+    pressure = [safe_float(x) for x in wh.get("pressure_msl", [])]
+    sst = [safe_float(x) for x in mh.get("sea_surface_temperature", [])]
 
-    wind_classes = [wind_class_detailed(angle_diff(wd, orient)) for wd in wind_dir]
+    wind_classes_detailed = [wind_class_detailed(angle_diff(wd, orient)) for wd in wind_dir_vals]
 
     N = len(times)
     score = 0.0
-    red_hours = green_hours = 0
+    red_hours = 0
+    green_hours = 0
 
     try:
         sr_h = int(sunrise_str.split(":")[0])
@@ -377,34 +331,29 @@ def evaluate_spot(times: List[datetime], aligned: dict, orient: int, sunrise_str
         elif 0.3 <= wave_h[i] <= 1.0 and 0.1 <= power <= 1.5 and wind_speed[i] < 27.8:
             green_hours += 1
             score += 10
-            h = times[i].hour
+            dt = datetime.fromisoformat(times[i])
+            h = dt.hour
             if abs(h - sr_h) <= 2 or abs(h - ss_h) <= 2:
                 score += 5
         else:
-            if 0.2 <= wave_h[i] <= 1.2:
-                score += 3
-            elif wave_h[i] < 0.2:
-                score += 1
-            else:
-                score -= 2
-            if wind_speed[i] < 15:
-                score += 4
-            elif wind_speed[i] < 25:
-                score += 2
-            else:
-                score -= 1
+            if 0.2 <= wave_h[i] <= 1.2: score += 3
+            elif wave_h[i] < 0.2: score += 1
+            else: score -= 2
+            if wind_speed[i] < 15: score += 4
+            elif wind_speed[i] < 25: score += 2
+            else: score -= 1
 
     avg_wave = sum(wave_h) / N
     avg_power = sum(0.49 * (wave_h[i]**2) * wave_p[i] for i in range(N)) / N
     avg_wind = sum(wind_speed) / N
     avg_sst = sum(sst) / N
     avg_press = sum(pressure) / N
-    dominant = max(set(wind_classes), key=wind_classes.count)
+    dominant_wind = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
 
+    # مكافأة الضغط المستقر
     if 1015 <= avg_press <= 1025:
         score += 8
 
-    factor = 1.0
     if target_species and target_species in SPECIES_PREFERENCES:
         prefs = SPECIES_PREFERENCES[target_species]
         match_score = 0
@@ -415,29 +364,32 @@ def evaluate_spot(times: List[datetime], aligned: dict, orient: int, sunrise_str
             match_score += 15
         if prefs["bottom_type"] == beach_type:
             match_score += 20
-        if dominant in prefs["preferred_wind"]:
+        if dominant_wind in prefs["preferred_wind"]:
             match_score += 25
-        elif any(w in prefs["preferred_wind"] for w in wind_classes):
+        elif any(w in prefs["preferred_wind"] for w in wind_classes_detailed):
             match_score += 10
         if prefs["ideal_wave_range"][0] <= avg_wave <= prefs["ideal_wave_range"][1]:
             match_score += 15
         if prefs["ideal_power_range"][0] <= avg_power <= prefs["ideal_power_range"][1]:
             match_score += 10
         factor = 0.5 + (match_score / 100.0)
+    else:
+        factor = 1.0
 
     normalized = max(0.0, min(100.0, (score / 200.0) * 100.0 * factor))
+
     summary = {
         "avg_wave": round(avg_wave, 2),
         "avg_power": round(avg_power, 2),
         "avg_wind": round(avg_wind, 1),
         "avg_sst": round(avg_sst, 1),
-        "dominant_wind": dominant,
+        "dominant_wind": dominant_wind,
         "green_hours": green_hours,
         "red_hours": red_hours,
     }
     return round(normalized, 1), summary
 
-# ========== قاعدة الشواطئ الكاملة ==========
+# --------------- قاعدة بيانات الشواطئ ---------------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name": "شاطئ الكورنيش (بنزرت)", "lat": 37.2744, "lon": 9.8739, "orientation": 45, "type": "sandy"},
@@ -505,233 +457,6 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# ========== مسح أفضل الشواطئ ==========
-@app.post("/scan-best")
-@limiter.limit("5/minute")
-async def scan_best_spots(request: Request, req: ScanRequest):
-    beaches = []
-    for gov in req.governorates:
-        if gov in TUNISIAN_BEACHES:
-            for b in TUNISIAN_BEACHES[gov]:
-                beaches.append({**b, "governorate": gov})
-    if not beaches:
-        raise HTTPException(400, "لا توجد شواطئ للولايات المحددة")
-
-    tz = zoneinfo.ZoneInfo("Africa/Tunis")
-    today = datetime.now(tz).date()
-    target_dt = today if req.target_date == "today" else (today + timedelta(days=1) if req.target_date == "tomorrow" else today + timedelta(days=2))
-
-    start = target_dt - timedelta(days=1)
-    end = target_dt + timedelta(days=1)
-
-    sem = asyncio.Semaphore(5)
-
-    async def process(beach):
-        async with sem:
-            try:
-                m, w = await asyncio.gather(
-                    fetch_with_retry(MARINE_URL, {
-                        "latitude": beach["lat"], "longitude": beach["lon"],
-                        "hourly": "wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature",
-                        "timezone": "Africa/Tunis", "start_date": start.isoformat(), "end_date": end.isoformat()
-                    }),
-                    fetch_with_retry(WEATHER_URL, {
-                        "latitude": beach["lat"], "longitude": beach["lon"],
-                        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,precipitation,weather_code",
-                        "daily": "sunrise,sunset",
-                        "timezone": "Africa/Tunis", "start_date": start.isoformat(), "end_date": end.isoformat()
-                    })
-                )
-                all_times, aligned = align_hourly_data(m["hourly"], w["hourly"], tz)
-                target_times = [t for t in all_times if t.date() == target_dt]
-                if not target_times:
-                    target_times = all_times  # fallback نادر
-                indices = [all_times.index(t) for t in target_times]
-                filtered = {k: [v[i] for i in indices] for k, v in aligned.items()}
-
-                sunrise = get_daily_value(w.get("daily", {}), target_dt, "sunrise", "06:00")
-                sunset = get_daily_value(w.get("daily", {}), target_dt, "sunset", "18:00")
-
-                score, summary = evaluate_spot(target_times, filtered, beach["orientation"], sunrise, sunset, beach["type"], req.target_species)
-                return {"name": beach["name"], "governorate": beach["governorate"], "score": score, "summary": summary, "type": beach["type"]}
-            except Exception as e:
-                logger.error(f"فشل تقييم {beach['name']}: {e}")
-                return None
-
-    results = await asyncio.gather(*[process(b) for b in beaches], return_exceptions=True)
-    valid = [r for r in results if isinstance(r, dict) and r is not None]
-    valid.sort(key=lambda x: x["score"], reverse=True)
-    return {"target_date": target_dt.isoformat(), "top10": valid[:10]}
-
-# ========== التجميع الفيزيائي (للأعشاب والأيام السابقة) ==========
-def aggregate_physics(all_times: List[datetime], aligned: dict, beach_orient: int,
-                      target_date_obj: date, sunrise_str: str, sunset_str: str) -> dict:
-    tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
-    target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
-    target_end = target_start + timedelta(days=1)
-    past_start = target_start - timedelta(hours=48)
-
-    past_indices = [i for i, t in enumerate(all_times) if past_start <= t < target_start]
-    target_indices = [i for i, t in enumerate(all_times) if target_start <= t < target_end]
-
-    if not target_indices:
-        return {"past_avg_power":0, "dominant_wind":"غير معروف", "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False, "bio":{}, "avg_sst":0, "extra_info":{}}
-
-    def pick(key):
-        return [aligned[key][i] for i in target_indices]
-
-    wave_h = pick("wave_height")
-    wave_p = pick("wave_period")
-    swell_h = pick("swell_wave_height")
-    swell_p = pick("swell_wave_period")
-    sst = pick("sea_surface_temperature")
-    wind_kph = pick("wind_speed_10m")
-    wind_dir = pick("wind_direction_10m")
-    wind_gust = pick("wind_gusts_10m")
-    pressure = pick("pressure_msl")
-    temp_air = pick("temperature_2m")
-    precip = pick("precipitation")
-    wcode = [int(v) if v else 0 for v in pick("weather_code")]
-
-    wave_power = [0.49 * (h**2) * p for h, p in zip(wave_h, wave_p)]
-    wind_classes_detailed = [wind_class_detailed(angle_diff(wd, beach_orient)) for wd in wind_dir]
-
-    # الأيام السابقة
-    past_avg_power = 0.0
-    past_sh_avg = 0.0
-    if past_indices:
-        past_avg_power = sum(0.49 * (aligned["wave_height"][i]**2) * aligned["wave_period"][i] for i in past_indices) / len(past_indices)
-        past_sh_avg = sum(aligned["swell_wave_height"][i] for i in past_indices) / len(past_indices)
-
-    weed_risk = False
-    if target_indices:
-        first_wind_class = wind_classes_detailed[0] if wind_classes_detailed else ""
-        if past_avg_power >= 8.0 and past_sh_avg > 1.0 and first_wind_class.startswith("بحرية"):
-            weed_risk = True
-
-    sustained_hrs = sum(1 for i in past_indices if aligned["wind_speed_10m"][i] > 18.5) if past_indices else 0
-    dominant = max(set(wind_classes_detailed), key=wind_classes_detailed.count) if wind_classes_detailed else "غير معروف"
-
-    periods = defaultdict(lambda: {"indices":[], "temps":[], "precip":[], "codes":[]})
-    for idx, i in enumerate(target_indices):
-        h = all_times[i].hour
-        if 4 <= h <= 11: key = "morning"
-        elif 12 <= h <= 17: key = "afternoon"
-        else: key = "night"
-        periods[key]["indices"].append(idx)
-        periods[key]["temps"].append(temp_air[idx])
-        periods[key]["precip"].append(precip[idx])
-        periods[key]["codes"].append(wcode[idx])
-
-    blocks = []
-    for key, pd in periods.items():
-        idxs = pd["indices"]
-        if not idxs: continue
-        avg_h = sum(wave_h[i] for i in idxs)/len(idxs)
-        min_h, max_h = min(wave_h[i] for i in idxs), max(wave_h[i] for i in idxs)
-        avg_pow = sum(wave_power[i] for i in idxs)/len(idxs)
-        avg_w = sum(wind_kph[i] for i in idxs)/len(idxs)
-        min_w, max_w = min(wind_kph[i] for i in idxs), max(wind_kph[i] for i in idxs)
-        wc = max(set(wind_classes_detailed[i] for i in idxs), key=wind_classes_detailed.count)
-        avg_sw_h = sum(swell_h[i] for i in idxs)/len(idxs)
-        avg_sw_p = sum(swell_p[i] for i in idxs)/len(idxs)
-        avg_air = sum(pd["temps"])/len(pd["temps"]) if pd["temps"] else 0
-        total_precip = sum(pd["precip"])
-        most_code = max(set(pd["codes"]), key=pd["codes"].count) if pd["codes"] else 0
-        blocks.append({
-            "name": {"morning":"الصباح","afternoon":"الظهر","night":"الليل"}[key],
-            "wave_h_range": f"{min_h:.2f}-{max_h:.2f}",
-            "power": round(avg_pow,2),
-            "wind_kph_range": f"{min_w:.1f}-{max_w:.1f}",
-            "wind_dir": wc,
-            "swell_h_range": f"{min(swell_h[i] for i in idxs):.2f}-{max(swell_h[i] for i in idxs):.2f}",
-            "swell_period": round(avg_sw_p*2)/2,
-            "air_temp": round(avg_air,1),
-            "precip_mm": round(total_precip,1),
-            "weather": weather_desc(most_code)
-        })
-
-    reds, greens = [], []
-    for i in range(len(wave_h)):
-        hh = all_times[target_indices[i]].strftime("%H:%M")
-        if wave_power[i] > 3 or wave_h[i] > 1.8 or wind_gust[i] > 50 or pressure[i] < 1005:
-            reds.append(hh)
-        if 0.3 <= wave_h[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and wind_kph[i] < 27.8:
-            greens.append(hh)
-
-    avg_sst = sum(sst)/len(sst) if sst else 0.0
-    avg_press = sum(pressure)/len(pressure) if pressure else 0.0
-    p3 = pressure[-1] - pressure[0] if len(pressure) > 1 else 0.0
-    p6 = pressure[-1] - pressure[0] if len(pressure) > 2 else 0.0
-
-    bio = {}
-    if avg_sst < 16: bio["high"] = ["قاروص", "سارغ"]
-    elif avg_sst > 19: bio["high"] = ["دوراد", "ماربري"]
-    else: bio["high"] = []
-
-    moon_detail = moon_phase_detail(target_date_obj)
-    moon_guidance = moon_fishing_guidance(target_date_obj)
-    swell_day = swell_h if swell_h else [0]
-    swell_range = f"{min(swell_day):.2f}-{max(swell_day):.2f}"
-
-    return {
-        "past_avg_power": round(past_avg_power,2),
-        "dominant_wind": dominant,
-        "sustained_hrs": sustained_hrs,
-        "blocks": blocks,
-        "red_flags": reds[:5],
-        "green_flags": greens[:5],
-        "weed_risk": weed_risk,
-        "bio": bio,
-        "avg_sst": round(avg_sst,1),
-        "extra_info": {
-            "pressure_avg": round(avg_press,1),
-            "pressure_change_3h": round(p3,1),
-            "pressure_change_6h": round(p6,1),
-            "sunrise": sunrise_str,
-            "sunset": sunset_str,
-            "moon_phase": moon_detail["name"],
-            "moon_status": moon_detail["status"],
-            "moon_activity": moon_detail["activity"],
-            "moon_guidance": moon_guidance,
-            "swell_range_day": swell_range
-        }
-    }
-
-# ========== بناء السياق ==========
-def build_context(req: ReportRequest, agg: dict, tz_name: str) -> str:
-    beach = "رملي" if req.beach_type == "sandy" else "صخري"
-    lines = [
-        f"الموقع: {req.latitude:.2f},{req.longitude:.2f}، شاطئ {beach}، اتجاه البحر {req.beach_orientation}°",
-        f"التاريخ: {req.target_date} (توقيت {tz_name})",
-        f"حرارة الماء: {agg.get('avg_sst','غير معروف')}°م",
-        f"متوسط طاقة الموج 48س: {agg.get('past_avg_power',0)} kW/m",
-        f"الرياح السائدة: {agg.get('dominant_wind','')}",
-        f"خطر الأعشاب: {'نعم' if agg.get('weed_risk') else 'لا'}"
-    ]
-    extra = agg.get("extra_info", {})
-    if extra:
-        lines.append(f"الضغط الجوي: {extra.get('pressure_avg','')} hPa (تغير 3س: {extra.get('pressure_change_3h','')}, 6س: {extra.get('pressure_change_6h','')})")
-        lines.append(f"الشروق: {extra.get('sunrise','')} | الغروب: {extra.get('sunset','')}")
-        lines.append(f"حالة القمر للصيد: {extra.get('moon_status','')} - {extra.get('moon_activity','')}")
-        lines.append(f"توجيه: {extra.get('moon_guidance','')}")
-        lines.append(f"Swell اليومي: {extra.get('swell_range_day','')} م")
-    if agg.get("blocks"):
-        lines.append("تفاصيل الفترات:")
-        for b in agg["blocks"]:
-            lines.append(
-                f"- {b['name']}: {b['weather']}, الموج {b['wave_h_range']}م, swell {b['swell_h_range']}م/{b['swell_period']}ث, طاقة {b['power']}kW/m, "
-                f"الرياح {b['wind_kph_range']} كم/س ({b['wind_dir']}), حرارة ~{b['air_temp']}°م, أمطار {b['precip_mm']}مم"
-            )
-    if agg.get("red_flags"): lines.append("ساعات الخطر: " + ", ".join(agg["red_flags"]))
-    if agg.get("green_flags"): lines.append("ساعات مثالية: " + ", ".join(agg["green_flags"]))
-    if agg.get("bio"):
-        bio = agg["bio"]
-        lines.append("الأسماك المتوقعة: " + ", ".join(bio.get("high",[])))
-    lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل.")
-    return "\n".join(lines)
-
-# ========== نظام التوجيه ==========
 SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري قدير. اكتب تقريراً بحرياً كاملاً باللغة العربية والمصطلحات التونسية الدارجة (المرصاص، اللدونة، التيارات الجارفة، القفلة، دود الكف، القمبري، الشريب، القرابين، الصابونة...). التقرير نص واحد متصل بلا نقاط أو رموز، يغطي:
 1. تحليل عام: حالة السماء، حرارة الهواء والماء، القمر وتأثيره (أيام الحمل/الفساد، المحاق، البدر...)، الشروق والغروب. **استخدم معلومات حالة القمر للصيد والتوجيه لتحدد بالضبط متى يكون النشاط أفضل (نهار/ليل) وما هي الأسماك المستهدفة في كل فترة.**
 2. الأمواج والتيارات: نطاق الموج و swell، الطاقة. بناءً عليها:
@@ -753,67 +478,316 @@ SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف و
 
 اكتب بلغة خبير ميداني، موجز ومفيد. لا تذكر أنك تلقيت بيانات أو أنك ذكاء اصطناعي."""
 
-async def call_openrouter(ctx: str) -> str:
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL_NAME, "messages": [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}], "max_tokens":7000, "temperature":0.3}
-    data = await post_with_retry(OPENROUTER_URL, payload, headers)
-    if "choices" in data and len(data["choices"]) > 0:
-        return data["choices"][0]["message"]["content"]
-    raise HTTPException(502, "استجابة OpenRouter فارغة")
+async def call_openrouter(ctx):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ctx}
+        ],
+        "max_tokens": 7000,
+        "temperature": 0.3
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        raise SurfError("استجابة OpenRouter فارغة")
+
+@app.post("/scan-best")
+@limiter.limit("5/minute")
+async def scan_best_spots(request: Request, req: ScanRequest):
+    beaches = []
+    for gov in req.governorates:
+        if gov in TUNISIAN_BEACHES:
+            for b in TUNISIAN_BEACHES[gov]:
+                beaches.append({**b, "governorate": gov})
+    if not beaches:
+        raise HTTPException(400, "لا توجد شواطئ للولايات المحددة")
+
+    tz_name = "Africa/Tunis"
+    now = datetime.now(zoneinfo.ZoneInfo(tz_name))
+    if req.target_date == "today":
+        target_dt = now.date()
+    elif req.target_date == "tomorrow":
+        target_dt = now.date() + timedelta(days=1)
+    else:
+        target_dt = now.date() + timedelta(days=2)
+
+    start = target_dt - timedelta(days=2)
+    end = target_dt + timedelta(days=1)
+    sem = asyncio.Semaphore(5)
+
+    async def process(beach):
+        async with sem:
+            try:
+                m, w = await asyncio.gather(
+                    fetch_marine(beach["lat"], beach["lon"], start.isoformat(), end.isoformat()),
+                    fetch_weather(beach["lat"], beach["lon"], start.isoformat(), end.isoformat())
+                )
+                sunrise = w.get("daily", {}).get("sunrise", ["06:00"])[0]
+                sunset = w.get("daily", {}).get("sunset", ["18:00"])[0]
+                score, summary = evaluate_spot(
+                    m, w, beach["orientation"], sunrise, sunset,
+                    beach["type"], target_species=req.target_species
+                )
+                return {
+                    "name": beach["name"],
+                    "governorate": beach["governorate"],
+                    "score": score,
+                    "summary": summary,
+                    "type": beach["type"]
+                }
+            except Exception as e:
+                logger.error(f"فشل تقييم {beach['name']}: {e}")
+                return None
+
+    tasks = [process(b) for b in beaches]
+    results = await asyncio.gather(*tasks)
+    valid = [r for r in results if r is not None]
+    valid.sort(key=lambda x: x["score"], reverse=True)
+    return {"target_date": target_dt.isoformat(), "top10": valid[:10]}
+
+def aggregate_physics(marine, weather, beach_orient, beach_type, target_date_obj, tz_name):
+    tz = zoneinfo.ZoneInfo(tz_name) if tz_name else zoneinfo.ZoneInfo("UTC")
+    mh = marine.get("hourly", {})
+    wh = weather.get("hourly", {})
+    dw = weather.get("daily", {})
+
+    times = mh.get("time", [])
+    wave_h = [safe_float(x) for x in mh.get("wave_height", [])]
+    wave_p = [safe_float(x) for x in mh.get("wave_period", [])]
+    swell_h = [safe_float(x) for x in mh.get("swell_wave_height", [])]
+    swell_p = [safe_float(x) for x in mh.get("swell_wave_period", [])]
+    sst = [safe_float(x) for x in mh.get("sea_surface_temperature", [])]
+
+    wind_speed = [safe_float(x) for x in wh.get("wind_speed_10m", [])]
+    wind_dir = [safe_float(x) for x in wh.get("wind_direction_10m", [])]
+    wind_gust = [safe_float(x) for x in wh.get("wind_gusts_10m", [])]
+    pressure = [safe_float(x) for x in wh.get("pressure_msl", [])]
+    temp_air = [safe_float(x) for x in wh.get("temperature_2m", [])]
+    precip = [safe_float(x) for x in wh.get("precipitation", [])]
+    weather_code = [int(safe_float(x)) for x in wh.get("weather_code", [])]
+
+    wind_kph = wind_speed
+    gust_kph = wind_gust
+    wave_power = [0.49 * (h**2) * p for h, p in zip(wave_h, wave_p)]
+
+    wind_classes_detailed = [wind_class_detailed(angle_diff(wd, beach_orient)) for wd in wind_dir]
+
+    dtimes = []
+    for t_str in times:
+        dt = datetime.fromisoformat(t_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        dtimes.append(dt)
+
+    target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
+    target_end = target_start + timedelta(days=1)
+    past_start = target_start - timedelta(hours=48)
+
+    past_idx = [i for i, dt in enumerate(dtimes) if past_start <= dt < target_start]
+    target_idx = [i for i, dt in enumerate(dtimes) if target_start <= dt < target_end]
+
+    if not target_idx:
+        return {"past_avg_power":0, "dominant_wind":"غير معروف", "blocks":[], "red_flags":[], "green_flags":[], "weed_risk":False, "bio":{}, "avg_sst":0, "extra_info":{}, "target_date_obj": target_date_obj}
+
+    past_avg_power_val = sum(wave_power[i] for i in past_idx) / max(len(past_idx), 1)
+    dominant = max(set(wind_classes_detailed), key=wind_classes_detailed.count)
+    sustained_hrs = sum(1 for i in past_idx if wind_kph[i] > 18.5)
+
+    press_target = [pressure[i] for i in target_idx]
+    avg_press = sum(press_target) / len(press_target)
+    press_trend = "مستقر"
+    if len(press_target) >= 6:
+        half = len(press_target)//2
+        first = sum(press_target[:half])/half
+        second = sum(press_target[half:])/(len(press_target)-half)
+        diff = second - first
+        if diff > 1: press_trend = "في ارتفاع"
+        elif diff < -1: press_trend = "في انخفاض"
+
+    periods = defaultdict(lambda: {"indices":[], "temps":[], "precip":[], "codes":[]})
+    for i in target_idx:
+        h = dtimes[i].hour
+        if 4 <= h <= 11: key = "morning"
+        elif 12 <= h <= 17: key = "afternoon"
+        else: key = "night"
+        periods[key]["indices"].append(i)
+        periods[key]["temps"].append(temp_air[i])
+        periods[key]["precip"].append(precip[i])
+        periods[key]["codes"].append(weather_code[i])
+
+    block_list = []
+    for key, pd in periods.items():
+        idxs = pd["indices"]
+        if not idxs: continue
+        avg_h = sum(wave_h[i] for i in idxs)/len(idxs)
+        min_h = min(wave_h[i] for i in idxs)
+        max_h = max(wave_h[i] for i in idxs)
+        avg_p = sum(wave_power[i] for i in idxs)/len(idxs)
+        avg_w = sum(wind_kph[i] for i in idxs)/len(idxs)
+        min_w = min(wind_kph[i] for i in idxs)
+        max_w = max(wind_kph[i] for i in idxs)
+        wc = max(set(wind_classes_detailed[i] for i in idxs), key=wind_classes_detailed.count)
+        avg_sw_h = sum(swell_h[i] for i in idxs)/len(idxs)
+        avg_sw_p = sum(swell_p[i] for i in idxs)/len(idxs)
+        avg_air = sum(pd["temps"])/len(pd["temps"]) if pd["temps"] else None
+        total_precip = sum(pd["precip"]) if pd["precip"] else 0
+        most_common_code = max(set(pd["codes"]), key=pd["codes"].count) if pd["codes"] else 0
+        block_list.append({
+            "name": {"morning":"الصباح","afternoon":"الظهر","night":"الليل"}[key],
+            "wave_h_range": f"{min_h:.2f}-{max_h:.2f}",
+            "power": round(avg_p,2),
+            "wind_kph_range": f"{min_w:.1f}-{max_w:.1f}",
+            "wind_dir": wc,
+            "swell_h_range": f"{min(swell_h[i] for i in idxs):.2f}-{max(swell_h[i] for i in idxs):.2f}",
+            "swell_period": round(avg_sw_p*2)/2,
+            "air_temp": round(avg_air,1) if avg_air else "غير متوفر",
+            "precip_mm": round(total_precip,1),
+            "weather": weather_desc(most_common_code)
+        })
+
+    sunrise = dw.get("sunrise", ["غير معروف"])[0] if dw.get("sunrise") else "غير معروف"
+    sunset = dw.get("sunset", ["غير معروف"])[0] if dw.get("sunset") else "غير معروف"
+
+    reds, greens = [], []
+    for i in target_idx:
+        hh = dtimes[i].strftime("%H:%M")
+        if wave_power[i] > 3 or wave_h[i] > 1.8 or wind_gust[i] > 50 or pressure[i] < 1005:
+            reds.append(hh)
+        if 0.3 <= wave_h[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and wind_kph[i] < 27.8:
+            greens.append(hh)
+
+    past_wp_avg = sum(wave_p[i] for i in past_idx)/max(len(past_idx),1)
+    past_sh_avg = sum(swell_h[i] for i in past_idx)/max(len(past_idx),1)
+    weed = (past_wp_avg >= 8.0 and past_sh_avg > 1.0 and wind_classes_detailed[target_idx[0]].startswith("بحرية"))
+
+    avg_sst = sum(sst[i] for i in target_idx)/len(target_idx)
+    bio = {}
+    if avg_sst < 16: bio["high"] = ["قاروص", "سارغ"]
+    elif avg_sst > 19: bio["high"] = ["دوراد", "ماربري"]
+    else: bio["high"] = []
+    if beach_type == "rocky": bio.setdefault("additional", []).append("سارغ")
+    elif beach_type == "sandy": bio.setdefault("additional", []).append("بوري")
+
+    moon_detail = moon_phase_detail(target_date_obj)
+    moon_guidance = moon_fishing_guidance(target_date_obj)
+
+    swell_day = [swell_h[i] for i in target_idx]
+    swell_range = f"{min(swell_day):.2f}-{max(swell_day):.2f}"
+
+    press_vals = [pressure[i] for i in target_idx]
+    p3 = press_vals[-1] - press_vals[0] if len(press_vals) > 1 else 0
+    p6 = press_vals[-1] - press_vals[0] if len(press_vals) > 2 else 0
+
+    return {
+        "past_avg_power": round(past_avg_power_val,2),
+        "dominant_wind": dominant,
+        "sustained_hrs": sustained_hrs,
+        "blocks": block_list,
+        "red_flags": reds[:5],
+        "green_flags": greens[:5],
+        "weed_risk": weed,
+        "bio": bio,
+        "avg_sst": round(avg_sst,1),
+        "extra_info": {
+            "pressure_avg": round(avg_press,1),
+            "pressure_change_3h": round(p3,1),
+            "pressure_change_6h": round(p6,1),
+            "sunrise": sunrise,
+            "sunset": sunset,
+            "moon_phase": moon_detail["name"],
+            "moon_status": moon_detail["status"],
+            "moon_activity": moon_detail["activity"],
+            "moon_guidance": moon_guidance,
+            "swell_range_day": swell_range
+        },
+        "target_date_obj": target_date_obj
+    }
+
+def build_context(req, agg, tz_name):
+    beach = "رملي" if req.beach_type=="sandy" else "صخري"
+    target_date_obj = agg.get("target_date_obj")
+
+    lines = [
+        f"الموقع: {req.latitude:.2f},{req.longitude:.2f}، شاطئ {beach}، اتجاه البحر {req.beach_orientation}°",
+        f"التاريخ: {req.target_date} (توقيت {tz_name})",
+        f"حرارة الماء: {agg.get('avg_sst','غير معروف')}°م",
+        f"متوسط طاقة الموج 48س: {agg.get('past_avg_power',0)} kW/m",
+        f"الرياح السائدة: {agg.get('dominant_wind','')}",
+        f"خطر الأعشاب: {'نعم' if agg.get('weed_risk') else 'لا'}"
+    ]
+    extra = agg.get("extra_info", {})
+    if extra:
+        lines.append(f"الضغط الجوي: {extra.get('pressure_avg','')} hPa (تغير 3س: {extra.get('pressure_change_3h','')}, 6س: {extra.get('pressure_change_6h','')})")
+        lines.append(f"الشروق: {extra.get('sunrise','')} | الغروب: {extra.get('sunset','')}")
+        lines.append(f"حالة القمر للصيد: {extra.get('moon_status','')} - {extra.get('moon_activity','')}")
+        lines.append(f"توجيه: {extra.get('moon_guidance','')}")
+        lines.append(f"Swell اليومي: {extra.get('swell_range_day','')} م")
+
+    if agg.get("blocks"):
+        lines.append("تفاصيل الفترات:")
+        for b in agg["blocks"]:
+            lines.append(
+                f"- {b['name']}: {b['weather']}, الموج {b['wave_h_range']}م, "
+                f"swell {b['swell_h_range']}م/{b['swell_period']}ث, طاقة {b['power']}kW/m, "
+                f"الرياح {b['wind_kph_range']} كم/س ({b['wind_dir']}), حرارة ~{b['air_temp']}°م, أمطار {b['precip_mm']}مم"
+            )
+    if agg.get("red_flags"): lines.append("ساعات الخطر: " + ", ".join(agg["red_flags"]))
+    if agg.get("green_flags"): lines.append("ساعات مثالية: " + ", ".join(agg["green_flags"]))
+    if agg.get("bio"):
+        bio = agg["bio"]
+        lines.append("الأسماك المتوقعة: " + ", ".join(bio.get("high",[]) + bio.get("additional",[])))
+
+    if target_date_obj:
+        month = target_date_obj.month
+        if month in [12, 1, 2]:
+            lines.append("نصيحة موسمية: الشتاء ممتاز للقاروص والسارغ، استعمل الشريب والسردين المجمد.")
+        elif month in [3, 4, 5]:
+            lines.append("نصيحة موسمية: الربيع مثالي للبوري والدوراد، استعمل دود الكف والقمبري.")
+        elif month in [6, 7, 8]:
+            lines.append("نصيحة موسمية: الصيف تكثر فيه الأسماك السطحية، استعمل السردين الطازج والطعم الحي.")
+        else:
+            lines.append("نصيحة موسمية: الخريف يعود القاروص بقوة، جرب الشريب المخمّر.")
+
+    lines.append("تذكير: راجع جدول المد المحلي – آخر ساعتين من المد هما الأفضل.")
+    return "\n".join(lines)
 
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: ReportRequest):
     cache_key = f"{req.latitude:.4f}_{req.longitude:.4f}_{req.beach_orientation}_{req.beach_type}_{req.target_date}"
-    async with cache_lock:
-        if cache_key in cache and time.time() - cache[cache_key]["ts"] < CACHE_TTL:
-            return cache[cache_key]["data"]
-
+    if cache_key in cache and time.time() - cache[cache_key]["ts"] < CACHE_TTL:
+        return cache[cache_key]["data"]
     try:
         tz_name = await fetch_timezone_info(req.latitude, req.longitude)
-        tz = zoneinfo.ZoneInfo(tz_name)
-        real_today = datetime.now(tz).date()
-        target_dt = resolve_target_date(req.target_date, real_today)
-
+        # ---- التصحيح الجذري: استعمل توقيت تونس بدل UTC ----
+        tz_tn = zoneinfo.ZoneInfo("Africa/Tunis")
+        target_dt = datetime.now(tz_tn).date()
+        # -------------------------------------------------
         start = target_dt - timedelta(days=2)
         end = target_dt + timedelta(days=1)
         marine, weather = await asyncio.gather(
-            fetch_with_retry(MARINE_URL, {
-                "latitude": req.latitude, "longitude": req.longitude,
-                "hourly": ["wave_height","wave_period","wave_direction","swell_wave_height","swell_wave_period","swell_wave_direction","sea_surface_temperature"],
-                "timezone": tz_name, "start_date": start.isoformat(), "end_date": end.isoformat()
-            }),
-            fetch_with_retry(WEATHER_URL, {
-                "latitude": req.latitude, "longitude": req.longitude,
-                "hourly": ["wind_speed_10m","wind_direction_10m","wind_gusts_10m","pressure_msl","temperature_2m","precipitation","weather_code"],
-                "daily": ["sunrise","sunset"],
-                "timezone": tz_name, "start_date": start.isoformat(), "end_date": end.isoformat()
-            })
+            fetch_marine(req.latitude, req.longitude, start.isoformat(), end.isoformat()),
+            fetch_weather(req.latitude, req.longitude, start.isoformat(), end.isoformat())
         )
-
-        all_times, aligned = align_hourly_data(marine["hourly"], weather["hourly"], tz)
-        if not all_times:
-            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
-
-        sunrise = get_daily_value(weather.get("daily", {}), target_dt, "sunrise", "06:00")
-        sunset = get_daily_value(weather.get("daily", {}), target_dt, "sunset", "18:00")
-
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
-
+        real_today = extract_real_date_from_times(marine["hourly"]["time"], tz_name)
+        target_dt = resolve_target_date(req.target_date, real_today)
+        agg = aggregate_physics(marine, weather, req.beach_orientation, req.beach_type, target_dt, tz_name)
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
-
         result = {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
-
-        async with cache_lock:
-            cache[cache_key] = {"ts": time.time(), "data": result}
+        cache[cache_key] = {"ts": time.time(), "data": result}
         return result
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"/generate-report failed: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="فشل إنشاء التقرير")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
