@@ -1,5 +1,6 @@
+streamlit
 fastapi
-uvicorn[standard]
+uvicorn
 httpx
 pydantic
 slowapi
