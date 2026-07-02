@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v6.0 (Client‑side data fetching, no API key)
+Surfcasting Analytics API – v6.1 (Client‑side data, fixed IndexError)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="6.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="6.1.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -30,37 +30,22 @@ if not OPENROUTER_API_KEY:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL_NAME = "google/gemini-2.5-flash"
-# لم نعد نحتاج MARINE_URL أو WEATHER_URL في الخادم
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 cache = {}
 cache_lock = asyncio.Lock()
 CACHE_TTL = 3600
 
-class ReportRequest(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
-    beach_orientation: int = Field(..., ge=0, le=360)
-    beach_type: str = Field(..., pattern="^(sandy|rocky)$")
-    target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
-
 class AutoOrientationRequest(BaseModel):
     latitude: float
     longitude: float
 
-class ScanRequest(BaseModel):
-    governorates: List[str]
-    target_date: str = "today"
-    target_species: Optional[str] = None
-
-# ---------- نموذج جديد لاستقبال البيانات الأولية من المتصفح ----------
 class RawDataReportRequest(BaseModel):
     beach_orientation: int = Field(..., ge=0, le=360)
     beach_type: str = Field(..., pattern="^(sandy|rocky)$")
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
-    # بيانات Open-Meteo التي جلبها المتصفح
-    marine_data: dict   # كائن marine API
-    weather_data: dict  # كائن weather API
+    marine_data: dict
+    weather_data: dict
 
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
@@ -69,9 +54,9 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME, "mode": "client-side data"}
+    return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME, "mode": "client-side"}
 
-# ---------- دوال الشبكة (فقط لـ OpenRouter و Overpass) ----------
+# ---------- أدوات الشبكة ----------
 async def post_with_retry(url: str, json_data: dict, headers: dict, max_retries: int = 3, timeout: float = 120.0) -> dict:
     for attempt in range(1, max_retries + 1):
         try:
@@ -90,7 +75,7 @@ async def post_with_retry(url: str, json_data: dict, headers: dict, max_retries:
                 continue
             raise
 
-# ---------- دوال مساعدة (نفس السابق، لم تتغير) ----------
+# ---------- دوال رياضية ومساعدات ----------
 def safe_float(v):
     try: return 0.0 if math.isnan(float(v)) else float(v)
     except: return 0.0
@@ -198,6 +183,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
+# ---------- Overpass ----------
 async def get_bottom_type(lat, lon):
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
     try:
@@ -239,7 +225,7 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     return {"orientation": await get_auto_orientation(req.latitude, req.longitude)}
 
-# ---------- التجميع الفيزيائي (نفس الدالة، لكن المدخلات من القواميس الأصلية) ----------
+# ---------- التجميع الفيزيائي (تم تصحيح الخطأ) ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -282,7 +268,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_swp = sum(swp[i] for i in idxs)/len(idxs)
         avg_air = sum(ta[i] for i in idxs)/len(idxs) if ta else 0
         total_precip = sum(prec[i] for i in idxs)
-        most_code = max(set(wcode[i] for i in idxs), key=wcode[i].count) if idxs else 0
+        # التصحيح هنا: استخدام wcode.count بدلاً من wcode[i].count
+        most_code = max(set(wcode[i] for i in idxs), key=wcode.count) if idxs else 0
         swell_dom = "مختلط"
         if avg_swh > 0.7 * avg_h: swell_dom = "طاقة قادمة من بعيد"
         elif avg_h - avg_swh > 0.2: swell_dom = "موج محلي"
@@ -351,44 +338,37 @@ async def call_openrouter(ctx):
     if "choices" in data and data["choices"]: return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter فارغ")
 
-# ---------- نقطة النهاية الجديدة باستقبال البيانات الأولية ----------
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
-    # سنستخدم البيانات المرسلة من العميل بدلاً من جلبها
-    marine_hourly = req.marine_data.get("hourly", req.marine_data)  # يتوافق مع كائن marine
-    weather_data = req.weather_data
-    weather_hourly = weather_data.get("hourly", {})
-    daily = weather_data.get("daily", {})
+    try:
+        # استخراج البيانات من الكائنات المرسلة
+        marine_data = req.marine_data
+        weather_data = req.weather_data
+        marine_hourly = marine_data.get("hourly", marine_data)  # إذا كانت marine_data هي الهورلي مباشرة
+        weather_hourly = weather_data.get("hourly", {})
+        daily = weather_data.get("daily", {})
 
-    tz_name = req.marine_data.get("timezone", "Africa/Tunis")
-    tz = zoneinfo.ZoneInfo(tz_name)
-    now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
-    target_dt = resolve_target_date(req.target_date, now_tn.date())
+        tz_name = marine_data.get("timezone", "Africa/Tunis")
+        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
+        target_dt = resolve_target_date(req.target_date, now_tn.date())
 
-    # استخراج الشروق والغروب
-    sunrise = "06:00"
-    sunset = "18:00"
-    if daily:
         sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
         sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
 
-    # محاذاة البيانات
-    all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
-    if not all_times:
-        raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+        all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
+        if not all_times:
+            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
 
-    agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
-    ctx = build_context(req, agg, tz_name)
-    report = await call_openrouter(ctx)
+        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
+        ctx = build_context(req, agg, tz_name)
+        report = await call_openrouter(ctx)
 
-    result = {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
-    return result
-
-# ---------- الإبقاء على نقطة المسح القديمة (لم تعد تستخدم Open-Meteo من الخادم، بل تحتاج إلى تعديل مشابه لكن نتركها للخلف) ----------
-# (يمكن تعطيلها أو تعديلها لاحقاً، لكننا نبقيها للتوافق مع الواجهة الحالية التي تستخدم /scan-best من الخادم - قد لا تعمل بدون API key)
-# لذلك سنعلقها أو نزيلها. للتبسيط، سنتركها كما هي لكنها ستفشل بسبب 429.
-# لكن المستخدم يستخدم الواجهة الجديدة، لذا لا مشكلة.
+        return {"report": report, "meta": {"timezone": tz_name, "target_date": target_dt.isoformat()}}
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail="فشل إنشاء التقرير")
 
 if __name__ == "__main__":
     import uvicorn
