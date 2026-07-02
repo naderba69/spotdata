@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – v3.0</title>
+  <title>Surfcasting Analytics – Production Ready</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -27,6 +27,7 @@
     .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,229,255,0.1); }
     .btn-primary { background-color: #00e5ff; color: #0b132b; font-weight: bold; padding: 0.75rem 2rem; border-radius: 0.5rem; border: none; cursor: pointer; transition: all 0.3s; }
     .btn-primary:hover { background-color: #00b8d4; box-shadow: 0 0 15px rgba(0,229,255,0.4); }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn-secondary { background-color: transparent; color: #00e5ff; border: 1px solid #00e5ff; padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; transition: all 0.3s; }
     .btn-secondary:hover { background-color: rgba(0,229,255,0.1); }
     .input-field { background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #e0e7ff; border-radius: 0.5rem; padding: 0.75rem; width: 100%; }
@@ -37,11 +38,12 @@
     .spinner { width: 60px; height: 60px; border: 6px solid rgba(0,229,255,0.2); border-top: 6px solid #00e5ff; border-radius: 50%; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .direction-display { background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #00e5ff; padding: 0.25rem 0.75rem; border-radius: 0.5rem; font-weight: bold; text-align: center; min-width: 130px; }
+    .reason-text { max-width: 200px; white-space: normal; word-break: break-word; font-size: 0.8rem; color: #a0b3d9; }
   </style>
 </head>
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – v3.0</h1>
+    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – Production</h1>
 
     <div class="flex justify-center gap-4 mb-8">
       <button id="tabSingle" class="btn-primary rounded-lg">📍 تقرير بقعة</button>
@@ -75,7 +77,7 @@
             <input type="hidden" id="targetDate" value="today">
           </div>
           <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
-          <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق 30-50 ثانية عند أول استخدام</p>
+          <p class="text-xs text-gray-500 text-center mt-2">قد يستغرق ما يصل إلى 90 ثانية</p>
         </div>
       </div>
       <div id="reportCard" class="card hidden">
@@ -120,7 +122,7 @@
             <thead>
               <tr class="border-b border-gray-600">
                 <th class="p-2">#</th><th class="p-2">الشاطئ</th><th class="p-2">الولاية</th>
-                <th class="p-2">التقييم</th><th class="p-2">الموج (م)</th><th class="p-2">الرياح (كم/س)</th><th class="p-2">حرارة الماء</th>
+                <th class="p-2">التقييم</th><th class="p-2">الموج (م)</th><th class="p-2">الرياح (كم/س)</th><th class="p-2">حرارة الماء</th><th class="p-2">السبب</th>
               </tr>
             </thead>
             <tbody id="scanTableBody"></tbody>
@@ -140,6 +142,9 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
+    // ---------- الإعدادات ----------
+    const API_BASE = 'https://spotdata.onrender.com';  // غيّر إلى رابط خادمك الصحيح
+
     // ---------- التبويب ----------
     const tabSingle = document.getElementById('tabSingle');
     const tabScan = document.getElementById('tabScan');
@@ -183,7 +188,7 @@
       const lng = parseFloat(document.getElementById('longitude').value);
       if (isNaN(lat) || isNaN(lng)) return;
       try {
-        const resp = await fetch('https://spotdata.onrender.com/detect-bottom-type', {
+        const resp = await fetch(`${API_BASE}/detect-bottom-type`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ latitude: lat, longitude: lng })
@@ -210,15 +215,19 @@
       const btn=document.getElementById('autoOrientBtn');
       btn.disabled=true; btn.textContent='⏳ تحديد...';
       try{
-        const r=await fetch('https://spotdata.onrender.com/auto-orientation',{
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const r=await fetch(`${API_BASE}/auto-orientation`,{
           method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({latitude:lat,longitude:lng})
+          body:JSON.stringify({latitude:lat,longitude:lng}),
+          signal: controller.signal
         });
+        clearTimeout(timeoutId);
         if(!r.ok)throw new Error('فشل');
         const d=await r.json();
         orientSlider.value=d.orientation;
         orientVal.textContent=`${d.orientation}° (${degToDir(d.orientation)})`;
-      }catch(e){alert('تعذر التحديد التلقائي');}
+      }catch(e){alert('تعذر التحديد التلقائي. قد يكون الخادم مشغولاً.');}
       finally{btn.disabled=false;btn.textContent='📍 تحديد تلقائي';}
     });
 
@@ -231,7 +240,7 @@
       });
     });
 
-    // ---------- تقرير فردي ----------
+    // ---------- تقرير فردي مع مهلة طويلة ----------
     const submitBtn=document.getElementById('submitBtn');
     const loadingOverlay=document.getElementById('loadingOverlay');
     const reportCard=document.getElementById('reportCard');
@@ -244,18 +253,45 @@
         beach_type:document.getElementById('beachType').value,
         target_date:document.getElementById('targetDate').value
       };
+      // التحقق من الإحداثيات
+      if (isNaN(payload.latitude) || isNaN(payload.longitude)) {
+        alert('الرجاء إدخال إحداثيات صحيحة');
+        return;
+      }
       loadingOverlay.classList.remove('hidden'); reportCard.classList.add('hidden');
+      submitBtn.disabled = true;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 90000); // 90 ثانية
       try{
-        const resp=await fetch('https://spotdata.onrender.com/generate-report',{
-          method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)
+        const resp=await fetch(`${API_BASE}/generate-report`,{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(payload),
+          signal: controller.signal
         });
-        if(!resp.ok){let e=await resp.json().catch(()=>{});throw new Error(e?.detail||`خطأ ${resp.status}`);}
+        clearTimeout(timeoutId);
+        if(!resp.ok){
+          let errorMsg = `خطأ ${resp.status}`;
+          try {
+            const errData = await resp.json();
+            errorMsg = errData.detail || errorMsg;
+          } catch {}
+          throw new Error(errorMsg);
+        }
         const data=await resp.json();
         reportContent.textContent=data.report||'لم يصدر تقرير';
         reportCard.classList.remove('hidden');
         reportCard.scrollIntoView({behavior:'smooth'});
-      }catch(e){alert('❌ فشل جلب التقرير:\n'+e.message);}
-      finally{loadingOverlay.classList.add('hidden');}
+      }catch(e){
+        if (e.name === 'AbortError') {
+          alert('❌ انتهت مهلة الانتظار (90 ثانية). الخادم مشغول، حاول مجدداً لاحقاً.');
+        } else {
+          alert('❌ فشل جلب التقرير:\n' + e.message);
+        }
+      }finally{
+        clearTimeout(timeoutId);
+        loadingOverlay.classList.add('hidden');
+        submitBtn.disabled = false;
+      }
     });
 
     function copyReport() {
@@ -267,10 +303,11 @@
       window.open(`https://wa.me/?text=${text}`, '_blank');
     }
 
-    // ---------- مسح الشواطئ ----------
+    // ---------- مسح الشواطئ مع عمود السبب ----------
     const governorates = ["بنزرت","أريانة","تونس","بن عروس","نابل","سوسة","المنستير","المهدية","صفاقس","قابس","مدنين"];
     function buildGovernorates(){
       const c=document.getElementById('governorateCheckboxes');
+      c.innerHTML = '';
       governorates.forEach(gov=>{
         const div=document.createElement('div'); div.className='flex items-center gap-2';
         div.innerHTML=`<input type="checkbox" id="gov_${gov}" value="${gov}" class="accent-[#00e5ff]"> <label for="gov_${gov}" class="text-gray-300">${gov}</label>`;
@@ -284,26 +321,52 @@
       const targetDate=document.getElementById('scanDate').value;
       const targetSpecies=document.getElementById('targetSpecies').value;
       loadingOverlay.classList.remove('hidden'); document.getElementById('scanResults').classList.add('hidden');
+      const scanBtn = document.getElementById('scanBtn');
+      scanBtn.disabled = true;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 ثانية
       try{
-        const resp=await fetch('https://spotdata.onrender.com/scan-best',{
+        const body = { governorates: selected, target_date: targetDate };
+        if (targetSpecies) body.target_species = targetSpecies;
+        const resp=await fetch(`${API_BASE}/scan-best`,{
           method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({governorates:selected,target_date:targetDate,target_species:targetSpecies||null})
+          body:JSON.stringify(body),
+          signal: controller.signal
         });
-        if(!resp.ok)throw new Error(await resp.text());
+        clearTimeout(timeoutId);
+        if(!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(errText || `خطأ ${resp.status}`);
+        }
         const data=await resp.json();
-        const top10=data.top10;
+        const top10=data.top10 || [];
         const tbody=document.getElementById('scanTableBody');
         tbody.innerHTML='';
         top10.forEach((spot,idx)=>{
+          const reason = spot.reason || '';
           tbody.innerHTML+=`<tr class="border-b border-gray-700">
-            <td class="p-2">${idx+1}</td><td class="p-2">${spot.name}</td><td class="p-2">${spot.governorate}</td>
+            <td class="p-2">${idx+1}</td>
+            <td class="p-2">${spot.name}</td>
+            <td class="p-2">${spot.governorate || ''}</td>
             <td class="p-2 font-bold text-[#00e5ff]">${spot.score}/100</td>
-            <td class="p-2">${spot.summary.avg_wave} م</td><td class="p-2">${spot.summary.avg_wind} كم/س</td>
-            <td class="p-2">${spot.summary.avg_sst}°م</td></tr>`;
+            <td class="p-2">${spot.summary.avg_wave} م</td>
+            <td class="p-2">${spot.summary.avg_wind} كم/س</td>
+            <td class="p-2">${spot.summary.avg_sst}°م</td>
+            <td class="p-2"><span class="reason-text" title="${reason}">${reason}</span></td>
+          </tr>`;
         });
         document.getElementById('scanResults').classList.remove('hidden');
-      }catch(e){alert('❌ فشل المسح: '+e.message);}
-      finally{loadingOverlay.classList.add('hidden');}
+      }catch(e){
+        if (e.name === 'AbortError') {
+          alert('❌ انتهت مهلة المسح (60 ثانية). حاول مجدداً.');
+        } else {
+          alert('❌ فشل المسح: ' + e.message);
+        }
+      }finally{
+        clearTimeout(timeoutId);
+        loadingOverlay.classList.add('hidden');
+        scanBtn.disabled = false;
+      }
     });
   </script>
 </body>
