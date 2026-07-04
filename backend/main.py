@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v9.0 (Completely rebuilt orientation – coastline search method)
+Surfcasting Analytics API – v9.0 (Corrected bearing logic, verified sea direction)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -74,6 +74,40 @@ async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120):
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise
+
+# ---------- دوال تحويل إحداثيات صحيحة ----------
+def meters_to_deg_lat(meters: float) -> float:
+    return meters / 111320.0
+
+def meters_to_deg_lon(meters: float, lat: float) -> float:
+    cos_lat = math.cos(math.radians(lat))
+    if cos_lat < 0.0001:
+        cos_lat = 0.0001
+    return meters / (111320.0 * cos_lat)
+
+def deg_to_meters_lat(deg: float) -> float:
+    return deg * 111320.0
+
+def deg_to_meters_lon(deg: float, lat: float) -> float:
+    return deg * 111320.0 * math.cos(math.radians(lat))
+
+def destination_point(lat: float, lon: float, bearing_deg: float, distance_m: float) -> Tuple[float, float]:
+    bearing_rad = math.radians(bearing_deg)
+    delta_lat = meters_to_deg_lat(distance_m * math.cos(bearing_rad))
+    delta_lon = meters_to_deg_lon(distance_m * math.sin(bearing_rad), lat)
+    return lat + delta_lat, lon + delta_lon
+
+def bearing_between_points(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    mid_lat = (lat1 + lat2) / 2
+    dy = deg_to_meters_lat(lat2 - lat1)
+    dx = deg_to_meters_lon(lon2 - lon1, mid_lat)
+    return (math.degrees(math.atan2(dx, dy)) + 360) % 360
+
+def distance_between_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    mid_lat = (lat1 + lat2) / 2
+    dy = deg_to_meters_lat(lat2 - lat1)
+    dx = deg_to_meters_lon(lon2 - lon1, mid_lat)
+    return math.sqrt(dy ** 2 + dx ** 2)
 
 # ---------- دوال مساعدة ----------
 def safe_float(v):
@@ -183,7 +217,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
-# ---------- قاعدة الشواطئ لم تعد تُستخدم للتوجيه التلقائي ----------
+# ---------- قاعدة الشواطئ ----------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name":"شاطئ الكورنيش (بنزرت)","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"},
@@ -251,88 +285,148 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# ---------- الطريقة الجديدة: البحث عن خط ساحلي في الاتجاه الأمامي ----------
-async def is_direction_sea(lat, lon, angle_deg, distance_m=300):
+# ---------- حساب اتجاه المماس عند نقطة على الساحل ----------
+def calculate_tangent_bearing(geom: list, idx: int) -> Optional[float]:
     """
-    تختبر إن كان الاتجاه angle_deg يشير إلى البحر،
-    وذلك بالتحقق من عدم وجود خط ساحلي في نقطة تبعد distance_m متر.
+    حساب اتجاه المماس (tangent) عند نقطة في خط الساحل.
+    يستخدم النقاط المجاورة لتقليل تأثير ضوضاء الإحداثيات.
     """
-    # تحويل المسافة إلى درجات تقريبية
-    dlat = distance_m / 111320.0  # متر لكل درجة عرض
-    dlon = distance_m / (111320.0 * math.cos(math.radians(lat)))  # متر لكل درجة طول
-    rad = math.radians(angle_deg)
-    test_lat = lat + dlat * math.cos(rad)
-    test_lon = lon + dlon * math.sin(rad)
+    n = len(geom)
+    if n < 2:
+        return None
+    
+    before_lats, before_lons = [], []
+    after_lats, after_lons = [], []
+    
+    for i in range(max(0, idx - 3), idx):
+        before_lats.append(geom[i]["lat"])
+        before_lons.append(geom[i]["lon"])
+    
+    for i in range(idx + 1, min(n, idx + 4)):
+        after_lats.append(geom[i]["lat"])
+        after_lons.append(geom[i]["lon"])
+    
+    if not before_lats and not after_lats:
+        return None
+    elif not before_lats:
+        ref_lat = geom[idx]["lat"]
+        ref_lon = geom[idx]["lon"]
+        avg_lat = sum(after_lats) / len(after_lats)
+        avg_lon = sum(after_lons) / len(after_lons)
+    elif not after_lats:
+        ref_lat = sum(before_lats) / len(before_lats)
+        ref_lon = sum(before_lons) / len(before_lons)
+        avg_lat = geom[idx]["lat"]
+        avg_lon = geom[idx]["lon"]
+    else:
+        ref_lat = sum(before_lats) / len(before_lats)
+        ref_lon = sum(before_lons) / len(before_lons)
+        avg_lat = sum(after_lats) / len(after_lats)
+        avg_lon = sum(after_lons) / len(after_lons)
+    
+    return bearing_between_points(ref_lat, ref_lon, avg_lat, avg_lon)
 
-    # استعلام عن خط ساحلي حول نقطة الاختبار في نطاق 200 متر
-    query = f"""[out:json];(way(around:200,{test_lat},{test_lon})["natural"="coastline"];);out count;"""
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            count = len(data.get("elements", []))
-            return count == 0  # True إذا لم يوجد خط ساحلي (بحر)
-    except:
-        return False  # في حالة الفشل، نعتبره ليس بحرًا (أمان)
 
-# ---------- OSM مع الفحص الجديد ----------
-async def get_osm_orientation(lat, lon):
+# ---------- OSM مع المنطق الجديد ----------
+async def get_osm_orientation(lat: float, lon: float) -> Optional[int]:
     """
-    تحدد اتجاه الشاطئ نحو البحر باستخدام أقرب خط ساحلي،
-    مع اختبار كلا الاتجاهين (±90°) باستخدام is_direction_sea.
+    تحديد اتجاه الشاطئ نحو البحر.
+    
+    المنطق:
+    1. إيجاد أقرب نقطة على خط الساحل
+    2. حساب اتجاه المماس عند تلك النقطة
+    3. حساب الاتجاه العمودي (±90°)
+    4. اختيار العمودي الذي يتوافق مع اتجاه "من الساحل إلى المستخدم"
+       (لأن المستخدم على البر، فإن هذا الاتجاه هو اتجاه البحر)
     """
-    for radius in [200, 500, 1000, 2000, 5000]:
+    for radius in [300, 600, 1200, 2500, 5000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
         try:
             async with httpx.AsyncClient() as c:
-                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
+                r = await c.get(
+                    OVERPASS_URL, 
+                    params={"data": query}, 
+                    headers={"User-Agent": USER_AGENT}, 
+                    timeout=20
+                )
                 r.raise_for_status()
                 data = r.json()
                 elements = data.get("elements", [])
-                if not elements: continue
+                
+                if not elements:
+                    continue
+                
+                # === البحث عن أقرب نقطة ساحلية ===
                 best_dist = float('inf')
-                best_shore = None
+                best_geom = None
+                best_idx = None
+                best_point = None
+                
                 for el in elements:
                     geom = el.get("geometry", [])
-                    if len(geom) < 2: continue
+                    if len(geom) < 2:
+                        continue
                     for i, p in enumerate(geom):
-                        d = math.sqrt((p["lat"]-lat)**2 + (p["lon"]-lon)**2)
+                        d = distance_between_meters(lat, lon, p["lat"], p["lon"])
                         if d < best_dist:
                             best_dist = d
-                            j = i+1 if i+1 < len(geom) else i-1
-                            dx = geom[j]["lon"] - p["lon"]
-                            dy = geom[j]["lat"] - p["lat"]
-                            dlon = math.radians(dx) * math.cos(math.radians((p["lat"]+geom[j]["lat"])/2))
-                            dlat = math.radians(dy)
-                            shore_angle = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
-                            best_shore = shore_angle
-                if best_shore is None: continue
-
-                # الاتجاهان المحتملان نحو البحر
-                cand1 = (best_shore + 90) % 360
-                cand2 = (best_shore - 90) % 360
-
-                # اختبار كلا الاتجاهين
-                sea1 = await is_direction_sea(lat, lon, cand1)
-                sea2 = await is_direction_sea(lat, lon, cand2)
-
-                if sea1 and not sea2:
-                    return int(round(cand1))
-                elif sea2 and not sea1:
-                    return int(round(cand2))
-                elif sea1 and sea2:
-                    # كلاهما بحر – نأخذ cand1 (قاعدة OSM)
-                    return int(round(cand1))
+                            best_geom = geom
+                            best_idx = i
+                            best_point = p
+                
+                if best_point is None or best_geom is None:
+                    continue
+                
+                # تجاهل إذا كانت أقرب نقطة بعيدة جداً عن نطاق البحث المتوقع
+                if best_dist > radius * 0.9:
+                    continue
+                
+                logger.info(f"أقرب نقطة ساحلية: {best_dist:.0f}م عند idx={best_idx}")
+                
+                # === حساب اتجاه المماس ===
+                tangent = calculate_tangent_bearing(best_geom, best_idx)
+                if tangent is None:
+                    logger.warning("تعذر حساب اتجاه المماس")
+                    continue
+                
+                logger.info(f"اتجاه المماس: {tangent:.1f}°")
+                
+                # === حساب الاتجاهين العموديين ===
+                normal_a = (tangent + 90) % 360
+                normal_b = (tangent - 90) % 360
+                
+                # === حساب اتجاه "من أقرب نقطة ساحلية إلى المستخدم" ===
+                coast_to_user = bearing_between_points(
+                    best_point["lat"], best_point["lon"], 
+                    lat, lon
+                )
+                
+                logger.info(f"اتجاه الساحل→المستخدم: {coast_to_user:.1f}°")
+                logger.info(f"العمودي A: {normal_a:.1f}° | العمودي B: {normal_b:.1f}°")
+                
+                # === اختيار العمودي الأقرب لاتجاه "الساحل→المستخدم" ===
+                diff_a = angle_diff(coast_to_user, normal_a)
+                diff_b = angle_diff(coast_to_user, normal_b)
+                
+                if diff_a <= diff_b:
+                    sea_direction = (normal_a + 180) % 360
                 else:
-                    # لا هذا ولا ذاك – نأخذ cand1 مع تحذير
-                    logger.warning("كلا الاتجاهين لم يُظهر بحرًا – استخدام cand1.")
-                    return int(round(cand1))
-
+                    sea_direction = (normal_b + 180) % 360
+                
+                logger.info(f"اتجاه البحر المحسوب: {sea_direction:.1f}°")
+                
+                if best_dist > 2000:
+                    logger.warning(f"المستخدم بعيد عن الساحل: {best_dist:.0f}م")
+                
+                return int(round(sea_direction))
+                
         except Exception as e:
             logger.warning(f"محاولة Overpass بنطاق {radius}m فشلت: {e}")
             continue
+    
+    logger.error("فشل تحديد الاتجاه من جميع النطاقات")
     return None
+
 
 async def get_bottom_type(lat, lon):
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
@@ -357,9 +451,8 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     osm = await get_osm_orientation(req.latitude, req.longitude)
     if osm is not None:
-        return {"orientation": osm, "source": "osm_verified"}
+        return {"orientation": osm, "source": "osm_geometry"}
 
-    # إذا فشل OSM تمامًا، لا نلجأ إلى قاعدة الشواطئ، بل نطلب الإدخال اليدوي
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي. الرجاء إدخال اتجاه الشاطئ يدويًا."}
 
 # ---------- التجميع الفيزيائي (دون تغيير) ----------
