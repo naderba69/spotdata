@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v7.1 (Unified analysis, decision‑focused report)
+Surfcasting Analytics API – v8.0 (Professional integrated decision report)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="7.1.0")
+app = FastAPI(title="Surfcasting Analytics", version="8.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -389,13 +389,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if 0.3 <= wh[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and ws[i] < 27.8: greens.append(hh)
     avg_sst = sum(sst)/len(sst) if sst else 0
     avg_press = sum(pr)/len(pr) if pr else 0
+    press_3h_change = pr[-1] - pr[0] if len(pr) > 1 else 0
     bio = {}
     if avg_sst < 16: bio["high"] = ["قاروص", "سارغ"]
     elif avg_sst > 19: bio["high"] = ["دوراد", "ماربري"]
     moon = moon_phase_detail(target_date_obj)
     moon_g = moon_fishing_guidance(target_date_obj)
     extra = {
-        "pressure_avg":round(avg_press,1),"sunrise":sunrise,"sunset":sunset,
+        "pressure_avg":round(avg_press,1),
+        "pressure_change_3h":round(press_3h_change,1),
+        "sunrise":sunrise,"sunset":sunset,
         "moon_phase":moon["name"],"moon_status":moon["status"],"moon_guidance":moon_g,
         "peak_gust_today":round(peak_gust,1)
     }
@@ -411,91 +414,108 @@ def build_context(req, agg, tz_name):
     moon = agg["extra_info"]
     orient = req.beach_orientation
 
-    # استخراج البيانات بشكل موحد
-    swell_angles = []
-    wave_angles = []
-    periods = []
-    wind_info = []
-    sea_states = []
-    for b in agg["blocks"]:
-        swell_angles.append(b.get("swell_angle_diff"))
-        wave_angles.append(b.get("wave_angle_diff"))
-        periods.append(b.get("swell_period"))
-        wind_info.append((b.get("wind_dir"), b.get("wind_speed"), b.get("wind_gust_peak"), b.get("wind_trend")))
-        sea_states.append(b.get("sea_state"))
-
-    # توليد نص وصفي واحد يدمج المعطيات
-    angle_text = []
+    # --- تحليل موحد للزوايا ---
+    angle_summary = []
     for b in agg["blocks"]:
         sa = b.get("swell_angle_diff")
         wa = b.get("wave_angle_diff")
-        sa_desc = f"{sa}° (عمودي)" if sa is not None and 70 <= sa <= 110 else f"{sa}° (مائل)"
-        wa_desc = f"{wa}° (عمودي)" if wa is not None and 70 <= wa <= 110 else f"{wa}° (مائل)"
-        angle_text.append(f"{b['name']}: swell {sa_desc}, موج محلي {wa_desc}")
+        sa_desc = "عمودي" if sa is not None and 70 <= sa <= 110 else "مائل"
+        wa_desc = "عمودي" if wa is not None and 70 <= wa <= 110 else "مائل"
+        angle_summary.append(f"{b['name']}: Swell {b['swell_dir']} ({sa_desc})، موج محلي {b['wave_dir']} ({wa_desc})")
 
-    period_text = []
+    # --- تحليل موحد للدورة ---
+    period_summary = []
     for b in agg["blocks"]:
         p = b.get("swell_period")
         if p:
-            if p <= 4: desc = "سطحي، لا يقتلع حشيش"
-            elif p >= 7: desc = "عميق، خطر اقتلاع البوسيدونيا"
+            if p <= 4: desc = "سطحي (لا يقتلع حشيشاً)"
+            elif p >= 7: desc = "عميق (خطر اقتلاع البوسيدونيا)"
             else: desc = "متوسط"
-            period_text.append(f"{b['name']}: دورة {p}s ({desc})")
+            period_summary.append(f"{b['name']}: {p}s ({desc})")
         else:
-            period_text.append(f"{b['name']}: دورة غير معروفة")
+            period_summary.append(f"{b['name']}: دورة غير معروفة")
 
-    wind_text = []
+    # --- تحليل موحد للرياح ---
+    wind_summary = []
     for b in agg["blocks"]:
-        wind_text.append(f"{b['name']}: {b['wind_dir']} {b['wind_speed']} كم/س، هبات {b['wind_gust_peak']}، {b['wind_trend']}")
+        wind_summary.append(f"{b['name']}: {b['wind_dir']} {b['wind_speed']} كم/س (هبات {b['wind_gust_peak']})، {b['wind_trend']}")
 
-    # سياق موحد
+    # --- تحليل الضغط ---
+    press_avg = moon.get("pressure_avg", 1013)
+    press_change = moon.get("pressure_change_3h", 0)
+    if press_change < -0.5:
+        press_trend = "في انخفاض (الساعة الذهبية للصيد)"
+    elif press_change > 0.5:
+        press_trend = "في ارتفاع (الأسماك قد تكون خاملة)"
+    else:
+        press_trend = "مستقر"
+
+    # --- تقييم أولي آلي لمساعدة النموذج ---
+    swell_ok = all(b.get("swell_height") and float(b["swell_height"].split("-")[1]) <= 1.3 for b in agg["blocks"])
+    period_ok = all(b.get("swell_period") and b["swell_period"] >= 7 for b in agg["blocks"])
+    wind_ok = all(b.get("wind_speed") and float(b["wind_speed"].split("-")[1]) <= 33 for b in agg["blocks"])  # 18 عقدة ≈ 33 كم/س
+    pressure_ok = press_change <= 0  # مستقر أو ينخفض
+
+    score = sum([swell_ok, period_ok, wind_ok, pressure_ok])
+    if score == 4:
+        verdict = "مثالية (Go)"
+    elif score == 3:
+        verdict = "جيدة مع استعدادات (Go)"
+    elif score == 2:
+        verdict = "مقبولة بشروط (Go بحذر)"
+    else:
+        verdict = "سيئة (No-Go)"
+
     lines = [
-        f"تقرير موحد لشاطئ {beach} (اتجاه {orient}°) بتاريخ {req.target_date} توقيت {tz_name}.",
-        f"حرارة الماء: {agg['avg_sst']}°م. القمر: {moon['moon_status']} ({moon['moon_phase']}).",
-        f"الشروق {moon['sunrise']}، الغروب {moon['sunset']}.",
-        f"الرياح السائدة: {agg['dominant_wind']}، هبات عامة تصل إلى {moon['peak_gust_today']} كم/س.",
-        f"خطر الأعشاب: {'مرتفع' if agg['weed_risk'] else 'منخفض'}.",
-        f"طاقة الموج الماضية: {agg['past_avg_power']} kW/m.",
+        f"شاطئ {beach} (اتجاه {orient}°) - {req.target_date} - توقيت {tz_name}",
+        f"حرارة الماء: {agg['avg_sst']}°م | القمر: {moon['moon_status']} ({moon['moon_phase']})",
+        f"الشروق {moon['sunrise']} | الغروب {moon['sunset']}",
+        f"الضغط الجوي: {press_avg} hPa ({press_trend})",
+        f"خطر الأعشاب: {'مرتفع' if agg['weed_risk'] else 'منخفض'} | طاقة الموج الماضية: {agg['past_avg_power']} kW/m",
         "",
-        "زوايا الموج (Swell & Wave) مقارنة بالشاطئ:"
+        "زوايا الموج:",
+        *angle_summary,
+        "",
+        "دورة الموج:",
+        *period_summary,
+        "",
+        "الرياح:",
+        *wind_summary,
+        "",
+        f"أفضل ساعات الصيد: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'}",
+        f"ساعات الخطر: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}",
+        f"الأسماك المتوقعة: {', '.join(agg['bio'].get('high', []))}",
+        "",
+        f"تقييم آلي أولي: {verdict} (الموج {'✓' if swell_ok else '✗'} | الدورة {'✓' if period_ok else '✗'} | الرياح {'✓' if wind_ok else '✗'} | الضغط {'✓' if pressure_ok else '✗'})",
+        "",
+        "المطلوب: تقرير تحليلي واحد يدمج هذه المعطيات، مع توصيات محددة (وزن الرصاصة، زاوية الرمي، الطعم، خطة طوارئ، سلامة) وقرار نهائي (Go/No‑Go). لا تسرد البيانات بل حللها واستنتج."
     ]
-    lines.extend(angle_text)
-    lines.append("\nتحليل الدورة (Period) وتأثيرها على الأعشاب:")
-    lines.extend(period_text)
-    lines.append("\nالرياح في كل فترة:")
-    lines.extend(wind_text)
-    lines.append(f"\nأفضل الساعات: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'}")
-    lines.append(f"ساعات الخطر: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}")
-    if agg["bio"].get("high"):
-        lines.append(f"الأسماك المتوقعة: {', '.join(agg['bio']['high'])}.")
-
-    lines.append("\nالمطلوب: كتابة تقرير واحد يجمع هذه المعطيات في تحليل متكامل، مع التركيز على:")
-    lines.append("- تأثير زوايا الموج والتيار الجانبي وثبات الرصاص.")
-    lines.append("- دورة الموج وخطر الأعشاب.")
-    lines.append("- تأثير الرياح على الرمي والسلامة.")
-    lines.append("- توصيات محددة: وزن الرصاصة، زاوية الرمي، الطعم، خطة طوارئ.")
-    lines.append("لا تكرر سرد الفترات كما هي، بل ادمجها في تحليل واحد واختم بقرار (Go/No‑Go).")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري. اكتب تقريراً واحداً متكاملاً بالدارجة التونسية. التقرير نص واحد متصل بدون رموز.
+SYSTEM_PROMPT = """أنت محلل بحري تونسي محترف لصيد السرفكاستينغ. اكتب تقريراً تحليلياً واحداً بالدارجة التونسية. التقرير نص متصل بدون رموز.
 
-يجب أن تحلل المعلومات التالية وتدمجها في تحليل واحد، لا أن تكرر سرد الفترات المنفصلة:
-- زوايا دخول الموج والـ Swell وتأثيرها على التيار الجانبي وثبات الرصاص.
-- دورة الموج (Period) وتأثيرها على الأعشاب ونظافة الماء.
-- الرياح (سرعتها، هباتها، اتجاهها) وتأثيرها على الرمي والسلامة.
+ستتلقى معلومات موجزة عن زوايا الموج، دورته، الرياح، الضغط الجوي، وأفضل ساعات الصيد. مهمتك تحليل هذه المعلومات وربطها ببعضها لاستخلاص توصيات وقرار.
 
-بناءً على هذا التحليل، أعط:
-- تقييماً عاماً للوضع.
-- أفضل ساعات الصيد.
-- وزن ونوع الرصاصة مع تعليل.
-- زاوية الرمي المثالية.
-- الطعم المناسب.
-- تحذيرات السلامة.
-- خطة طوارئ.
-- مقارنة سريعة مع الأيام الماضية.
-- قرار نهائي (الخروج للصيد أو لا).
+اتبع هذا الهيكل بدقة:
 
-اكتب بلغة خبير ميداني، واقعي وقاسٍ. لا تكرر سرد البيانات بل حللها واخرج بالنتائج."""
+1. تحليل زوايا الموج وتأثيرها على التيار الجانبي وثبات الرصاص. اشرح كيف ستؤثر الزوايا المائلة أو العمودية على الحمل الجانبي وانجراف الطعم.
+
+2. تحليل دورة الموج وخطر الأعشاب. اربط الدورة (بالثواني) بخطر اقتلاع الحشيش أو نظافة الماء.
+
+3. تحليل الرياح: سرعتها، هباتها، اتجاهها. كيف ستؤثر على مسافة الرمي، دقته، وسلامة الصياد.
+
+4. تحليل الضغط الجوي: اذكر قيمته وتغيره وتأثير ذلك على نشاط الأسماك.
+
+5. توصيات محددة:
+   - وزن ونوع الرصاصة (صابونة، هرم، قرابين) مع تعليل.
+   - زاوية الرمي المثالية.
+   - الطعم المناسب.
+   - تحذيرات السلامة (خاصة إذا تجاوزت الهبات 30 كم/س أو الموج 1.5م).
+   - خطة طوارئ.
+
+6. قرار نهائي (Go/No‑Go) مع ذكر الأسباب بوضوح. إذا كان القرار Go، اذكر أفضل توقيت للخروج. إذا كان No‑Go، اذكر الأسباب بصراحة.
+
+اكتب بلغة صياد خبير، واقعي وقاسٍ. لا تسرد المعلومات بل حللها. كل جملة تحمل معلومة جديدة. لا تذكر أنك تلقيت بيانات أو أنك ذكاء اصطناعي."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
