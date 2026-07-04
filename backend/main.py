@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v6.3 (Auto orientation via nearest beach, robust)
+Surfcasting Analytics API – v6.4 (Robust auto orientation + manual fallback)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="6.3.0")
+app = FastAPI(title="Surfcasting Analytics", version="6.4.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -254,7 +254,6 @@ TUNISIAN_BEACHES = {
 }
 
 def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
-    """البحث عن أقرب شاطئ في القاعدة وإرجاع اتجاهه."""
     min_dist = float('inf')
     nearest_orient = None
     for gov, beaches in TUNISIAN_BEACHES.items():
@@ -305,20 +304,20 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
-    # المحاولة الأولى: أقرب شاطئ من القاعدة (سريع ودقيق)
-    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
-    if orientation is not None:
-        return {"orientation": orientation, "source": "nearest_beach"}
-
-    # المحاولة الثانية: Overpass (إذا لم نجد شاطئاً قريباً)
+    # 1. Overpass (الأدق)
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
     if orientation != 0:
         return {"orientation": orientation, "source": "overpass"}
 
-    # فشل كل شيء
-    raise HTTPException(404, "لم نتمكن من تحديد الاتجاه تلقائياً. يرجى إدخاله يدوياً.")
+    # 2. أقرب شاطئ من القاعدة
+    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
+    if orientation is not None:
+        return {"orientation": orientation, "source": "nearest_beach"}
 
-# ---------- التجميع الفيزيائي (نفس الإصدار 6.2) ----------
+    # 3. فشل كل شيء – إرجاع -1 ليعرف المستخدم أنه يجب عليه إدخال الاتجاه يدوياً
+    return {"orientation": -1, "source": "none", "message": "لم نتمكن من تحديد الاتجاه تلقائياً. يرجى إدخال اتجاه الشاطئ يدوياً."}
+
+# ---------- التجميع الفيزيائي ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
