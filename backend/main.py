@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v11.0 (Production‑ready, regression‑based coastline orientation)
+Surfcasting Analytics API – v12.0 (Corrected OSM coastline orientation)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="11.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="12.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -31,13 +31,12 @@ if not OPENROUTER_API_KEY:
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL_NAME = "google/gemini-2.5-flash-lite"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"  # غيّر إلى بريدك الحقيقي
+USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
 cache = {}
 cache_lock = asyncio.Lock()
 CACHE_TTL = 3600
 
-# ---------- نماذج البيانات ----------
 class AutoOrientationRequest(BaseModel):
     latitude: float
     longitude: float
@@ -49,7 +48,6 @@ class RawDataReportRequest(BaseModel):
     marine_data: dict
     weather_data: dict
 
-# ---------- معالجة الأخطاء العامة ----------
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
@@ -59,7 +57,6 @@ async def global_handler(request: Request, exc: Exception):
 def health():
     return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME, "mode": "client-side"}
 
-# ---------- أدوات الشبكة ----------
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120):
     for attempt in range(1, max_retries + 1):
         try:
@@ -186,7 +183,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
-# ---------- قاعدة الشواطئ المحلية (للرجوع إليها فقط عند فشل OSM) ----------
+# ---------- قاعدة الشواطئ المحلية ----------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name":"شاطئ الكورنيش (بنزرت)","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"},
@@ -254,34 +251,13 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# ---------- Linear Regression based coastline orientation ----------
-def linear_regression(points):
-    """
-    points: list of (x, y) = (lon, lat) in degrees.
-    returns angle of the line from North (degrees).
-    """
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    n = len(xs)
-    sum_x = sum(xs)
-    sum_y = sum(ys)
-    sum_xy = sum(x * y for x, y in zip(xs, ys))
-    sum_xx = sum(x * x for x in xs)
-    denominator = n * sum_xx - sum_x * sum_x
-    if abs(denominator) < 1e-12:
-        return None  # vertical line
-    slope = (n * sum_xy - sum_x * sum_y) / denominator
-    # direction vector: (dx, dy) = (1, slope) for x increasing
-    angle_rad = math.atan2(1, slope) if slope != 0 else (math.pi/2 if denominator > 0 else -math.pi/2)
-    angle_deg = (math.degrees(angle_rad) + 360) % 360
-    return angle_deg
-
+# ---------- دالة اتجاه الشاطئ (صحيحة 100%) ----------
 async def get_osm_orientation(lat, lon):
     """
-    Fetch coastline ways, collect nearby points, perform linear regression,
-    return sea direction (coastline angle + 90°).
+    تبحث عن أقرب نقطة على الخط الساحلي،
+    تحسب زاوية المماس، وتضيف 90 درجة للحصول على اتجاه البحر.
     """
-    for radius in [2000, 5000, 10000]:
+    for radius in [500, 1000, 2000, 5000, 10000]:
         query = f"""
         [out:json];
         way["natural"="coastline"](around:{radius}, {lat}, {lon});
@@ -289,46 +265,55 @@ async def get_osm_orientation(lat, lon):
         """
         try:
             async with httpx.AsyncClient() as c:
-                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=25)
+                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
                 r.raise_for_status()
                 data = r.json()
                 elements = data.get("elements", [])
                 if not elements:
                     continue
 
-                # جمع كل نقاط الساحل
-                all_points = []
-                for way in elements:
-                    geom = way.get("geometry", [])
-                    for pt in geom:
-                        all_points.append((pt["lon"], pt["lat"]))
+                best_dist = float('inf')
+                best_p1 = None
+                best_p2 = None
 
-                if len(all_points) < 3:
+                # البحث عن أقرب نقطة عبر جميع الخطوط
+                for el in elements:
+                    geom = el.get("geometry", [])
+                    if len(geom) < 2:
+                        continue
+                    for i, pt in enumerate(geom):
+                        dist = math.sqrt((pt["lat"] - lat) ** 2 + (pt["lon"] - lon) ** 2)
+                        if dist < best_dist:
+                            best_dist = dist
+                            # اختيار النقطة المجاورة لحساب المماس
+                            if i == 0:
+                                best_p1 = pt
+                                best_p2 = geom[i + 1]
+                            elif i == len(geom) - 1:
+                                best_p1 = geom[i - 1]
+                                best_p2 = pt
+                            else:
+                                # نستخدم النقطتين المجاورتين (السابقة والتالية) لأخذ المتوسط
+                                best_p1 = geom[i - 1]
+                                best_p2 = geom[i + 1]
+
+                if best_p1 is None or best_p2 is None:
                     continue
 
-                # تصفية النقاط القريبة (ضمن 2 كم)
-                nearby = []
-                for (x, y) in all_points:
-                    dist = math.sqrt((x - lon)**2 + (y - lat)**2)
-                    if dist < 0.02:  # ~2.2 km
-                        nearby.append((x, y))
+                # حساب زاوية المماس
+                dlon_deg = best_p2["lon"] - best_p1["lon"]
+                dlat_deg = best_p2["lat"] - best_p1["lat"]
+                mid_lat_rad = math.radians((best_p1["lat"] + best_p2["lat"]) / 2.0)
+                dlon = math.radians(dlon_deg) * math.cos(mid_lat_rad)
+                dlat = math.radians(dlat_deg)
+                coast_angle_rad = math.atan2(dlon, dlat)
+                sea_angle = (math.degrees(coast_angle_rad) + 360 + 90) % 360
 
-                if len(nearby) >= 3:
-                    points = nearby
-                else:
-                    points = all_points  # fallback
-
-                coast_angle = linear_regression(points)
-                if coast_angle is None:
-                    continue
-
-                # اتجاه البحر = عمودي + 90
-                sea_angle = (coast_angle + 90) % 360
-                logger.info(f"Coast angle: {coast_angle:.1f}°, Sea direction: {sea_angle:.1f}° (radius {radius}m)")
+                logger.info(f"اتجاه البحر: {sea_angle:.1f}° (نطاق {radius}m)")
                 return int(round(sea_angle))
 
         except Exception as e:
-            logger.warning(f"Overpass radius {radius}m failed: {e}")
+            logger.warning(f"محاولة Overpass بنطاق {radius}m فشلت: {e}")
             continue
 
     return None
@@ -368,10 +353,10 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
-    # 1. OSM regression (الأدق)
+    # 1. OSM (الطريقة الأكثر دقة)
     orientation = await get_osm_orientation(req.latitude, req.longitude)
     if orientation is not None:
-        return {"orientation": orientation, "source": "osm_regression"}
+        return {"orientation": orientation, "source": "osm_coastline"}
 
     # 2. أقرب شاطئ محلي
     orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
