@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v6.8 (Scientific, strict report with angle/period analysis)
+Surfcasting Analytics API – v7.0 (Detailed scientific analysis)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="6.8.0")
+app = FastAPI(title="Surfcasting Analytics", version="7.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -367,7 +367,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         swell_dir_desc = deg_to_compass(avg_swd) if avg_swd else "غير معروف"
         wave_dir_desc = deg_to_compass(avg_wave_dir) if avg_wave_dir else "غير معروف"
 
-        # حساب الفرق الزاوي بين swell والموج واتجاه الشاطئ
         swell_angle = angle_diff(avg_swd, orient) if avg_swd else None
         wave_angle = angle_diff(avg_wave_dir, orient) if avg_wave_dir else None
 
@@ -420,51 +419,70 @@ def build_context(req, agg, tz_name):
         f"القمر: {moon['moon_status']} ({moon['moon_phase']}). {moon['moon_guidance']}",
         f"الشروق {moon['sunrise']}، الغروب {moon['sunset']}.",
         f"الرياح السائدة: {agg['dominant_wind']}، هبات تصل إلى {moon['peak_gust_today']} كم/س.",
-        f"خطر الأعشاب: {'نعم' if agg['weed_risk'] else 'منخفض'}.",
-        f"طاقة الموج الماضية: {agg['past_avg_power']} kW/m",
-        "تفاصيل الفترات:"
+        f"خطر الأعشاب من الـ 48 ساعة الماضية: {'نعم' if agg['weed_risk'] else 'منخفض'}.",
+        f"متوسط طاقة الموج الماضية: {agg['past_avg_power']} kW/m.",
+        "تفاصيل الفترات الزمنية (كل فترة تحمل هذه المعطيات):"
     ]
     for b in agg["blocks"]:
         swell_angle = b.get("swell_angle_diff")
         wave_angle = b.get("wave_angle_diff")
-        swell_angle_desc = f"{swell_angle}° (عمودي)" if swell_angle is not None and 70 <= swell_angle <= 110 else f"{swell_angle}° (مائل)" if swell_angle is not None else "غير معروف"
+        swell_angle_desc = f"{swell_angle}° (عمودي على الشاطئ)" if swell_angle is not None and 70 <= swell_angle <= 110 else f"{swell_angle}° (مائل على الشاطئ)" if swell_angle is not None else "غير معروف"
         wave_angle_desc = f"{wave_angle}° (عمودي)" if wave_angle is not None and 70 <= wave_angle <= 110 else f"{wave_angle}° (مائل)" if wave_angle is not None else "غير معروف"
 
+        period = b.get("swell_period")
+        period_analysis = ""
+        if period:
+            if period <= 4:
+                period_analysis = "بحر نظيف (الموج سطحي لا يقتلع الحشيش)"
+            elif period >= 7:
+                period_analysis = "خطر حشيش (الموج العميق يقتلع البوسيدونيا)"
+            else:
+                period_analysis = "حالة متوسطة (بعض الأوساخ ممكنة)"
+
         lines.append(
-            f"{b['name']} ({b['time_range']}): بحر {b['sea_state']}، "
-            f"موج محلي {b['wave_height']}م (اتجاه {b['wave_dir']}، زاوية {wave_angle_desc})، "
-            f"دورة {b['swell_period']}ث، swell {b['swell_height']}م (اتجاه {b['swell_dir']}، زاوية {swell_angle_desc}). "
-            f"طاقة {b['wave_power']}kW/m. رياح {b['wind_speed']} كم/س ({b['wind_dir']})، {b['wind_trend']}، هبات {b['wind_gust_peak']} كم/س. "
-            f"حرارة {b['air_temp']}°م، {b['weather']}."
+            f"\n{b['name']} ({b['time_range']}): بحر {b['sea_state']}، "
+            f"الموج المحلي: ارتفاع {b['wave_height']}م، اتجاه {b['wave_dir']} (زاوية دخول {wave_angle_desc})، طاقة {b['wave_power']}kW/m. "
+            f"Swell: ارتفاع {b['swell_height']}م، دورة {b['swell_period']}ث ({period_analysis})، اتجاه {b['swell_dir']} (زاوية دخول {swell_angle_desc}). "
+            f"رياح: سرعة {b['wind_speed']} كم/س، {b['wind_dir']}. {b['wind_trend']}. أقصى هبة {b['wind_gust_peak']} كم/س. "
+            f"حرارة الهواء: {b['air_temp']}°م، {b['weather']}."
         )
-    if agg["red_flags"]: lines.append(f"ساعات خطر: {', '.join(agg['red_flags'])}")
-    if agg["green_flags"]: lines.append(f"ساعات مثالية: {', '.join(agg['green_flags'])}")
+    if agg["red_flags"]: lines.append(f"\nساعات خطر (تجنب الصيد): {', '.join(agg['red_flags'])}")
+    if agg["green_flags"]: lines.append(f"أفضل الساعات للصيد: {', '.join(agg['green_flags'])}")
     if agg["bio"].get("high"): lines.append(f"الأسماك المتوقعة: {', '.join(agg['bio']['high'])}.")
-    lines.append("حلل الوضع علمياً: زاوية الموج، الدورة، الرياح. أعط توصيات مباشرة (رصاصة، زاوية رمي، طعم، سلامة) دون حشو.")
+    lines.append("\nبناءً على هذه المعطيات الدقيقة، اكتب تقريراً مفصلاً يغطي: 1) تحليل زاوية الموج وتأثيرها على التيار الجانبي وثبات الرصاص. 2) تحليل دورة الموج وخطر الأعشاب. 3) تحليل الرياح وتأثيرها على الرمي. 4) توصيات محددة (وزن الرصاصة، زاوية الرمي، الطعم، السلامة، خطة طوارئ).")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي خبير ومحلل بحري دقيق. اكتب تقريراً منظماً وموجزاً بالدارجة التونسية. التقرير نص واحد متصل بدون رموز. التزم بالهيكل التالي دون أي حشو أو تكرار:
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري. اكتب تقريراً مفصلاً بالدارجة التونسية. التقرير نص واحد متصل بدون رموز. يجب أن تغطي النقاط التالية بالتفصيل، مع ذكر الأرقام والمعطيات كما وردت:
 
-1. تحليل زاوية الموج (Swell & Waves):
-- قارن اتجاه الـ Swell والموج المحلي مع اتجاه الشاطئ (الزاوية المعطاة). إذا كانت الزاوية قريبة من 90°، فالبحر "عمودي" والتيار الجانبي ضعيف والطعم يثبت. إذا كانت مائلة، فالتيار الجانبي نشط وقد ينجرف الرصاص.
-- اذكر تأثير ذلك على ثبات الطعم ونظافة الماء.
+1. تحليل زاوية الموج (Swell & Waves Direction):
+- قارن زاوية دخول الـ Swell والموج المحلي مع اتجاه الشاطئ. إذا كانت الزاوية قريبة من 90°، فالتيار الجانبي ضعيف، والطعم يثبت، والماء نظيف. إذا كانت مائلة (< 70° أو > 110°)، فهناك تيار جانبي (Courant de dérive) يسحب الرصاص ويجمع الحشيش.
+- اذكر كيف تؤثر هذه الزاوية على خطة الرمي والثبات.
 
-2. تحليل الدورة (Wave Period):
-- الدورة أقل من 5 ثوانٍ تعني أن الموج سطحي ولا يقتلع أعشاباً من القاع (الماء نظيف). الدورة أعلى من 7 ثوانٍ تعني خطراً كبيراً لاقتلاع الحشيش والدرع البني.
-- اذكر خطر الأعشاب بناءً على الدورة الحالية.
+2. تحليل دورة الموج (Wave Period) وتأثيرها على الأعشاب:
+- الدورة 3-4 ثوانٍ: الموج سطحي، لا يقتلع أعشاباً من القاع، البحر نظيف.
+- الدورة 5-6 ثوانٍ: احتمال أعشاب طافية خفيفة.
+- الدورة 7 ثوانٍ فأكثر: خطر كبير، الموج العميق يقتلع البوسيدونيا ويخرج "الدرع البني".
+- اذكر تأثير الدورة الحالية على نظافة الماء وخطر تعليق الحشيش في الخيط.
 
-3. تحليل الرياح:
-- سرعة الرياح والهبات واتجاهها. إذا كانت الرياح بحرية (قادمة من البحر) تؤثر على الرمي وتزيد الأمواج، وإذا كانت برية (قادمة من البر) تساعد على الرمي ولكن قد تخلق تيارات سطحية.
-- الهبات القوية (>30 كم/س) تجعل الرمي صعباً وخطراً على القصبة.
+3. تحليل الرياح (Wind Speed & Direction):
+- سرعة الرياح والهبات. إذا كانت الرياح معتدلة (12-20 كم/س) فهي تحفز السمك بالأكسجين. إذا كانت عنيفة (>30 كم/س) فهي تزيد التيار الجانبي وتجعل الرمي صعباً.
+- اتجاه الرياح: بحرية، برية، جانبية. كيف تؤثر على مسافة الرمي واستقرار الطعم؟
 
-4. التوصيات النهائية:
-- أفضل ساعات الصيد. وزن الرصاصة المناسب (صابونة، هرم، قرابين) مع تعليل. زاوية الرمي المثالية. الطعم المناسب. تحذيرات السلامة. خطة طوارئ.
+4. التوصيات النهائية (Go / No-Go):
+- تقييم عام: هل الوضع مناسب للصيد؟ هل هناك حشيش؟ هل التيار قوي؟
+- أفضل ساعات الصيد.
+- وزن ونوع الرصاصة (صابونة، هرم، قرابين) مع تعليل.
+- زاوية الرمي المثالية.
+- الطعم المناسب حسب القاع والموسم.
+- تحذيرات سلامة (هبات، أمواج عالية).
+- خطة طوارئ إذا ساءت الأحوال.
+- قارن مع الأيام الماضية بناءً على طاقة الموج السابقة.
 
 اكتب بلغة صياد خبير، واقعي وقاسٍ. كل جملة تحمل معلومة جديدة. لا تقل "بناءً على المعطيات"."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":6000,"temperature":0.2}
+    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":7000,"temperature":0.3}
     data = await post_with_retry(OPENROUTER_URL, payload, headers)
     if "choices" in data and data["choices"]: return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter فارغ")
