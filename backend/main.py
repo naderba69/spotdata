@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v8.7 (Production‑ready, multi‑source orientation, all features)
+Surfcasting Analytics API – v8.9 (Bidirectional sea check – final orientation fix)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="8.7.0")
+app = FastAPI(title="Surfcasting Analytics", version="8.9.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -183,7 +183,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
-# ---------- قاعدة الشواطئ الكاملة ----------
+# ---------- قاعدة الشواطئ ----------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name":"شاطئ الكورنيش (بنزرت)","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"},
@@ -251,18 +251,20 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# ---------- اتجاه الشاطئ (متعدد المصادر) ----------
-def find_nearest_beach_orientation(lat, lon):
-    min_dist = float('inf')
-    nearest = None
-    for gov, beaches in TUNISIAN_BEACHES.items():
-        for b in beaches:
-            d = math.sqrt((b["lat"]-lat)**2 + (b["lon"]-lon)**2)
-            if d < min_dist:
-                min_dist = d
-                nearest = b["orientation"]
-    return nearest
+# ---------- فحص البحر ----------
+async def is_point_in_sea(lat, lon):
+    query = f"""[out:json];(way(around:150,{lat},{lon})["natural"="coastline"];);out count;"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            count = len(data.get("elements", []))
+            return count == 0
+    except:
+        return None
 
+# ---------- OSM مع التحقق ثنائي الاتجاه ----------
 async def get_osm_orientation(lat, lon):
     for radius in [200, 500, 1000, 2000, 5000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
@@ -289,10 +291,44 @@ async def get_osm_orientation(lat, lon):
                             dlat = math.radians(dy)
                             shore_angle = (math.degrees(math.atan2(dlon, dlat)) + 360) % 360
                             best_shore = shore_angle
-                if best_shore is not None:
-                    return int(round((best_shore + 90) % 360))
-        except: continue
+                if best_shore is None: continue
+
+                # الاتجاهان المحتملان نحو البحر
+                cand1 = (best_shore + 90) % 360
+                cand2 = (best_shore - 90) % 360
+
+                dist_test = 0.001  # ~111 متر
+                for angle in [cand1, cand2]:
+                    rad = math.radians(angle)
+                    test_lat = lat + dist_test * math.cos(rad)
+                    test_lon = lon + dist_test * math.sin(rad)
+                    sea = await is_point_in_sea(test_lat, test_lon)
+                    if sea is True:
+                        logger.info(f"اتجاه البحر: {angle:.0f}° (نطاق {radius}m)")
+                        return int(round(angle))
+
+                # إذا فشل الاختباران، نعود إلى cand1 مع تحذير
+                logger.warning(f"تعذر التحقق من البحر، تم استخدام القاعدة العامة (90+).")
+                return int(round(cand1))
+
+        except Exception as e:
+            logger.warning(f"محاولة Overpass بنطاق {radius}m فشلت: {e}")
+            continue
     return None
+
+def find_nearest_beach(lat, lon):
+    min_dist = float('inf')
+    nearest_beach = None
+    for gov, beaches in TUNISIAN_BEACHES.items():
+        for b in beaches:
+            d = math.sqrt((b["lat"]-lat)**2 + (b["lon"]-lon)**2)
+            if d < min_dist:
+                min_dist = d
+                nearest_beach = b
+    if nearest_beach:
+        dist_km = round(min_dist * 111, 1)
+        return nearest_beach["orientation"], nearest_beach["name"], dist_km
+    return None, None, None
 
 async def get_bottom_type(lat, lon):
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
@@ -316,16 +352,16 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     osm = await get_osm_orientation(req.latitude, req.longitude)
-    beach = find_nearest_beach_orientation(req.latitude, req.longitude)
+    beach_orient, beach_name, beach_dist = find_nearest_beach(req.latitude, req.longitude)
 
-    if osm is not None and beach is not None and angle_diff(osm, beach) < 20:
-        return {"orientation": osm, "source": "osm_beach_agree", "beach_orientation": beach}
+    if osm is not None and beach_orient is not None and angle_diff(osm, beach_orient) < 20:
+        return {"orientation": osm, "source": "osm_beach_agree", "beach_name": beach_name, "beach_distance_km": beach_dist}
 
     if osm is not None:
         return {"orientation": osm, "source": "osm_only", "message": "تم التحديد من OpenStreetMap. تأكد من صحته."}
 
-    if beach is not None:
-        return {"orientation": beach, "source": "beach_only", "message": "تم التحديد من قاعدة الشواطئ. تأكد من صحته."}
+    if beach_orient is not None:
+        return {"orientation": beach_orient, "source": "beach_only", "beach_name": beach_name, "beach_distance_km": beach_dist, "message": f"تم التحديد من قاعدة الشواطئ (أقرب شاطئ: {beach_name}، يبعد {beach_dist} كم). تأكد من أن هذا هو الشاطئ الصحيح!"}
 
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي. الرجاء إدخال الاتجاه يدويًا."}
 
