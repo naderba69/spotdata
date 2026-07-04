@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v6.6 (Free model, all features, production‑ready)
+Surfcasting Analytics API – v6.8 (Scientific, strict report with angle/period analysis)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="6.6.0")
+app = FastAPI(title="Surfcasting Analytics", version="6.8.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -29,7 +29,7 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash-lite"   # نموذج مجاني من Google
+MODEL_NAME = "google/gemini-2.5-flash-lite"   # نموذج مجاني
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"   # غيّر إلى بريدك
@@ -264,7 +264,6 @@ def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
                 nearest_orient = b["orientation"]
     return nearest_orient
 
-# ---------- Overpass (مع User-Agent) ----------
 async def get_bottom_type(lat, lon):
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
     try:
@@ -312,7 +311,7 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
         return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "لم نتمكن من تحديد الاتجاه تلقائياً."}
 
-# ---------- التجميع الفيزيائي ----------
+# ---------- التجميع الفيزيائي مع الزوايا والدورة ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -367,6 +366,11 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         sea = "هادئ" if avg_h < 0.3 else "متوسط الهيجان" if avg_h < 0.8 else "هائج"
         swell_dir_desc = deg_to_compass(avg_swd) if avg_swd else "غير معروف"
         wave_dir_desc = deg_to_compass(avg_wave_dir) if avg_wave_dir else "غير معروف"
+
+        # حساب الفرق الزاوي بين swell والموج واتجاه الشاطئ
+        swell_angle = angle_diff(avg_swd, orient) if avg_swd else None
+        wave_angle = angle_diff(avg_wave_dir, orient) if avg_wave_dir else None
+
         blocks.append({
             "name":{"morning":"الصباح","afternoon":"الظهر","night":"الليل"}[key],
             "time_range":f"{all_times[target_idx[idxs[0]]].strftime('%H:%M')}-{all_times[target_idx[idxs[-1]]].strftime('%H:%M')}",
@@ -374,7 +378,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "swell_height":f"{min(swh[i] for i in idxs):.2f}-{max(swh[i] for i in idxs):.2f}",
             "swell_period":round(avg_swp,1),
             "swell_dir": swell_dir_desc,
+            "swell_angle_diff": round(swell_angle,0) if swell_angle is not None else None,
             "wave_dir": wave_dir_desc,
+            "wave_angle_diff": round(wave_angle,0) if wave_angle is not None else None,
             "swell_dominance":swell_dom,"wind_speed":f"{min_w:.1f}-{max_w:.1f}","wind_gust_peak":round(max(wg[i] for i in idxs),1),
             "wind_dir":wc_dom,"wind_trend":wind_trend,"air_temp":round(avg_air,1),"precip":round(total_precip,1),
             "weather":weather_desc(most_code)
@@ -406,49 +412,59 @@ def deg_to_compass(deg):
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     moon = agg["extra_info"]
+    orient = req.beach_orientation
     lines = [
-        f"الموقع: شاطئ {beach} اتجاهه {req.beach_orientation}° شمال.",
-        f"التاريخ: {req.target_date} (توقيت {tz_name})",
+        f"شاطئ {beach}، اتجاهه نحو البحر {orient}°.",
+        f"التاريخ: {req.target_date}، توقيت {tz_name}",
         f"حرارة الماء: {agg['avg_sst']}°م",
         f"القمر: {moon['moon_status']} ({moon['moon_phase']}). {moon['moon_guidance']}",
         f"الشروق {moon['sunrise']}، الغروب {moon['sunset']}.",
-        f"الرياح السائدة اليوم: {agg['dominant_wind']}، مع هبات تصل إلى {moon['peak_gust_today']} كم/س.",
-        f"خطر الأعشاب: {'نعم، الأعشاب متوقعة قرب الشاطئ' if agg['weed_risk'] else 'منخفض'}.",
-        f"متوسط طاقة الموج 48س الماضية: {agg['past_avg_power']} kW/m"
+        f"الرياح السائدة: {agg['dominant_wind']}، هبات تصل إلى {moon['peak_gust_today']} كم/س.",
+        f"خطر الأعشاب: {'نعم' if agg['weed_risk'] else 'منخفض'}.",
+        f"طاقة الموج الماضية: {agg['past_avg_power']} kW/m",
+        "تفاصيل الفترات:"
     ]
-    if moon['peak_gust_today'] > 30:
-        lines.append("تحذير: هبات الرياح القوية تشكل خطراً على القصبة وتجعل الرمي بعيداً صعباً.")
-    lines.append("\nتفاصيل الفترات الزمنية – يجب ذكر جميع الأرقام حرفياً:")
     for b in agg["blocks"]:
-        lines.append(f"\n【{b['name']} ({b['time_range']})】")
-        lines.append(f"حالة البحر: {b['sea_state']}.")
-        lines.append(f"الموج (Wind Sea): ارتفاع {b['wave_height']} متر، اتجاه {b['wave_dir']}. طاقة {b['wave_power']} kW/m.")
-        lines.append(f"Swell: ارتفاع {b['swell_height']} متر، دورة {b['swell_period']} ثانية، اتجاه {b['swell_dir']}. تحليل: {b['swell_dominance']}.")
-        lines.append(f"الرياح: سرعة {b['wind_speed']} كم/س، اتجاه سائد {b['wind_dir']}. {b['wind_trend']}. أقصى هبة {b['wind_gust_peak']} كم/س.")
-        if b['wind_gust_peak'] > 25:
-            lines.append(f"انتبه: هبات رياح عاتية تصل إلى {b['wind_gust_peak']} كم/س تؤثر على ثبات الطعم والرمي.")
-        lines.append(f"حرارة الهواء: {b['air_temp']}°م، السماء: {b['weather']}، أمطار: {b['precip']} مم.")
-        lines.append(f"التأثير على الطعم: بناءً على الرياح {b['wind_dir']} والموج {b['wave_height']}م، يجب استخدام رصاصة بوزن كافٍ لضمان الثبات.")
-        if agg['weed_risk']:
-            lines.append("تحذير: الأعشاب البحرية قد تكون عالقة في الماء بسبب swell سابق، مما يفسد الطعم.")
-    if agg["red_flags"]: lines.append(f"\nساعات الخطر (تجنب الصيد): {', '.join(agg['red_flags'])}")
-    if agg["green_flags"]: lines.append(f"أفضل الساعات للصيد: {', '.join(agg['green_flags'])}")
-    if agg["bio"].get("high"): lines.append(f"\nالأسماك المتوقعة بناءً على الحرارة: {', '.join(agg['bio']['high'])}.")
-    lines.append("\nقدم تحليلك الاحترافي وتوصياتك النهائية (الرصاصة، التركيبة، الطعم، خطة الطوارئ، السلامة) بناءً على هذه الأرقام حصرياً. لا تخمن أي قيمة.")
+        swell_angle = b.get("swell_angle_diff")
+        wave_angle = b.get("wave_angle_diff")
+        swell_angle_desc = f"{swell_angle}° (عمودي)" if swell_angle is not None and 70 <= swell_angle <= 110 else f"{swell_angle}° (مائل)" if swell_angle is not None else "غير معروف"
+        wave_angle_desc = f"{wave_angle}° (عمودي)" if wave_angle is not None and 70 <= wave_angle <= 110 else f"{wave_angle}° (مائل)" if wave_angle is not None else "غير معروف"
+
+        lines.append(
+            f"{b['name']} ({b['time_range']}): بحر {b['sea_state']}، "
+            f"موج محلي {b['wave_height']}م (اتجاه {b['wave_dir']}، زاوية {wave_angle_desc})، "
+            f"دورة {b['swell_period']}ث، swell {b['swell_height']}م (اتجاه {b['swell_dir']}، زاوية {swell_angle_desc}). "
+            f"طاقة {b['wave_power']}kW/m. رياح {b['wind_speed']} كم/س ({b['wind_dir']})، {b['wind_trend']}، هبات {b['wind_gust_peak']} كم/س. "
+            f"حرارة {b['air_temp']}°م، {b['weather']}."
+        )
+    if agg["red_flags"]: lines.append(f"ساعات خطر: {', '.join(agg['red_flags'])}")
+    if agg["green_flags"]: lines.append(f"ساعات مثالية: {', '.join(agg['green_flags'])}")
+    if agg["bio"].get("high"): lines.append(f"الأسماك المتوقعة: {', '.join(agg['bio']['high'])}.")
+    lines.append("حلل الوضع علمياً: زاوية الموج، الدورة، الرياح. أعط توصيات مباشرة (رصاصة، زاوية رمي، طعم، سلامة) دون حشو.")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي محترف ومحلل بحري دقيق. اكتب تقريراً بحرياً كاملاً باللغة العربية والمصطلحات التونسية الدارجة. التقرير نص واحد متصل بلا نقاط أو رموز.
-يجب أن تبني تقريرك حصرياً على الأرقام المعطاة، دون تخمين أي قيمة. اذكر الأرقام كما هي.
-غطِّ جميع النقاط التالية بالتفصيل:
-1. تحليل عام: السماء، حرارة الهواء والماء، القمر وتأثيره (أيام الحمل/الفساد، المحاق، البدر)، الشروق والغروب. اذكر كيف يؤثر القمر على نشاط الأسماك بالضبط.
-2. الأمواج والتيارات: نطاق الموج الناتج عن الرياح (Wind Sea) وارتفاعه واتجاهه. نطاق swell وارتفاعه ودورته واتجاهه. اشرح بوضوح الفرق بينهما وتأثير كل منهما على حركة الماء. بناءً على قوة الرياح واتجاهها والتيار الناتج، حدد وزن ونوع الرصاصة (صابونة، هرم، قرابين) مع تعليل. إذا الرياح بحرية، ارمِ بزاوية 45° عكس الريح. وإذا برية، ارمِ مع الريح لمسافة أطول. إذا جانبية، ارمِ بعكس التيار.
-3. الرياح والأعشاب: سرعة واتجاه الرياح، وتغيرها خلال اليوم. تأثيرها على الأعشاب ونقاء الماء (خاصة إذا كان swell سابق قوي). كيف تؤثر الرياح على ثبات الطعم في القاع. نصائح للرمي حسب الرياح.
-4. التقييم والتوصيات: أفضل الأوقات بدقة. استراتيجية خاصة للبوري إذا كان ممكناً. الطعوم حسب القاع والموسم. تحذير سلامة إذا تجاوزت الرياح 30 كم/س أو الموج 1.5م. خطة طوارئ لمواجهة التغيرات المفاجئة. نصائح لقراءة البحر (تجمع الطيور، تغير لون الماء). قارن مع الأيام الماضية بناءً على طاقة الموج السابقة.
-اكتب بلغة خبير ميداني تونسي، واقعي وقاسٍ في تقييمه. لا تتفاءل كذباً، وإذا كانت الظروف سيئة قل ذلك بوضوح. لا تقل "بناءً على البيانات" بل تحدث كصياد يصف البحر أمامه."""
+SYSTEM_PROMPT = """أنت صياد سرفكاستينغ تونسي خبير ومحلل بحري دقيق. اكتب تقريراً منظماً وموجزاً بالدارجة التونسية. التقرير نص واحد متصل بدون رموز. التزم بالهيكل التالي دون أي حشو أو تكرار:
+
+1. تحليل زاوية الموج (Swell & Waves):
+- قارن اتجاه الـ Swell والموج المحلي مع اتجاه الشاطئ (الزاوية المعطاة). إذا كانت الزاوية قريبة من 90°، فالبحر "عمودي" والتيار الجانبي ضعيف والطعم يثبت. إذا كانت مائلة، فالتيار الجانبي نشط وقد ينجرف الرصاص.
+- اذكر تأثير ذلك على ثبات الطعم ونظافة الماء.
+
+2. تحليل الدورة (Wave Period):
+- الدورة أقل من 5 ثوانٍ تعني أن الموج سطحي ولا يقتلع أعشاباً من القاع (الماء نظيف). الدورة أعلى من 7 ثوانٍ تعني خطراً كبيراً لاقتلاع الحشيش والدرع البني.
+- اذكر خطر الأعشاب بناءً على الدورة الحالية.
+
+3. تحليل الرياح:
+- سرعة الرياح والهبات واتجاهها. إذا كانت الرياح بحرية (قادمة من البحر) تؤثر على الرمي وتزيد الأمواج، وإذا كانت برية (قادمة من البر) تساعد على الرمي ولكن قد تخلق تيارات سطحية.
+- الهبات القوية (>30 كم/س) تجعل الرمي صعباً وخطراً على القصبة.
+
+4. التوصيات النهائية:
+- أفضل ساعات الصيد. وزن الرصاصة المناسب (صابونة، هرم، قرابين) مع تعليل. زاوية الرمي المثالية. الطعم المناسب. تحذيرات السلامة. خطة طوارئ.
+
+اكتب بلغة صياد خبير، واقعي وقاسٍ. كل جملة تحمل معلومة جديدة. لا تقل "بناءً على المعطيات"."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":7000,"temperature":0.3}
+    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":6000,"temperature":0.2}
     data = await post_with_retry(OPENROUTER_URL, payload, headers)
     if "choices" in data and data["choices"]: return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter فارغ")
