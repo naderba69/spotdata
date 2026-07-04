@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v9.1 (Simple, reliable coastline orientation)
+Surfcasting Analytics API – v9.2 (Simple, OSM‑compliant coastline orientation)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="9.1.0")
+app = FastAPI(title="Surfcasting Analytics", version="9.2.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -251,32 +251,18 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-# ---------- دوال الموقع والاتجاه ----------
-def destination_point(lat, lon, bearing_deg, distance_m):
-    bearing_rad = math.radians(bearing_deg)
-    delta_lat = distance_m * math.cos(bearing_rad) / 111320.0
-    delta_lon = distance_m * math.sin(bearing_rad) / (111320.0 * math.cos(math.radians(lat)))
-    return lat + delta_lat, lon + delta_lon
-
-async def is_point_in_sea(lat, lon):
-    query = f"""[out:json];(way(around:150,{lat},{lon})["natural"="coastline"];);out count;"""
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            count = len(data.get("elements", []))
-            return count == 0
-    except:
-        return None
-
+# ---------- دالة اتجاه الشاطئ (مستوحاة من كود المستخدم) ----------
 async def get_osm_orientation(lat, lon):
     """
-    إيجاد أقرب قطعة مستقيمة من الخط الساحلي،
-    حساب اتجاه البحر بناءً عليها.
+    جلب أقرب خط ساحلي من OpenStreetMap وحساب اتجاه البحر.
+    البحر = اتجاه المماس + 90 درجة (قاعدة OSM).
     """
-    for radius in [300, 600, 1200, 2500, 5000]:
-        query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
+    for radius in [500, 1000, 2000, 5000]:
+        query = f"""
+        [out:json];
+        way["natural"="coastline"](around:{radius}, {lat}, {lon});
+        out geom;
+        """
         try:
             async with httpx.AsyncClient() as c:
                 r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
@@ -286,51 +272,62 @@ async def get_osm_orientation(lat, lon):
                 if not elements:
                     continue
 
-                best_dist = float('inf')
-                best_sea_angle = None
-
-                for el in elements:
-                    geom = el.get("geometry", [])
-                    if len(geom) < 2:
-                        continue
-                    for i in range(len(geom) - 1):
-                        p1 = geom[i]
-                        p2 = geom[i+1]
-                        # المسافة إلى منتصف القطعة
-                        mid_lat = (p1["lat"] + p2["lat"]) / 2
-                        mid_lon = (p1["lon"] + p2["lon"]) / 2
-                        dist = math.sqrt((mid_lat - lat)**2 + (mid_lon - lon)**2)
-
-                        if dist < best_dist:
-                            best_dist = dist
-                            dx = p2["lon"] - p1["lon"]
-                            dy = p2["lat"] - p1["lat"]
-                            segment_angle = (math.degrees(math.atan2(dx, dy)) + 360) % 360
-                            sea_angle = (segment_angle + 90) % 360
-
-                if best_sea_angle is None:
+                # نأخذ أول عنصر (أقرب way)
+                way = elements[0]
+                geometry = way.get("geometry", [])
+                if len(geometry) < 2:
                     continue
 
-                # التحقق السريع من أن الاتجاه يشير للبحر
-                test_lat, test_lon = destination_point(lat, lon, sea_angle, 200)
-                if await is_point_in_sea(test_lat, test_lon):
-                    logger.info(f"اتجاه البحر (مؤكد): {sea_angle:.0f}° (نطاق {radius}m)")
-                    return int(round(sea_angle))
+                # إيجاد أقرب نقطة على هذا الخط
+                min_dist = float("inf")
+                closest_idx = 0
+                for i, pt in enumerate(geometry):
+                    dist = math.sqrt((pt["lat"] - lat) ** 2 + (pt["lon"] - lon) ** 2)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_idx = i
+
+                # تحديد النقاط المجاورة لحساب زاوية الخط
+                if closest_idx == 0:
+                    p1 = geometry[closest_idx]
+                    p2 = geometry[closest_idx + 1]
+                elif closest_idx == len(geometry) - 1:
+                    p1 = geometry[closest_idx - 1]
+                    p2 = geometry[closest_idx]
                 else:
-                    # جرب العكس
-                    rev_angle = (sea_angle + 180) % 360
-                    test_lat2, test_lon2 = destination_point(lat, lon, rev_angle, 200)
-                    if await is_point_in_sea(test_lat2, test_lon2):
-                        logger.info(f"اتجاه البحر (معكوس): {rev_angle:.0f}° (نطاق {radius}m)")
-                        return int(round(rev_angle))
-                    # إذا فشل الاختباران، نثق بالحساب الأصلي
-                    logger.warning(f"تعذر تأكيد البحر، تم استخدام {sea_angle:.0f}°")
-                    return int(round(sea_angle))
+                    p1 = geometry[closest_idx - 1]
+                    p2 = geometry[closest_idx + 1]
+
+                # تقريب مركاتور للمسافات القصيرة
+                mid_lat = math.radians((p1["lat"] + p2["lat"]) / 2.0)
+                dlon = math.radians(p2["lon"] - p1["lon"]) * math.cos(mid_lat)
+                dlat = math.radians(p2["lat"] - p1["lat"])
+
+                coast_angle = math.atan2(dlon, dlat)  # راديان
+                sea_angle_rad = coast_angle + (math.pi / 2.0)
+                sea_bearing = (math.degrees(sea_angle_rad) + 360) % 360
+
+                logger.info(f"اتجاه البحر (OSM): {sea_bearing:.1f}° (نطاق {radius}m)")
+                return int(round(sea_bearing))
 
         except Exception as e:
             logger.warning(f"محاولة Overpass بنطاق {radius}m فشلت: {e}")
             continue
 
+    return None
+
+def find_nearest_beach_orientation(lat, lon, max_dist_km=10.0):
+    """إرجاع اتجاه أقرب شاطئ إذا كانت المسافة أقل من max_dist_km"""
+    min_dist = float('inf')
+    nearest_orient = None
+    for gov, beaches in TUNISIAN_BEACHES.items():
+        for b in beaches:
+            d = math.sqrt((b["lat"]-lat)**2 + (b["lon"]-lon)**2) * 111.0  # تقريب كم
+            if d < min_dist:
+                min_dist = d
+                nearest_orient = b["orientation"]
+    if nearest_orient is not None and min_dist < max_dist_km:
+        return nearest_orient
     return None
 
 async def get_bottom_type(lat, lon):
@@ -354,14 +351,20 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
+    # 1. OSM (الطريقة الأكثر دقة)
     orientation = await get_osm_orientation(req.latitude, req.longitude)
     if orientation is not None:
-        return {"orientation": orientation, "source": "osm_segment"}
+        return {"orientation": orientation, "source": "osm_coastline"}
 
-    # فشل OSM – لا نعود إلى قاعدة الشواطئ
+    # 2. أقرب شاطئ محلي إذا كان قريبًا جدًا
+    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
+    if orientation is not None:
+        return {"orientation": orientation, "source": "nearest_beach", "message": "تم التحديد من قاعدة الشواطئ المحلية."}
+
+    # 3. فشل
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي. الرجاء إدخال اتجاه الشاطئ يدويًا."}
 
-# ---------- التجميع الفيزيائي ----------
+# ---------- التجميع الفيزيائي (لم يتغير) ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
