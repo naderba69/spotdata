@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v8.0 (Professional integrated decision report)
+Surfcasting Analytics API – v13.0 (Final production‑ready, robust orientation)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, time
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="8.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="13.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -29,10 +29,9 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash-lite"   # نموذج مجاني
+MODEL_NAME = "google/gemini-2.5-flash-lite"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-
-USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"   # غيّر إلى بريدك
+USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"  # غيّر إلى بريدك الحقيقي
 
 cache = {}
 cache_lock = asyncio.Lock()
@@ -58,7 +57,6 @@ async def global_handler(request: Request, exc: Exception):
 def health():
     return {"status": "ok", "openrouter": bool(OPENROUTER_API_KEY), "model": MODEL_NAME, "mode": "client-side"}
 
-# ---------- أدوات الشبكة ----------
 async def post_with_retry(url: str, json_data: dict, headers: dict, max_retries: int = 3, timeout: float = 120.0) -> dict:
     for attempt in range(1, max_retries + 1):
         try:
@@ -185,7 +183,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
     return common, aligned
 
-# ---------- قاعدة الشواطئ الكاملة ----------
+# ---------- قاعدة الشواطئ المحلية ----------
 TUNISIAN_BEACHES = {
     "بنزرت": [
         {"name":"شاطئ الكورنيش (بنزرت)","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"},
@@ -253,18 +251,127 @@ TUNISIAN_BEACHES = {
     ],
 }
 
-def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
+# ---------- دوال الموقع والاتجاه ----------
+def destination_point(lat: float, lon: float, bearing_deg: float, distance_m: float) -> Tuple[float, float]:
+    """حساب نقطة الوجهة انطلاقاً من (lat, lon) باتجاه bearing_deg ومسافة distance_m (تقريب كروي بسيط)"""
+    R = 6371000  # متوسط نصف قطر الأرض
+    bearing_rad = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    d_over_R = distance_m / R
+    lat2 = math.asin(math.sin(lat1) * math.cos(d_over_R) + math.cos(lat1) * math.sin(d_over_R) * math.cos(bearing_rad))
+    lon2 = math.radians(lon) + math.atan2(math.sin(bearing_rad) * math.sin(d_over_R) * math.cos(lat1),
+                                         math.cos(d_over_R) - math.sin(lat1) * math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
+
+async def is_point_in_sea(lat: float, lon: float) -> Optional[bool]:
+    """التحقق من أن نقطة لا تحوي خطاً ساحلياً قريباً (أي تقع في البحر)"""
+    query = f"""[out:json];(way(around:200,{lat},{lon})["natural"="coastline"];);out count;"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            return len(data.get("elements", [])) == 0
+    except:
+        return None
+
+async def get_osm_orientation(lat: float, lon: float) -> Optional[int]:
+    """
+    تحديد اتجاه الشاطئ نحو البحر باستخدام OpenStreetMap.
+    - تبحث عن أقرب نقطة على الخط الساحلي.
+    - تحسب زاوية المماس باستخدام النقاط المجاورة (مع تصحيح ميركاتور).
+    - تختبر الاتجاهين (±90°) وتختار الذي يشير إلى البحر.
+    """
+    for radius in [500, 1000, 2000, 5000]:
+        query = f"""
+        [out:json];
+        way["natural"="coastline"](around:{radius}, {lat}, {lon});
+        out geom;
+        """
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                elements = data.get("elements", [])
+                if not elements:
+                    continue
+
+                best_dist = float('inf')
+                best_p1 = None
+                best_p2 = None
+
+                # البحث عن أقرب نقطة عبر جميع الخطوط
+                for el in elements:
+                    geom = el.get("geometry", [])
+                    if len(geom) < 2:
+                        continue
+                    for i, pt in enumerate(geom):
+                        dist = math.sqrt((pt["lat"] - lat) ** 2 + (pt["lon"] - lon) ** 2)
+                        if dist < best_dist:
+                            best_dist = dist
+                            # اختيار النقطتين المجاورتين (أو النقطة التالية/السابقة)
+                            if i == 0:
+                                best_p1 = pt
+                                best_p2 = geom[i + 1]
+                            elif i == len(geom) - 1:
+                                best_p1 = geom[i - 1]
+                                best_p2 = pt
+                            else:
+                                best_p1 = geom[i - 1]
+                                best_p2 = geom[i + 1]
+
+                if best_p1 is None or best_p2 is None:
+                    continue
+
+                # حساب زاوية المماس (بالتصحيح الميركاتوري)
+                dlon_deg = best_p2["lon"] - best_p1["lon"]
+                dlat_deg = best_p2["lat"] - best_p1["lat"]
+                mid_lat_rad = math.radians((best_p1["lat"] + best_p2["lat"]) / 2.0)
+                dlon = math.radians(dlon_deg) * math.cos(mid_lat_rad)
+                dlat = math.radians(dlat_deg)
+                coast_angle_rad = math.atan2(dlon, dlat)
+                coast_angle = (math.degrees(coast_angle_rad) + 360) % 360
+
+                # الاتجاهان العموديان المحتملان نحو البحر
+                cand1 = (coast_angle + 90) % 360
+                cand2 = (coast_angle - 90) % 360
+
+                # اختبار أي الاتجاهين بحر على بعد 200م
+                test_lat1, test_lon1 = destination_point(lat, lon, cand1, 200)
+                test_lat2, test_lon2 = destination_point(lat, lon, cand2, 200)
+
+                sea1 = await is_point_in_sea(test_lat1, test_lon1)
+                sea2 = await is_point_in_sea(test_lat2, test_lon2)
+
+                if sea1 is True and sea2 is not True:
+                    return int(round(cand1))
+                elif sea2 is True and sea1 is not True:
+                    return int(round(cand2))
+                else:
+                    # إذا فشل الاختباران نستخدم قاعدة OSM (cand1 = coast_angle + 90)
+                    return int(round(cand1))
+
+        except Exception:
+            continue
+
+    return None
+
+def find_nearest_beach_orientation(lat: float, lon: float, max_dist_km: float = 5.0) -> Optional[int]:
+    """إرجاع اتجاه أقرب شاطئ إذا كانت المسافة أقل من max_dist_km"""
     min_dist = float('inf')
     nearest_orient = None
     for gov, beaches in TUNISIAN_BEACHES.items():
         for b in beaches:
-            dist = math.sqrt((b["lat"] - lat)**2 + (b["lon"] - lon)**2)
-            if dist < min_dist:
-                min_dist = dist
+            d = math.sqrt((b["lat"]-lat)**2 + (b["lon"]-lon)**2) * 111.0
+            if d < min_dist:
+                min_dist = d
                 nearest_orient = b["orientation"]
-    return nearest_orient
+    if nearest_orient is not None and min_dist < max_dist_km:
+        return nearest_orient
+    return None
 
-async def get_bottom_type(lat, lon):
+async def get_bottom_type(lat: float, lon: float) -> str:
     query = f"""[out:json];(node(around:500,{lat},{lon})["surface"="sand"];node(around:500,{lat},{lon})["natural"="beach"];node(around:500,{lat},{lon})["surface"="gravel"];node(around:500,{lat},{lon})["surface"="rock"];);out body;"""
     try:
         async with httpx.AsyncClient() as c:
@@ -277,24 +384,6 @@ async def get_bottom_type(lat, lon):
             return "sandy"
     except: return "sandy"
 
-async def get_auto_orientation_overpass(lat, lon):
-    query = f"""[out:json];(way(around:5000,{lat},{lon})["natural"="coastline"];);out geom;"""
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
-            r.raise_for_status()
-            els = r.json().get("elements", [])
-            if not els: return 0
-            for el in els:
-                geom = el.get("geometry", [])
-                if geom and len(geom) >= 2:
-                    p1,p2 = geom[0], geom[-1]
-                    dx = p2["lon"] - p1["lon"]; dy = p2["lat"] - p1["lat"]
-                    angle = (math.degrees(math.atan2(dx, dy)) + 360) % 360
-                    return int(round((angle + 90) % 360))
-            return 0
-    except: return 0
-
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
@@ -303,13 +392,18 @@ async def detect_bottom_type(request: Request, req: AutoOrientationRequest):
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
-    orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
-    if orientation != 0:
-        return {"orientation": orientation, "source": "overpass"}
+    # 1. OSM (الأدق)
+    orientation = await get_osm_orientation(req.latitude, req.longitude)
+    if orientation is not None:
+        return {"orientation": orientation, "source": "osm_verified"}
+
+    # 2. أقرب شاطئ محلي (احتياط)
     orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
     if orientation is not None:
-        return {"orientation": orientation, "source": "nearest_beach"}
-    return {"orientation": -1, "source": "none", "message": "لم نتمكن من تحديد الاتجاه تلقائياً."}
+        return {"orientation": orientation, "source": "nearest_beach", "message": "تم التحديد من قاعدة الشواطئ المحلية."}
+
+    # 3. فشل
+    return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي. الرجاء إدخال اتجاه الشاطئ يدويًا."}
 
 # ---------- التجميع الفيزيائي ----------
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
@@ -413,8 +507,6 @@ def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     moon = agg["extra_info"]
     orient = req.beach_orientation
-
-    # --- تحليل موحد للزوايا ---
     angle_summary = []
     for b in agg["blocks"]:
         sa = b.get("swell_angle_diff")
@@ -422,8 +514,6 @@ def build_context(req, agg, tz_name):
         sa_desc = "عمودي" if sa is not None and 70 <= sa <= 110 else "مائل"
         wa_desc = "عمودي" if wa is not None and 70 <= wa <= 110 else "مائل"
         angle_summary.append(f"{b['name']}: Swell {b['swell_dir']} ({sa_desc})، موج محلي {b['wave_dir']} ({wa_desc})")
-
-    # --- تحليل موحد للدورة ---
     period_summary = []
     for b in agg["blocks"]:
         p = b.get("swell_period")
@@ -434,13 +524,9 @@ def build_context(req, agg, tz_name):
             period_summary.append(f"{b['name']}: {p}s ({desc})")
         else:
             period_summary.append(f"{b['name']}: دورة غير معروفة")
-
-    # --- تحليل موحد للرياح ---
     wind_summary = []
     for b in agg["blocks"]:
         wind_summary.append(f"{b['name']}: {b['wind_dir']} {b['wind_speed']} كم/س (هبات {b['wind_gust_peak']})، {b['wind_trend']}")
-
-    # --- تحليل الضغط ---
     press_avg = moon.get("pressure_avg", 1013)
     press_change = moon.get("pressure_change_3h", 0)
     if press_change < -0.5:
@@ -449,13 +535,10 @@ def build_context(req, agg, tz_name):
         press_trend = "في ارتفاع (الأسماك قد تكون خاملة)"
     else:
         press_trend = "مستقر"
-
-    # --- تقييم أولي آلي لمساعدة النموذج ---
     swell_ok = all(b.get("swell_height") and float(b["swell_height"].split("-")[1]) <= 1.3 for b in agg["blocks"])
     period_ok = all(b.get("swell_period") and b["swell_period"] >= 7 for b in agg["blocks"])
-    wind_ok = all(b.get("wind_speed") and float(b["wind_speed"].split("-")[1]) <= 33 for b in agg["blocks"])  # 18 عقدة ≈ 33 كم/س
-    pressure_ok = press_change <= 0  # مستقر أو ينخفض
-
+    wind_ok = all(b.get("wind_speed") and float(b["wind_speed"].split("-")[1]) <= 33 for b in agg["blocks"])
+    pressure_ok = press_change <= 0
     score = sum([swell_ok, period_ok, wind_ok, pressure_ok])
     if score == 4:
         verdict = "مثالية (Go)"
@@ -465,7 +548,6 @@ def build_context(req, agg, tz_name):
         verdict = "مقبولة بشروط (Go بحذر)"
     else:
         verdict = "سيئة (No-Go)"
-
     lines = [
         f"شاطئ {beach} (اتجاه {orient}°) - {req.target_date} - توقيت {tz_name}",
         f"حرارة الماء: {agg['avg_sst']}°م | القمر: {moon['moon_status']} ({moon['moon_phase']})",
