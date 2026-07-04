@@ -29,7 +29,7 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash"
+MODEL_NAME = "google/gemini-2.0-flash-exp"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"  # غيّر إلى بريدك
