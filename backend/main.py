@@ -1,6 +1,6 @@
 """
-Surfcasting Analytics API – v11.0 (The Absolute Reality Check)
-يمنع ربط الظروف الضعيفة بالتأثيرات القوية (منع الهذيان الفيزيائي).
+Surfcasting Analytics API – v11.0.1 (Production-Ready)
+Fixed Vector Mapping Error & Hardened Index Bounds.
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="11.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="11.0.1")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -49,7 +49,7 @@ async def global_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "11.0.0"}
+def health(): return {"status": "ok", "version": "11.0.1"}
 
 # ==================== أدوات الشبكة والرياضيات ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -167,41 +167,28 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
     }
 
 # ==================== قاعدة الشواطئ ====================
-TUNISIAN_BEACHES = {
-    "نابل": [
-        {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ ياسمين الحمامات","lat":36.3800,"lon":10.5500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ الحمامات الجنوبي","lat":36.3500,"lon":10.5500,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
-        {"name":"شاطئ بني خيار","lat":36.4833,"lon":10.7833,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ منزل تميم","lat":36.7000,"lon":10.9500,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ المعمورة","lat":36.5500,"lon":10.6000,"orientation":90,"type":"sandy"},
-    ],
-    "تونس": [
-        {"name":"شاطئ حلق الوادي","lat":36.8167,"lon":10.3167,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ قرطاج","lat":36.8528,"lon":10.3264,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ المرسى","lat":36.8764,"lon":10.3253,"orientation":45,"type":"sandy"},
-    ],
-    "سوسة": [
-        {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
-        {"name":"شاطئ القنطاوي","lat":35.8833,"lon":10.6000,"orientation":90,"type":"sandy"},
-    ],
-    "بن عروس": [
-        {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
-        {"name":"شاطئ حمام الشط","lat":36.6833,"lon":10.3833,"orientation":90,"type":"sandy"},
-    ],
-}
+TUNISIAN_BEACHES = [
+    {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ ياسمين الحمامات","lat":36.3800,"lon":10.5500,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
+    {"name":"شاطئ المعمورة","lat":36.5500,"lon":10.6000,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ قرطاج","lat":36.8528,"lon":10.3264,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ المرسى","lat":36.8764,"lon":10.3253,"orientation":45,"type":"sandy"},
+    {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ القنطاوي","lat":35.8833,"lon":10.6000,"orientation":90,"type":"sandy"},
+    {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
+    {"name":"شاطئ حلق الوادي","lat":36.8167,"lon":10.3167,"orientation":0,"type":"sandy"},
+]
 
 def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
     min_dist = float('inf')
     nearest_orient = None
-    for gov, beaches in TUNISIAN_BEACHES.items():
-        for b in beaches:
-            dist = calc_distance(b["lat"], b["lon"], lat, lon)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_orient = b["orientation"]
-    return nearest_orient if min_dist < 20000 else None
+    for b in TUNISIAN_BEACHES:
+        dist = calc_distance(b["lat"], b["lon"], lat, lon)
+        if dist < min_dist and dist < 20000:
+            min_dist = dist
+            nearest_orient = b["orientation"]
+    return nearest_orient
 
 async def get_auto_orientation_overpass(lat, lon):
     for radius in [3000, 5000, 10000]:
@@ -242,7 +229,7 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
-# ==================== محرك التجميع الفيزيائي (v11.0) ====================
+# ==================== محرك التجميع الفيزيائي (v11.0.1) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -308,15 +295,17 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 elif diff_sst_past > 1.5: sst_trend = f"ارتفاع حاد ({diff_sst_past:.1f}°م)."
 
     # ==========================================
-    # الإصلاح الجذري (v11.0): حساب القوة كمتجهات مع "عتبة الصفر"
+    # الإصلاح الجذري: حساب القوة كمتجهات مع "عتبة الصفر"
     # ==========================================
     lateral_fx = 0.0
     lateral_fy = 0.0
     max_wh = max(wh) if wh else 0.0
     
-    for i in target_idx:
-        if wd_wave[i] != 0:
-            angle = math.radians(angle_diff(wd_wave[i], orient))
+    # الإصلاح (v11.0.1): المرور على المؤشرات المحلية للمصفوفات المستخرجة (0 إلى length-1)
+    for i in range(len(wh)):
+        w_dir = wd_wave[i] if i < len(wd_wave) else 0.0
+        if w_dir != 0:
+            angle = math.radians(angle_diff(w_dir, orient))
             force = wh[i] * wh[i] 
             lateral_fx += force * math.sin(angle)
             lateral_fy += force * math.cos(angle)
@@ -325,7 +314,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     lateral_force_ratio = abs(lateral_fx) / total_force if total_force > 0 else 0
     avg_wave_h = sum(wh) / len(wh) if wh else 0
 
-    # فلتر العتبة المطلقة: إذا كان الموج أقل من 0.4م، لا يوجد تيار فعلي مهما كانت الزاوية
+    # فلتر العتبة المطلقة
     is_mirror_sea = max_wh < 0.4
     
     if is_mirror_sea:
@@ -351,7 +340,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if sum(aligned["swell_wave_height"][i] for i in valid_strat)/len(valid_strat) < 0.2 and sum(aligned["wind_speed_10m"][i] for i in valid_strat)/len(valid_strat) < 10.0:
                 stratification_risk = "مرتفع (بحر مسطح)"
 
-    cross_angles = [angle_diff(swd[i], wd_wave[i]) for i in range(len(swd)) if swd[i] != 0 and wd_wave[i] != 0]
+    cross_angles = [angle_diff(swd[i], wd_wave[i]) for i in range(len(swd)) if swd[i] != 0 and i < len(wd_wave) and wd_wave[i] != 0]
     if cross_angles and not is_mirror_sea:
         avg_cross, max_cross = sum(cross_angles) / len(cross_angles), max(cross_angles)
         if max_cross > 60 and avg_cross > 40: cross_sea_risk = "بحر مختلط وخطير"
@@ -464,10 +453,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     for i in range(len(wh)):
         hh = all_times[target_idx[i]].strftime("%H:%M")
         if wave_power[i] > 3 or wh[i] > 1.8 or wg[i] > 50 or pr[i] < 1005: reds.append(hh)
-        # تعديل الساعات الخضراء لاستبعاد "بحر المرآة" نهاراً
         is_night = all_times[target_idx[i]].hour < 6 or all_times[target_idx[i]].hour > 19
         if 0.3 <= wh[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and ws[i] < 27.8:
-            if is_mirror_sea and not is_night: continue # استبعاد النهار إذا كان البحر مرآة
+            if is_mirror_sea and not is_night: continue 
             greens.append(hh)
         
     avg_press = sum(pr)/len(pr) if pr else 0
@@ -502,7 +490,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "transitions": transitions
     }
 
-# ==================== محرك التفاعلات (v11.0) ====================
+# ==================== محرك التفاعلات (v11.0.1) ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     hf = agg["hidden_factors"]
@@ -511,7 +499,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     extra = agg["extra_info"]
     is_mirror_sea = extra.get("is_mirror_sea", False)
     
-    # 1. تفاعل "بحر المرآة" (الجديد)
     if is_mirror_sea:
         interactions.append("[تفاعل البحر المرآوي] الموج أقل من 0.4م. قوة الدفع المائي شبه معدومة. التيار الجانبي مستحيل فيزيائياً. الرؤية تحت الماء في أعلى مستوياتها.")
         if extra.get("max_air_temp", 0) > 28:
@@ -520,9 +507,8 @@ def calculate_interactions(agg: dict) -> List[str]:
         else:
             interactions.append("[تفاعل الليل] مع غياب الشمس ليلاً، يُسمح بالصيد ولكن بأسلوب الدقة (خيط رفيع، طعم صغير) لأن السمك سيرى الخط بوضوح.")
             interactions.append("[الحسم النهائي - Go مشروط ليلاً] يمكن الصيد ليلاً فقط وبشروط صارمة.")
-        return interactions # نوقف باقي التفاعلات لأن البحر ميت
+        return interactions
 
-    # 2. تفاعل ميكانيكا الرمية (للبحار غير الميتة)
     for b in blocks:
         wind_is_onshore = "بحرية" in b["wind_dir"]
         wave_is_straight = b.get("wave_angle_diff") is not None and b["wave_angle_diff"] < 60
@@ -535,19 +521,16 @@ def calculate_interactions(agg: dict) -> List[str]:
         if "تقاطع" in b.get("swell_wave_interaction", ""):
             interactions.append(f"[تفاعل ميكانيكي - {b['name']}] {b['swell_wave_interaction']} فوضى عشوائية في حركة الماء.")
 
-    # 3. تفاعل الثبات
     if "جارف قوي" in lateral:
         interactions.append("[تفاعل الثبات] تيار جانبي قوي. استنتاج ميكانيكي: رصاصة أقل من 150 غرام ستنجرف خارج نطاق الرؤية.")
     elif "ضعيف" in lateral or "معدوم" in lateral:
         interactions.append("[تفاعل الثبات] غياب تيار جانبي. استنتاج ميكانيكي: رصاصة 80-120 غرام كافية تماماً، الثقل الزائد سيضر بالمسافة دون فائدة.")
 
-    # 4. تفاعل الضغط الصحيح بيولوجياً
     if "ارتفاع حاد" in agg["pressure_state"]:
         interactions.append("[تفاعل الفسيولوجيا] ارتفاع حاد في الضغط = توقف فوري للتغذية (المثانة الهوائية ممتلئة).")
     elif "انخفاض حاد" in agg["pressure_state"]:
         interactions.append("[تفاعل الفسيولوجيا] انخفاض حاد = نافذة ذهبية للتغذية العنيفة.")
 
-    # 5. الحسم النهائي
     if "خطير" in hf["cross_sea_risk"]: interactions.append("[الحسم النهائي - No-Go] بحر مختلط خطير يمنع السيطرة.")
     elif len(agg["red_flags"]) >= 4: interactions.append(f"[الحسم النهائي - No-Go] هيجان متواصل ({len(agg['red_flags'])} ساعات خطر).")
     elif len(agg["green_flags"]) >= 3 and "معدوم" in lateral and "توقف" not in agg["pressure_state"]: interactions.append("[الحسم النهائي - Go] ظروف ميكانيكية مثالية (ثبات + نشاط).")
@@ -555,7 +538,7 @@ def calculate_interactions(agg: dict) -> List[str]:
 
     return interactions
 
-# ==================== بناء السياق (v11.0) ====================
+# ==================== بناء السياق (v11.0.1) ====================
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     orient = req.beach_orientation
