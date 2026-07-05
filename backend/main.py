@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v10.1 (Production‑Ready, All Fixes & Enhancements)
+Surfcasting Analytics API – v10.2 (Strict & Realistic Decision‑Ready Reports)
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="10.1.0")
+app = FastAPI(title="Surfcasting Analytics", version="10.2.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -31,7 +31,6 @@ MODEL_NAME = "google/gemini-2.5-flash-lite"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
-# ==================== النماذج ====================
 class AutoOrientationRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -49,7 +48,7 @@ async def global_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "10.1.0"}
+def health(): return {"status": "ok", "version": "10.2.0"}
 
 # ==================== أدوات الشبكة والرياضيات ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -285,7 +284,7 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
-# ==================== محرك التجميع الفيزيائي المتقدم (v10.1) ====================
+# ==================== محرك التجميع الفيزيائي المتقدم (v10.2) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -310,7 +309,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
     
-    # 1. ذاكرة البحر (مُحسَّنة)
+    # 1. ذاكرة البحر
     sea_memory = "بحر صافي وهادئ (لا توجد عوامل تعكير سابقة)"
     past_avg, past_sh = 0.0, 0.0
     sudden_wind_shift = False
@@ -340,14 +339,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if past_rain > 10.0:
                 sea_memory += " | سيول: أمطار غزيرة سابقة أدخلت مياه عذبة وطينية للساحل."
 
-            # مؤشر تغير الرياح المفاجئ
             if len(valid_past) >= 6:
                 first_half_wd = [p_wd[i] for i in valid_past[:len(valid_past)//2]]
                 second_half_wd = [p_wd[i] for i in valid_past[len(valid_past)//2:]]
                 if angle_diff(sum(first_half_wd)/len(first_half_wd), sum(second_half_wd)/len(second_half_wd)) > 90:
                     sudden_wind_shift = True
 
-            # مؤشر انخفاض حرارة الماء (مقارنة آخر 24 ساعة بالـ 24 ساعة الأقدم)
             past_sst_vals = [p_sst[i] for i in valid_past if i < len(p_sst)]
             if len(past_sst_vals) >= 12:
                 half = len(past_sst_vals)//2
@@ -362,7 +359,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                     elif diff_sst_past > 1.5:
                         sst_trend = f"ارتفاع حاد في حرارة الماء ({diff_sst_past:.1f}°م). قد ينشط الأسماك السطحية."
 
-    # 2. ميكانيكا التيار الجانبي
+    # 2. التيار الجانبي
     valid_wd_wave = [angle_diff(w, orient) for w in wd_wave if w != 0]
     avg_wave_angle = sum(valid_wd_wave) / len(valid_wd_wave) if valid_wd_wave else 90
     lateral_force = math.sin(math.radians(avg_wave_angle))
@@ -372,7 +369,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     elif lateral_force > 0.5 and avg_wave_h > 0.4: lateral_current = "تيار جانبي متوسط: سيحدث انجراف تدريجي للطعم. يجب مراقبة خيط الخط وتعديل الثقل."
     else: lateral_current = "تيار جانبي ضعيف أو معدوم: الموج يدفع للخلف وللأمام (عمودي)، الرصاصة ستثبت جيداً في القاع دون انجراف عرضي."
 
-    # 3. العوامل الخفية (مُطوَّرة)
+    # 3. العوامل الخفية
     freshwater_risk = "منخفض"
     stratification_risk = "منخفض"
     cross_sea_risk = "منخفض"
@@ -390,7 +387,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if avg_p_swh < 0.2 and avg_p_ws < 10.0:
                 stratification_risk = "مرتفع (بحر مسطح لفترة طويلة، القاع يفقد الأكسجين والسمك يصبح خاملاً)"
 
-    # تحليل البحر المختلط (Cross Sea)
     cross_angles = []
     for i in range(len(swd)):
         if swd[i] != 0 and wd_wave[i] != 0:
@@ -403,7 +399,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         elif max_cross > 45:
             cross_sea_risk = "بحر مختلط متوسط: بعض التضارب بين السويل والموج المحلي. طاقة مشوهشة ومتقلل ثبات الرمية."
 
-    # الرؤية والضباب
     valid_vis = [v for v in vis if v > 0]
     if valid_vis:
         min_vis = min(valid_vis)
@@ -490,6 +485,17 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         swell_angle = angle_diff(avg_swd, orient) if avg_swd else None
         wave_angle = angle_diff(avg_wave_dir, orient) if avg_wave_dir else None
         
+        # (جديد) وصف تفاعل السويل والموج المحلي
+        swell_wave_interaction = ""
+        if swell_angle is not None and wave_angle is not None:
+            diff_sw = angle_diff(avg_swd, avg_wave_dir) if avg_swd and avg_wave_dir else 0
+            if diff_sw > 40:
+                swell_wave_interaction = f"السويل والموج المحلي يتقاطعان بزاوية ({diff_sw:.0f}°) مما يخلق بحراً مختلطاً يضاعف التيار الجانبي."
+            else:
+                swell_wave_interaction = "السويل والموج المحلي متوافقان في الاتجاه، البحر منتظم."
+        else:
+            swell_wave_interaction = "لا توجد بيانات كافية لتقييم تفاعل السويل والموج المحلي."
+        
         block_data = {
             "name":{"morning":"الصباح","afternoon":"الظهر","night":"الليل"}[key],
             "time_range":f"{all_times[target_idx[idxs[0]]].strftime('%H:%M')}-{all_times[target_idx[idxs[-1]]].strftime('%H:%M')}",
@@ -499,6 +505,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "swell_angle_diff": round(swell_angle,0) if swell_angle is not None else None,
             "wave_dir": deg_to_compass(avg_wave_dir) if avg_wave_dir else "غير معروف",
             "wave_angle_diff": round(wave_angle,0) if wave_angle is not None else None,
+            "swell_wave_interaction": swell_wave_interaction,
             "swell_dominance":swell_dom,"wind_speed":f"{min_w:.1f}-{max_w:.1f}","wind_gust_peak":round(max(wg[i] for i in idxs),1),
             "wind_dir":wc_dom,"wind_trend":wind_trend,"air_temp":round(avg_air,1),"precip":round(total_precip,1),
             "weather":weather_desc(most_code)
@@ -506,7 +513,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         blocks.append(block_data)
         raw_blocks_meta.append({"name": block_data["name"], "max_h": max_h, "avg_swp": avg_swp, "wind_cls": wc_dom})
 
-    # 5. التطور الديناميكي للظروف خلال اليوم
     transitions = []
     for i in range(len(raw_blocks_meta) - 1):
         b1, b2 = raw_blocks_meta[i], raw_blocks_meta[i+1]
@@ -533,7 +539,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     avg_press = sum(pr)/len(pr) if pr else 0
     press_change = pr[-1] - pr[-4] if len(pr) >= 4 else (pr[-1] - pr[0] if len(pr) > 1 else 0)
 
-    # تحليل الضغط المُطوَّر (قيمة مطلقة + تغير)
     if avg_press > 1025: press_abs_desc = "مرتفع جداً"; press_abs_effect = "الأسماك خاملة وكسولة بغض النظر عن التغير"
     elif avg_press < 1008: press_abs_desc = "منخفض جداً"; press_abs_effect = "إشارة خطر للأسماك، تدفعها للتغذية حتى لو كان التغير طفيفاً"
     else: press_abs_desc = "معتدل"; press_abs_effect = "لا تأثير سلبي مباشر"
@@ -562,7 +567,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "transitions": transitions
     }
 
-# ==================== بناء سياق التفاعلات ====================
+# ==================== بناء سياق صارم (v10.2) ====================
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     orient = req.beach_orientation
@@ -576,6 +581,9 @@ def build_context(req, agg, tz_name):
         f"ميكانيكا الموج والتيار الجانبي: {agg['lateral_current']}",
         f"حالة الضغط الجوي: {agg['pressure_state']}"
     ]
+    # (جديد) تنبيه صريح عن التيار
+    if "ضعيف" in agg["lateral_current"]:
+        interactions.append("✅ لا يوجد تيار جانبي مؤثر اليوم – الرصاصة ستثبت بأوزان عادية دون الحاجة لثقل مبالغ فيه.")
     if hf.get("weed_risk"): interactions.append("🚨 خطر الأعشاب: البوسيدونيا مقتلعة وتتجه للشاطئ.")
     if hf.get("clarity_risk"): interactions.append("⚠️ الماء عكر وغير صافٍ.")
     if hf.get("sudden_wind_shift"): interactions.append("⚠️ تغير مفاجئ في اتجاه الرياح خلال الساعات الماضية، الأسماك متوترة.")
@@ -592,7 +600,8 @@ def build_context(req, agg, tz_name):
         sa = b.get("swell_angle_diff"); wa = b.get("wave_angle_diff")
         sa_desc = "عمودي" if sa is not None and 70 <= sa <= 110 else "مائل"
         wa_desc = "عمودي" if wa is not None and 70 <= wa <= 110 else "مائل"
-        interactions.append(f"في {b['name']}: البحر {b['sea_state']}، السويل {b['swell_dir']} ({sa_desc})، الموج المحلي {b['wave_dir']} ({wa_desc})، الرياح {b['wind_dir']} {b['wind_speed']}كم/س ({b['wind_trend']}). حرارة الهواء {b['air_temp']}°م، السماء {b['weather']}.")
+        # (جديد) إضافة تفاعل السويل والموج
+        interactions.append(f"في {b['name']}: البحر {b['sea_state']}، السويل {b['swell_dir']} ({sa_desc})، الموج المحلي {b['wave_dir']} ({wa_desc}) – {b['swell_wave_interaction']} الرياح {b['wind_dir']} {b['wind_speed']}كم/س ({b['wind_trend']}). حرارة الهواء {b['air_temp']}°م، السماء {b['weather']}.")
 
     if agg.get("transitions"):
         interactions.extend(["", "=== التطور الديناميكي للظروف خلال اليوم ==="])
@@ -618,15 +627,17 @@ def build_context(req, agg, tz_name):
 SYSTEM_PROMPT = """أنت عالم أحياء بحرية ومحلل فيزيائي متخصص حصرياً في صيد السرفكاستينغ (Surfcasting) في البحر المتوسط (تونس).
 مهمتك: تحويل التفاعلات الفيزيائية المعطاة إلى تقرير استنتاجي طويل ومفصل بالدارجة التونسية.
 
-قواعد صارمة:
+قواعد صارمة جداً:
 1.  **الربط الإجباري:** كل جملة يجب أن تربط بين ظاهرة فيزيائية وتأثيرها المباشر على ميكانيكية الصيد (الرمي، ثبات الرصاص، انجراف الطعم، رؤية السمك للطعم، سلوك السمك). لا تكتب جملة منعزلة.
 2.  **تحليل الذاكرة البحرية:** ابدأ بتحليل حالة الماء اليوم بناءً على الأيام السابقة (العكر، الأعشاب، الأمطار) واشرح كيف ستؤثر على اختيارك للطعم ومكان الرمي.
-3.  **تحليل الزوايا والتيار:** اذكر زوايا الموج (عمودي/مائل) في كل فترة، واشرح بالتفصيل كيف ستخلق تياراً جانبياً (جرار) يجرف الرصاص. اربط ذلك مباشرة بوزن الرصاصة المطلوبة.
+3.  **تحليل الزوايا والتيار:** اذكر زوايا الموج (عمودي/مائل) في كل فترة، واشرح بالتفصيل كيف ستخلق تياراً جانبياً (جرار) يجرف الرصاص. اربط ذلك مباشرة بوزن الرصاصة المطلوبة. إذا كان التيار الجانبي "ضعيف أو معدوم"، يجب أن تبدأ التوصية بـ "بما أنه لا يوجد تيار جانبي (جرار) اليوم..." ثم تستنتج الوزن المناسب (الخفيف).
 4.  **تحليل الضغط الجوي:** استخدم وصف الضغط الجوي المُعطى (الذي يحوي القيمة المطلقة والتغير) لتحديد مستوى نشاط الأسماك. لا تهمل القيمة المطلقة.
 5.  **القرار النهائي:** يجب أن يكون في السطر الأول: "Go" أو "No-Go". إذا كان "Go"، حدد متى بالضبط. إذا كان "No-Go"، اذكر السبب الرئيسي بوضوح.
 6.  **الأسلوب:** واقعي، قاسٍ، لا يجامل. استخدم الدارجة التونسية الاحترافية. لا تذكر أبداً عبارات مثل "حسب المعطيات" أو "بناءً على البيانات".
+7.  **تفاعل السويل والموج المحلي:** إذا ذكر التحليل أن "السويل والموج المحلي يتقاطعان بزاوية..."، يجب أن تشرح كيف سيؤثر ذلك على شكل البحر واستقرار الطعم.
+8.  **لا تخمن أوزاناً ثقيلة دون مبرر:** إذا كان التيار الجانبي ضعيفاً، فالوزن المثالي هو 80-120 غرام. لا تقترح 150 غرام أو أكثر إلا إذا كان هناك تيار جانبي قوي أو أمواج عالية.
 
-اكتب تقريراً واحداً متصلاً، طويلاً، عميقاً، يشرح "لماذا" و"كيف" سيحدث كل شيء."""
+اكتب تقريراً واحداً متصلاً، طويلاً، عميقاً، يشرح "لماذا" و"كيف" سيحدث كل شيء. كن دقيقاً، لا مجال للخطأ."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
