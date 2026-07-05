@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v9.0 (Expert Decision Matrix & Synthesis Engine)
+Surfcasting Analytics API – v9.6.1 (Hotfix - Index Out of Bounds)
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="9.0.0")
+app = FastAPI(title="Surfcasting Analytics", version="9.6.1")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -31,6 +31,7 @@ MODEL_NAME = "google/gemini-2.5-flash-lite"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
+# ==================== النماذج (Pydantic) ====================
 class AutoOrientationRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -48,9 +49,9 @@ async def global_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "9.0.0"}
+def health(): return {"status": "ok", "version": "9.6.1"}
 
-# ==================== أدوات الشبكة والرياضيات ====================
+# ==================== أدوات الشبكة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
     for attempt in range(1, max_retries + 1):
         try:
@@ -65,6 +66,7 @@ async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0)
             if attempt < max_retries: await asyncio.sleep(2 ** attempt); continue
             raise
 
+# ==================== أدوات رياضية ومساعدة ====================
 def safe_float(v):
     try: return 0.0 if math.isnan(float(v)) else float(v)
     except: return 0.0
@@ -119,6 +121,29 @@ def resolve_target_date(txt, real_today):
     if txt == "tomorrow": return real_today + timedelta(days=1)
     return real_today + timedelta(days=2)
 
+# ==================== محرك العوامل الخفية ====================
+def calc_wave_steepness(h, p):
+    if not p or p <= 0: return 0.0
+    return h / (1.56 * (p ** 2))
+
+def check_freshwater_risk(past_idx, precip_array):
+    if not past_idx: return "منخفض"
+    valid = [i for i in past_idx if i < len(precip_array)]
+    if not valid: return "منخفض"
+    total_rain = sum(precip_array[i] for i in valid)
+    if total_rain > 15.0: return "مرتفع جداً (سيول ومياه عذبة طافية تغطي السطح وتمنع الأكسجين والرؤية)"
+    if total_rain > 5.0: return "مرتفع (طبقة مياه عذبة خفيفة على السطح قد تربك الأسماك السطحية)"
+    return "منخفض"
+
+def check_stratification_risk(past_idx, past_swh_array, past_ws_array):
+    if not past_idx: return "منخفض"
+    valid = [i for i in past_idx if i < len(past_swh_array) and i < len(past_ws_array)]
+    if not valid: return "منخفض"
+    avg_swh = sum(past_swh_array[i] for i in valid) / len(valid)
+    avg_ws = sum(past_ws_array[i] for i in valid) / len(valid)
+    if avg_swh < 0.2 and avg_ws < 10.0: return "مرتفع (بحر مسطح لفترة طويلة، غياب اختلاط المياه يجعل القاع يفقد الأكسجين والسمك يصبح خاملاً)"
+    return "منخفض"
+
 # ==================== تحليل القمر والمد ====================
 def get_moon_and_tide_analysis(d: date):
     y, m, day = d.year, d.month, d.day
@@ -129,13 +154,10 @@ def get_moon_and_tide_analysis(d: date):
     phase = (days_since_new % 29.53058867) / 29.53058867
     idx = int(phase * 8) % 8
     names = {0:"محاق",1:"هلال أول",2:"تربيع أول",3:"أحدب متزايد",4:"بدر",5:"أحدب متناقص",6:"تربيع ثاني",7:"هلال آخر"}
-    
-    # تحديد قوة المد (Spring / Neap)
     if idx in [0, 4]: tide_strength = "مد وجزر قوي جداً (Spring Tides)"
-    elif idx in [2, 6]: tide_strength = "مد وجزر ضعيف جداً (Neap Tides)"
+    elif idx in [2, 6]: tide_strength = "مد وجزر ضعيف (Neap Tides)"
     else: tide_strength = "مد وجزر متوسط"
-    
-    return {"name": names[idx], "phase_decimal": phase, "tide_strength": tide_strength, "idx": idx}
+    return {"name": names[idx], "tide_strength": tide_strength, "idx": idx}
 
 # ==================== مزامنة البيانات ====================
 def align_hourly_data(marine_hourly, weather_hourly, tz_name):
@@ -167,11 +189,10 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "precipitation": extract("precipitation", weather_hourly, w_map), "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== OSM الشواطئ والاتجاهات ====================
-TUNISIAN_BEACHES = { # نفس قاعدة البيانات السابقة، تم اختصارها هنا لتوفير المساحة
+# ==================== OSM الاتجاهات ====================
+TUNISIAN_BEACHES = {
     "بنزرت": [{"name":"شاطئ الكورنيش","lat":37.2744,"lon":9.8739,"orientation":45,"type":"sandy"}],
     "نابل": [{"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"}],
-    # أضف باقي الشواطئ من الكود السابق هنا إذا أردت
 }
 
 async def get_auto_orientation_overpass(lat, lon):
@@ -209,8 +230,8 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     if orientation != 0: return {"orientation": orientation, "source": "overpass"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
-# ==================== محرك التجميع الفيزيائي المتقدم ====================
-def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
+# ==================== محرك التوليف الفيزيائي والبيئي الشامل ====================
+def aggregate_physics(all_times, aligned, orient, beach_type, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
     target_end = target_start + timedelta(days=1)
@@ -218,7 +239,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     past_idx = [i for i, t in enumerate(all_times) if past_start <= t < target_start]
     target_idx = [i for i, t in enumerate(all_times) if target_start <= t < target_end]
     
-    empty_res = {"past_avg_power":0,"dominant_wind":"غير معروف","blocks":[],"red_flags":[],"green_flags":[],"weed_risk":False,"tide_analysis":{},"clarity_risk":False,"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"extra_info":{}}
+    empty_res = {"sea_memory":"غير معروف","lateral_current":"غير معروف","bottom_energy":"منخفض","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}}
     if not target_idx: return empty_res
     
     def pick(k): 
@@ -231,43 +252,93 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     wg = pick("wind_gusts_10m"); pr = pick("pressure_msl"); ta = pick("temperature_2m"); prec = pick("precipitation")
     wcode = [int(v) if v else 0 for v in pick("weather_code")]
     
-    wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
+    wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     
-    # 1. تحليل المد والجزر
-    tide_analysis = get_moon_and_tide_analysis(target_date_obj)
-    
-    # 2. تحليل استقرار حرارة الماء (SST Stability)
-    if len(sst) > 1:
-        sst_diff = max(sst) - min(sst)
-        sst_stability = "صدمة حرارية (انخفاض/ارتفاع حاد)" if sst_diff > 2.0 else "تغير بطيء" if sst_diff > 1.0 else "مستقر تماماً"
-    else: sst_stability = "بيانات غير كافية"
-    
-    # 3. تحليل وضعوح الماء (Clarity Risk)
-    max_swp = max(swp) if swp else 0
-    onshore_hours = sum(1 for w in wind_cls if w.startswith("بحرية"))
-    clarity_risk = (max_swp >= 8 and onshore_hours > len(wind_cls)*0.3)
-    
-    # 4. خطر الأعشاب (Bottom Energy)
-    past_avg, past_sh = 0.0, 0.0
+    # --- 1. ذاكرة البحر (الـ 48 ساعة الماضية) ---
+    sea_memory = "بحر صافي وهادئ (لا توجد عوامل تعكير سابقة)"
     if past_idx:
-        p_wh = aligned.get("wave_height", []); p_wp = aligned.get("wave_period", []); p_swh = aligned.get("swell_wave_height", [])
-        valid_past = [i for i in past_idx if i < len(p_wh) and i < len(p_wp) and i < len(p_swh)]
+        p_wh = aligned.get("wave_height", []); p_wp = aligned.get("wave_period", [])
+        p_swh = aligned.get("swell_wave_height", []); p_swp = aligned.get("swell_wave_period", [])
+        p_ws = aligned.get("wind_speed_10m", []); p_wd = aligned.get("wind_direction_10m", [])
+        valid_past = [i for i in past_idx if i < len(p_wh) and i < len(p_wp) and i < len(p_ws) and i < len(p_wd)]
+        
         if valid_past:
-            past_avg = sum(0.49*(p_wh[i]**2)*p_wp[i] for i in valid_past) / len(valid_past)
-            past_sh = sum(p_swh[i] for i in valid_past) / len(valid_past)
-    weed = onshore_hours > len(wind_cls)*0.5 and (past_sh > 0.8 or past_avg > 5.0)
+            past_power = sum(0.49*(p_wh[i]**2)*p_wp[i] for i in valid_past) / len(valid_past)
+            past_onshore_hours = sum(1 for i in valid_past if wind_class_detailed(angle_diff(p_wd[i], orient)).startswith("بحرية"))
+            past_onshore_ratio = past_onshore_hours / len(valid_past)
+            past_swp_avg = sum(p_swp[i] for i in valid_past if i < len(p_swp)) / len(valid_past)
+            past_swh_avg = sum(p_swh[i] for i in valid_past if i < len(p_swh)) / len(valid_past)
+            
+            if past_power > 6.0 and past_onshore_ratio > 0.4: sea_memory = "بحر خامر وعكر جداً (طونى): رياح بحرية قوية في اليومين الماضيين قلبت القاع وخلطت المياه بالرمل والطين. الرؤية شبه معدومة."
+            elif past_power > 4.0 and past_onshore_ratio > 0.3: sea_memory = "بحر يعكر ببطء: رياح بحرية متوسطة خلقت طبقة عكرة قريبة من الشاطئ."
+            
+            if beach_type == "rocky" and past_swp_avg > 7.0 and past_swh_avg > 0.8: sea_memory += " | تحذير صوفة: الأمواج الطويلة الماضية اقتلعت أعشاب البوسيدونيا من القاع الصخري."
+            elif beach_type == "sandy" and past_power > 5.0: sea_memory += " | توقع طحالب رملية محمولة جواً بسبب هيجان الموج الماضي."
+
+    # --- 2. التيار الجانبي وتحريك الرصاصة ---
+    # إصلاح الخطأ: المرور المباشر على العناصر بدلاً من استخدام فهارس target_idx
+    valid_wd = [angle_diff(w, orient) for w in wd_wave if w != 0]
+    avg_wave_angle = sum(valid_wd) / len(valid_wd) if valid_wd else 90
+    lateral_force = math.sin(math.radians(avg_wave_angle))
+    avg_wave_h = sum(wh) / len(wh) if wh else 0
     
-    # 5. مصفوفة الأسماك (Bio-Matrix)
+    if lateral_force > 0.8 and avg_wave_h > 0.6: lateral_current = "تيار جارف قوي جداً (موازي للشاطئ): الرصاصة ستنجرف بسرعة كبيرة، والخط سيصبح قوساً. يتطلب رصاص ثقيل جداً أو تغيير زاوية الرمي عكس التيار بـ 30-40 درجة."
+    elif lateral_force > 0.5 and avg_wave_h > 0.4: lateral_current = "تيار جانبي متوسط: سيحدث انجراف تدريجي للطعم. يجب مراقبة خيط الخط وتعديل الثقل."
+    else: lateral_current = "تيار جانبي ضعيف أو معدوم: الموج يدفع للخلف وللأمام (عمودي)، الرصاصة ستثبت جيداً في القاع دون انجراف عرضي."
+
+    # --- 3. طاقة القاع ---
+    max_swp = max(swp) if swp else 0
+    max_wh = max(wh) if wh else 0
+    if max_swp >= 8 and max_wh > 0.8: bottom_energy = "قوي جداً: مواج طويلة ستضرب القاع بقوة وتقتلع أي أعشاب متبقية وتجرفها نحو الشاطئ (خطر مادام للصيد)."
+    elif max_swp >= 6 and max_wh > 0.6: bottom_energy = "متوسط: احتمال وجود بعض الأعشاب المحمولة في أعماق مختلفة."
+    else: bottom_energy = "ضعيف: الطاقة سطحية، القاع مستقر."
+
+    # --- 4. ديناميكيات الضغط ---
+    avg_press = sum(pr)/len(pr) if pr else 1013
+    press_change = (pr[-1] if pr else 1013) - (pr[0] if pr else 1013)
+    if press_change < -2.0: pressure_state = "انخفاض حاد ومستمر: الأسماك تدرك العاصفة وتتغذى بشراهة. فرصة ذهبية لكن السلامة مهددة."
+    elif press_change < -0.5: pressure_state = "انخفاض بطيء: نشاط جيد ومستقر للأسماك."
+    elif press_change > 1.5: pressure_state = "ارتفاع حاد: الأسماك تمتلئ هواء وتتوقف عن الأكل لفترة."
+    else: pressure_state = "مستقر أو شبه مستقر: لا تأثير مباشر، العوامل الأخرى حاكمة."
+
+    # --- 5. استقرار حرارة الماء ---
+    sst_diff = max(sst) - min(sst) if len(sst) > 1 else 0
+    sst_stability = "صدمة حرارية (تغير > 2 درجة)" if sst_diff > 2.0 else "تغير ملحوظ" if sst_diff > 1.0 else "مستقر تماماً"
     avg_sst = sum(sst)/len(sst) if sst else 0
-    bio_matrix = {
-        "قاروص": {"status": "نشط جداً" if (avg_sst < 18 and clarity_risk) else "نشط" if avg_sst < 18 else "غائب تقريباً", "reason": "يحب المياه الباردة والعكرة"},
-        "دوراد": {"status": "نشط" if (avg_sst > 18 and not clarity_risk) else "خامل" if clarity_risk else "غائب", "reason": "يتطلب رؤية واضحة ومياه دافئة"},
-        "بوري": {"status": "نشط" if (not clarity_risk and tide_analysis["idx"] in [2, 6]) else "مقبول", "reason": "يفضل المياه الصافية والمد الضعيف"},
-        "سارغ": {"status": "ممكن" if avg_sst < 22 else "ضعيف", "reason": "يتأثر بالحرارة المرتفعة"}
+
+    # --- 6. العوامل الخفية (Hidden Killers) ---
+    hidden_factors = {
+        "freshwater_risk": check_freshwater_risk(past_idx, aligned.get("precipitation", [])),
+        "stratification_risk": check_stratification_risk(past_idx, aligned.get("swell_wave_height", []), aligned.get("wind_speed_10m", []))
     }
     
-    # 6. الفترات الزمنية
+    # إصلاح الخطأ: استخدام zip للمرور على القوائم المنقحة بأمان تام
+    steepness_values = [calc_wave_steepness(h, p) for h, p in zip(wh, wp) if p > 0]
+    avg_steepness = sum(steepness_values) / len(steepness_values) if steepness_values else 0
+    if avg_steepness > 0.06: hidden_factors["wave_steepness"] = "موج حاد وقصير (Steep). ينكسر بقوة، يخلق ماءاً أبيض كثيفاً. سيء للرمي البعيد."
+    elif avg_steepness < 0.03: hidden_factors["wave_steepness"] = "موج طويل وهادئ (Swell). ينكسر بعيداً ويخلق خنادق طبيعية. ممتاز."
+    else: hidden_factors["wave_steepness"] = "موج متوسط الانحدار."
+
+    tide_analysis = get_moon_and_tide_analysis(target_date_obj)
+    if tide_analysis["idx"] in [0, 4]: hidden_factors["golden_lock"] = "مد قوي (Spring). احتمال تزامن الشروق مع مد قوي."
+    elif tide_analysis["idx"] in [2, 6]: hidden_factors["golden_lock"] = "مد ضعيف (Neap). مستوى الماء عند الشروق سيكون متوسطاً."
+    else: hidden_factors["golden_lock"] = "متوسط."
+
+    # --- 7. مصفوفة الأنواع البيولوجية ---
+    is_murky = "عكر" in sea_memory or "خامر" in sea_memory
+    is_weedy = "صوفة" in sea_memory or "قوي جداً" in bottom_energy
+    is_freshwater_risk = "مرتفع" in hidden_factors["freshwater_risk"]
+    is_stratified = "مرتفع" in hidden_factors["stratification_risk"]
+
+    bio_matrix = {
+        "قاروص": {"viability": "معدومة" if is_stratified else "ممتازة" if (avg_sst < 18 and is_murky and not is_weedy) else "جيدة" if avg_sst < 19 else "ضعيفة", "reason": "يكره البحر المسطح الميت. يستفيد من العكر لكن الأعشاب تدمر خطوطه."},
+        "دوراد": {"viability": "شبه معدومة" if (is_murky or is_freshwater_risk) else "ممتازة" if (avg_sst > 18) else "مقبولة", "reason": "يهرب من المياه العذبة والعكرة تماماً. أصعب سمكة في أيام الأمطار."},
+        "بوري": {"viability": "معدومة" if (is_weedy or is_freshwater_risk) else "جيدة جداً" if (not is_murky and avg_sst > 15) else "ضعيفة", "reason": "الأوساخ العالقة تفقده قدرته على رؤية الطعم السطحي."},
+        "سارغ": {"viability": "معدومة" if is_stratified else "ممكنة" if (avg_sst < 22 and not is_weedy) else "ضعيفة", "reason": "يتأثر بالحرارة والأعشاب العالقة قرب الصخور."}
+    }
+
+    # --- 8. الفترات الزمنية ---
     peak_gust = max(wg) if wg else 0.0
     dominant = max(set(wind_cls), key=wind_cls.count) if wind_cls else "غير معروف"
     periods = defaultdict(list)
@@ -292,124 +363,85 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_swd = sum(swd[i] for i in idxs)/len(idxs) if swd else 0
         avg_wave_dir = sum(wd_wave[i] for i in idxs)/len(idxs) if wd_wave else 0
         
-        swell_angle = angle_diff(avg_swd, orient) if avg_swd else None
-        wave_angle = angle_diff(avg_wave_dir, orient) if avg_wave_dir else None
-        
         blocks.append({
             "name":{"morning":"الصباح","afternoon":"الظهر","night":"الليل"}[key],
             "time_range":f"{all_times[target_idx[idxs[0]]].strftime('%H:%M')}-{all_times[target_idx[idxs[-1]]].strftime('%H:%M')}",
             "wave_height":f"{min_h:.2f}-{max_h:.2f}", "wave_power":round(avg_pow,2),
             "swell_height":f"{min(swh[i] for i in idxs):.2f}-{max(swh[i] for i in idxs):.2f}",
-            "swell_period":round(avg_swp,1), "swell_dir": deg_to_compass(avg_swd) if avg_swd else "غير معروف",
-            "swell_angle_diff": round(swell_angle,0) if swell_angle is not None else None,
-            "wave_dir": deg_to_compass(avg_wave_dir) if avg_wave_dir else "غير معروف",
-            "wave_angle_diff": round(wave_angle,0) if wave_angle is not None else None,
-            "wind_speed":f"{min_w:.1f}-{max_w:.1f}", "wind_gust_peak":round(max(wg[i] for i in idxs),1),
-            "wind_dir":wc_dom
+            "swell_period":round(avg_swp,1), "swell_dir": deg_to_compass(avg_swd),
+            "swell_angle_diff": round(angle_diff(avg_swd, orient),0) if avg_swd else None,
+            "wave_dir": deg_to_compass(avg_wave_dir),
+            "wave_angle_diff": round(angle_diff(avg_wave_dir, orient),0) if avg_wave_dir else None,
+            "wind_speed":f"{min_w:.1f}-{max_w:.1f}", "wind_gust_peak":round(max(wg[i] for i in idxs),1), "wind_dir":wc_dom
         })
         
     reds, greens = [], []
     for i in range(len(wh)):
         hh = all_times[target_idx[i]].strftime("%H:%M")
-        if wave_power[i] > 3 or wh[i] > 1.8 or wg[i] > 50 or pr[i] < 1005: reds.append(hh)
-        if 0.3 <= wh[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and ws[i] < 27.8: greens.append(hh)
+        if wh[i] > 1.8 or wg[i] > 50 or pr[i] < 1000: reds.append(hh)
+        if 0.3 <= wh[i] <= 1.0 and wave_power[i] <= 1.5 and ws[i] < 27.8: greens.append(hh)
         
-    avg_press = sum(pr)/len(pr) if pr else 0
-    press_change = pr[-1] - pr[-4] if len(pr) >= 4 else (pr[-1] - pr[0] if len(pr) > 1 else 0)
-    
-    extra = {
-        "pressure_avg":round(avg_press,1), "pressure_change_3h":round(press_change,1),
-        "sunrise":sunrise, "sunset":sunset, "peak_gust_today":round(peak_gust,1)
-    }
     return {
-        "past_avg_power":round(past_avg,2), "dominant_wind":dominant, "blocks":blocks, 
-        "red_flags":reds[:5], "green_flags":greens[:5], "weed_risk":weed, 
-        "tide_analysis":tide_analysis, "clarity_risk":clarity_risk, "sst_stability":sst_stability,
-        "bio_matrix":bio_matrix, "avg_sst":round(avg_sst,1), "extra_info":extra
+        "dominant_wind":dominant, "blocks":blocks, "red_flags":reds[:5], "green_flags":greens[:5], 
+        "sea_memory":sea_memory, "lateral_current":lateral_current, "bottom_energy":bottom_energy,
+        "pressure_state":pressure_state, "tide_analysis":tide_analysis, "sst_stability":sst_stability,
+        "bio_matrix":bio_matrix, "avg_sst":round(avg_sst,1), "hidden_factors":hidden_factors,
+        "extra_info": {"pressure_avg":round(avg_press,1), "pressure_change":round(press_change,1), "sunrise":sunrise, "sunset":sunset, "peak_gust_today":round(peak_gust,1)}
     }
 
-# ==================== بناء سياق التفاعلات (بدلاً من سرد البيانات) ====================
+# ==================== بناء سياق التوليف العميق ====================
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
-    orient = req.beach_orientation
-    moon = agg["tide_analysis"]
-    extra = agg["extra_info"]
-
-    # بناء قصة التفاعلات بين العوامل
-    interactions = []
-    
-    # تفاعل الموج والرياح (وضوح الماء)
-    if agg["clarity_risk"]:
-        interactions.append("⚠️ تفاعل سلبي قوي: دورة الموج الطويلة تزامنت مع رياح بحرية. هذا يخلق مياه عكرة جداً (طوني). الأسماك البيضاء ستختفي، والقاروص فقط من قد يهاجم.")
-    else:
-        interactions.append("✅ تفاعل إيجابي: غياب الرياح البحرية القوية مع دورة الموج الحالية يضمن بقاء الماء صافياً أو شبه صافي.")
-        
-    # تفاعل المد والقمر مع الأنواع
-    if moon["idx"] in [0, 4]:
-        interactions.append(f"🌊 تأثير المد: {moon['tide_strength']}. التيارات الجانبية ستكون قوية جداً. إذا كان الشاطئ رملياً ستنجرف الرصاصات بسرعة، تتطلب أوزاناً ثقيلة. ممتاز للقاروص الليلي، كارثي للدوراد.")
-    elif moon["idx"] in [2, 6]:
-        interactions.append(f"🌊 تأثير المد: {moon['tide_strength']}. التيارات ضعيفة. فرصة ذهبية للبوري والدوراد لعدم انجراف الطعم، لكن القاروص قد يكون بطيئاً.")
-
-    # تفاعل استقرار الحرارة
-    if "صدمة" in agg["sst_stability"]:
-        interactions.append("❌ صدمة حرارية: تغير حاد في حرارة الماء. الأسماك ستتوقف عن الأكل لفترة. لا تعتمد على نشاط عادي حتى تستقر الحرارة.")
-        
-    # تفاعل الضغط
-    press_change = extra.get("pressure_change_3h", 0)
-    if press_change < -1.0:
-        interactions.append("✅ انخفاض حاد في الضغط (الساعة الذهبية): الأسماك تتسابق على الأكل قبل العاصفة. أفضل توقيت للصيد بغض النظر عن العوامل الأخرى.")
-    elif press_change > 1.5:
-        interactions.append("❌ ارتفاع حاد في الضغط: الأسماك ستنتقل للقاع وتتصلب.")
-
-    # تفاعل زوايا الموج مع الشاطئ
-    for b in agg["blocks"]:
-        sa = b.get("swell_angle_diff")
-        if sa is not None:
-            if 70 <= sa <= 110: interactions.append(f"في {b['name']}: الموج عمودي على الشاطئ. طاقة دفع قوية للخلف، لا يوجد حمل جانبي خطير، الرصاص سيثبت جيداً.")
-            elif sa < 40 or sa > 140: interactions.append(f"في {b['name']}: الموج موازي تقريباً للشاطئ. خطر انجراف الطعم وخطوط الصيد بشكل كبير، يجب تعديل زاوية الرمي عكس التيار.")
-
-    # تفاعل خطر الأعشاب
-    if agg["weed_risk"]:
-        interactions.append("🚨 خطر قاتل: الأعشاب البحرية (البوسيدونيا) مقتلعة من القاع بسبب طاقة الأمواج الماضية وتتجه نحو الشاطئ. ستغلف الخطافات وتجعل الصيد مستحيلاً.")
-
-    # مصفوفة الأنواع
-    bio_text = "\n".join([f"- {fish}: {data['status']} ({data['reason']})" for fish, data in agg["bio_matrix"].items()])
+    bio_text = "\n".join([f"- {fish}: {data['viability']} ({data['reason']})" for fish, data in agg["bio_matrix"].items()])
+    blocks_text = "\n".join([f"  * {b['name']} ({b['time_range']}): موج {b['wave_height']}م (دورة {b['swell_period']}ث)، رياح {b['wind_dir']} {b['wind_speed']}كم/س (هبات {b['wind_gust_peak']})" for b in agg["blocks"]])
 
     lines = [
-        f"المهمة: تحليل ظروف السيرفكاستينغ لشاطئ {beach} (اتجاه {orient}°) - توقيت {tz_name}.",
-        f"البيانات الخام ممنوعة من الإعادة في التقرير. حلل التفاعلات التالية واستنتج:",
+        "أنت محلل فيزيائي وبيئي للسيرفكاستينغ. قم بتوليف المعطيات التالية في تقرير تحليلي واحد.",
         "",
-        "=== مصفوفة التفاعلات الحرجة ===",
-        *interactions,
+        f"=== 1. ذاكرة البحر (حالة المياه نتيجة الـ 48 ساعة الماضية) ===",
+        agg["sea_memory"],
         "",
-        f"=== تقييم الأنواع المستهدفة ===",
+        f"=== 2. ميكانيكا الموائع وتحرك المعدات ===",
+        f"التيار الجانبي وانجراف الرصاصة: {agg['lateral_current']}",
+        f"طاقة القاع والأعشاب: {agg['bottom_energy']}",
+        "",
+        f"=== 3. ديناميكيات الضغط الجوي والتمثيل الغذائي ===",
+        agg["pressure_state"],
+        "",
+        f"=== 4. المعطيات الفيزيائية لفترات اليوم ===",
+        blocks_text,
+        f"القمر والمد: {agg['tide_analysis']['name']} ({agg['tide_analysis']['tide_strength']}).",
+        f"حرارة الماء: {agg['avg_sst']}°م (الاستقرار: {agg['sst_stability']}).",
+        "",
+        f"=== 5. الجدوى البيولوجية للأنواع المستهدفة ===",
         bio_text,
         "",
-        f"=== التوقيتات ===",
+        f"=== 6. العوامل الخفية (The Hidden Killers) ===",
+        f"خطر السيول والمياه العذبة: {agg['hidden_factors'].get('freshwater_risk', 'غير معروف')}",
+        f"خطر انعدام التمازج (البحر الميت تحت السطح): {agg['hidden_factors'].get('stratification_risk', 'غير معروف')}",
+        f"ميكانيكا الموج وانحداره: {agg['hidden_factors'].get('wave_steepness', 'غير معروف')}",
+        f"تزامن الشروق مع المد: {agg['hidden_factors'].get('golden_lock', 'غير معروف')}",
+        "",
+        f"=== 7. التوقيتات الحرجة ===",
         f"أفضل ساعات (خضراء): {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'}",
         f"ساعات الخطر (حمراء): {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}",
-        f"الشروق {extra['sunrise']} | الغروب {extra['sunset']} | هبات قصوى {extra['peak_gust_today']} كم/س",
         "",
-        "المطلوب: اكتب تقريراً تحليلياً مركباً (ليس سردياً). ابدأ بالنتيجة النهائية (Go/No-Go) ثم فكك الأسباب. ربط كل ظاهرة بتأثيرها الميكانيكي على الخطاف والرصاصة والسمكة."
+        "قاعدة الذكاء: ابدأ بقرار (Go / No-Go / Conditional Go) في أول سطرين. لا تشرح المعطيات كقائمة، بل اربطها (مثال: لأن البحر خامر من أمس، والموج اليوم موازي يخلق تيار جانبي، والدوراد يعتمد على الرؤية... إذن الدوراد مستحيل اليوم). حلل ميكانيكية الرصاصة والطعم بناءً على التيار الجانبي والموج."
     ]
     return "\n".join(lines)
 
-# ==================== برومبت التحليل الاستنتاجي الصارم ====================
-SYSTEM_PROMPT = """أنت عالم أحياء بحرية ومحلل فيزيائي متخصص حصرياً في صيد السرفكاستينغ (Surfcasting) في البحر المتوسط (تونس).
-ممنوع تماماً سرد البيانات العددية التي أرسلتها لك. دورك هو "التوليد الاستنتاجي" (Generative Inference).
+SYSTEM_PROMPT = """أنت خبير ميكانيكا موائع وأحياء بحرية متخصص في السيرفكاستينغ بتونس. لغتك الدارجة التونسية الجافة، لا تحليلاً، لا زخرفة.
 
-قواعد صارمة:
-1. لا تقل أبداً "بناءً على البيانات" أو "الموج يبلغ" أو "الرياح سرعتها". بدلاً من ذلك قل "الموج الطويل يضرب الساحل بعمود تام مما يخلق...".
-2. كل فقرة يجب أن تربط ظاهرة فيزيائية (موج/رياح/ضغط) بتأثيرها المباشر على سلوك السمكة أو ميكانيكية الصيد (انجراف، ثبات، رؤية).
-3. القرار (Go/No-Go) يجب أن يكون في أول سطرين من التقرير، واضحاًWithout ambiguity.
-4. إذا كان القرار No-Go، اشرح لماذا باستخدام مصفوفة التفاعلات (مثلاً: لا نذهب ليس لأن الموج مرتفع، بل لأن الموج المرتفع مقترن بدورة طويلة قتلت الأعشاب وأصبح الماء عكراً والضغط مرتفع).
-5. التوصيات الفنية (الرصاصة، الطعم، الزاوية) يجب أن تكون نتيجة مباشرة للتحليل الفيزيائي (مثلاً: "بسبب التيار الجانبي الناتج عن الموج المائل، سنستخدم رصاصة هرمية 150غ لضمان الثبات").
-
-اكتب بأسلوب ضيق، علمي، دارجة تونسية خالصة، لا تسامح ولا جمل تعبيرية فارغة."""
+قوانين صارمة:
+1. التوليف (Synthesis): ممنوع منعاً باتاً أن تنقل أي رقم أو معطى كما هو. تأخذ "ذاكرة البحر" + "التيار الجانبي" + "الضغط" وتصنع منها "قصة فيزيائية-بيولوجية واحدة".
+2. ميكانيكا المعدات: عندما تتحدث عن الرصاصة (الوزن، النوع: صابونة/هرم/قرابين)، يجب أن تربطها مباشرة بحساب "التيار الجانبي" و "طاقة القاع". (مثلاً: التيار الجانبي القوي + القاع الصخري = هرم 150غ حتى لا تنحشر في الصخور وتقاوم الجرف).
+3. ربط العوامل: الأخطاء الشائعة أن يقول الصياد "البحر هادئ والضغط منخفض، إذن ممتاز". أنت تصحح هذا: "الضغط منخفض نعم، لكن البحر لسه خامر من أمس والرؤية صفر، إذن الأسماك البيضاء ماذا تشوف حاجة، القرار No-Go رغم هدوء السطح".
+4. الطعم: اربط الطعم بوضوح الماء. (عكر = طعم برائحة قوية أو سمك حي. صافي = صناعي شفاف أو حبار).
+5. القرار النهائي في أول سطرين. إذا كان Go، حدد أي سمكة بالضبط تستهدف وأي فترة زمنية. إذا No-Go، اشرح السبب الفيزيائي المركب."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":4000,"temperature":0.4}
+    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":4500,"temperature":0.35}
     data = await post_with_retry(OPENROUTER_URL, payload, headers)
     if "choices" in data and data["choices"]: return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
@@ -430,9 +462,8 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
         if not all_times: raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
         
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset)
+        agg = aggregate_physics(all_times, aligned, req.beach_orientation, req.beach_type, target_dt, sunrise, sunset)
         
-        # فحص الأمان القاسي (Hard No-Go)
         if agg["extra_info"]["peak_gust_today"] > 60 or any(get_max_val(b.get("wave_height")) > 2.5 for b in agg["blocks"]):
             return {"report": "قرار نهائي: No-Go مطلق. ظروف بحرية خطرة تهدد حياتك مباشرة (هبات قاسية أو موج متطرف). لا تحاول المخاطرة.", "meta": {"hard_nogo": True}}
 
