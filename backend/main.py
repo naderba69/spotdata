@@ -1,5 +1,5 @@
 """
-Surfcasting Analytics API – v9.2 (Complete & Production‑Ready)
+Surfcasting Analytics API – v9.2.1 (Production‑Ready, Fix UnboundLocalError)
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="9.2.0")
+app = FastAPI(title="Surfcasting Analytics", version="9.2.1")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -48,7 +48,7 @@ async def global_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "9.2.0"}
+def health(): return {"status": "ok", "version": "9.2.1"}
 
 # ==================== أدوات الشبكة والرياضيات ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -304,6 +304,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
     
+    # تعريف avg_sst مبكراً لاستخدامه في الذاكرة البحرية
+    avg_sst = sum(sst)/len(sst) if sst else 0
+    
     # 1. ذاكرة البحر وحالته الراهنة (مع مؤشرات جديدة)
     sea_memory = "بحر صافي وهادئ (لا توجد عوامل تعكير سابقة)"
     past_avg, past_sh = 0.0, 0.0
@@ -394,8 +397,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     clarity_risk = is_past_murky or (max_swp >= 8 and onshore_hours > len(wind_cls)*0.3)
     
     weed = onshore_hours > len(wind_cls)*0.5 and (past_sh > 0.8 or past_avg > 5.0)
-    
-    avg_sst = sum(sst)/len(sst) if sst else 0
     
     is_murky = "عكر" in sea_memory or "خامر" in sea_memory
     is_weedy = "صوفة" in sea_memory
