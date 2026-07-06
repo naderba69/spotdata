@@ -1,6 +1,6 @@
 """
-Surfcasting Analytics API – v11.0.1 (Production-Ready)
-Fixed Vector Mapping Error & Hardened Index Bounds.
+Surfcasting Analytics API – v11.0.3 (The Dead Zone Rule)
+يمنع إعطاء نصائح تكتيكية (خيوط/رصاص) إذا كانت السمكة غير موجودة في المنطقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo
 from datetime import datetime, timedelta, date
@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="11.0.1")
+app = FastAPI(title="Surfcasting Analytics", version="11.0.3")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -49,7 +49,7 @@ async def global_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "11.0.1"}
+def health(): return {"status": "ok", "version": "11.0.3"}
 
 # ==================== أدوات الشبكة والرياضيات ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -229,7 +229,7 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
-# ==================== محرك التجميع الفيزيائي (v11.0.1) ====================
+# ==================== محرك التجميع الفيزيائي (v11.0.3) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -254,7 +254,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
     
-    # 1. ذاكرة البحر
     sea_memory = "بحر صافي وهادئ (لا توجد عوامل تعكير سابقة)"
     past_avg, past_sh = 0.0, 0.0
     sudden_wind_shift = "لا يوجد"
@@ -294,14 +293,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 if diff_sst_past < -1.5: sst_trend = f"انخفاض حاد ({abs(diff_sst_past):.1f}°م)."
                 elif diff_sst_past > 1.5: sst_trend = f"ارتفاع حاد ({diff_sst_past:.1f}°م)."
 
-    # ==========================================
-    # الإصلاح الجذري: حساب القوة كمتجهات مع "عتبة الصفر"
-    # ==========================================
     lateral_fx = 0.0
     lateral_fy = 0.0
     max_wh = max(wh) if wh else 0.0
     
-    # الإصلاح (v11.0.1): المرور على المؤشرات المحلية للمصفوفات المستخرجة (0 إلى length-1)
     for i in range(len(wh)):
         w_dir = wd_wave[i] if i < len(wd_wave) else 0.0
         if w_dir != 0:
@@ -314,11 +309,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     lateral_force_ratio = abs(lateral_fx) / total_force if total_force > 0 else 0
     avg_wave_h = sum(wh) / len(wh) if wh else 0
 
-    # فلتر العتبة المطلقة
     is_mirror_sea = max_wh < 0.4
     
     if is_mirror_sea:
-        lateral_current = "تيار جانبي معدوم (بحر مرآوي / ميت، قوة الدفع شبه صفر)"
+        lateral_current = "تيار جانبي معدوم (بحر مرآوي)"
     elif lateral_force_ratio > 0.7 and avg_wave_h > 0.6: 
         lateral_current = "تيار جارف قوي جداً"
     elif lateral_force_ratio > 0.4 and avg_wave_h > 0.4: 
@@ -490,7 +484,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "transitions": transitions
     }
 
-# ==================== محرك التفاعلات (v11.0.1) ====================
+# ==================== محرك التفاعلات (v11.0.3 - Dead Zone Rule) ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     hf = agg["hidden_factors"]
@@ -500,13 +494,14 @@ def calculate_interactions(agg: dict) -> List[str]:
     is_mirror_sea = extra.get("is_mirror_sea", False)
     
     if is_mirror_sea:
-        interactions.append("[تفاعل البحر المرآوي] الموج أقل من 0.4م. قوة الدفع المائي شبه معدومة. التيار الجانبي مستحيل فيزيائياً. الرؤية تحت الماء في أعلى مستوياتها.")
+        interactions.append("[تفاعل البحر المرآوي] الموج أقل من 0.4م. قوة الدفع المائي شبه معدومة. التيار الجانبي مستحيل فيزيائياً.")
+        
         if extra.get("max_air_temp", 0) > 28:
-            interactions.append("[تفاعل الحرارة والضوء] حرارة الهواء عالية (+28°م) + بحر مرآة نهاراً = خوف بصري قصوى للأسماك (هروب للمناطق العميقة المظلمة). الصيد النهاري مستحيل بيولوجياً.")
-            interactions.append("[الحسم النهائي - No-Go نهاراً] الظروف نهاراً تشكل 'مرآة قاتلة' للصيد الشاطئي.")
+            interactions.append("[قاعدة المنطقة الميتة] الماء صافٍ كالمرآة + حرارة هواء عالية = المنطقة الضحلة القريبة من الشاطئ (منطقة الرمية في السيرفكاستينغ) أصبحت 'منطقة ميتة بيولوجياً'. الأسماك المستهدفة (القاروص، الدوراد، البوري) هربت للخنادق العميقة البعيدة (أكثر من 80 متراً) لتجنب الإجهاد الحراري والانكشاف. الرمية ستسقط في ماء فارغ تماماً من الأسماك.")
+            interactions.append("[الحسم النهائي - No-Go مطلق (منطقة ميتة)] لا تذهب للصيد. المشكلة ليست في وضوح الخيط أو نوع الطعم، المشكلة أن السمك غير موجود في منطقة الرمية أصلاً. لا ينصح حتى بتغيير المعدات لأن الفريسة غائبة.")
         else:
-            interactions.append("[تفاعل الليل] مع غياب الشمس ليلاً، يُسمح بالصيد ولكن بأسلوب الدقة (خيط رفيع، طعم صغير) لأن السمك سيرى الخط بوضوح.")
-            interactions.append("[الحسم النهائي - Go مشروط ليلاً] يمكن الصيد ليلاً فقط وبشروط صارمة.")
+            interactions.append("[تفاعل الليل/بارد] الظلام يكسر حاجز الخوف البصري، والأسماك قد تقترب من الشاطئ للبحث عن غذاء في المياه الضحلة الهادئة.")
+            interactions.append("[الحسم النهائي - Go ليلاً فقط] الصيد مقتصر على الليل. الأسماك ستكون حذرة جداً لذلك يجب إخفاء المعدات قدر الإمكان.")
         return interactions
 
     for b in blocks:
@@ -538,7 +533,7 @@ def calculate_interactions(agg: dict) -> List[str]:
 
     return interactions
 
-# ==================== بناء السياق (v11.0.1) ====================
+# ==================== بناء السياق (v11.0.3) ====================
 def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     orient = req.beach_orientation
@@ -582,17 +577,18 @@ SYSTEM_PROMPT = """أنت محلل فيزيائي بحري صارم. مهمتك 
 
 هيكل التقرير الإجباري:
 1. تفكيك الحالة الراهنة.
-2. تفسير سلسلة التفاعلات (تحويل كل معادلة فيزيائية لفقرة توضح تأثيرها على الرصاصة والطعم).
-3. التكتيك الميداني الصارم (فقط في حالة Go أو Go مشروط):
-   - الرصاصة: يجب أن تستنتج وزنها حصرياً من "تفاعل الثبات". (مثال: إذا قال التفاعل "غياب تيار جانبي"، قل "رصاصة 80-120 غرام"). لا تقترح أبداً أكثر من 120 غرام إذا لم يذكر التفاعل وجود تيار قوي.
-   - الطعم: يستنتج من تفاعل البيئة (عكر/نظيف/مرآوي).
+2. تفسير سلسلة التفاعلات.
+3. التكتيك الميداني الصارم (فقط في حالة Go أو Go ليلاً فقط):
+   - الرصاصة: يجب أن تستنتج وزنها حصرياً من "تفاعل الثبات". 
+   - الطعم: يستنتج من تفاعل البيئة.
 4. صياغة القرار النهائي: "القرار النهائي: [انسخ النص من الحسم النهائي]".
 
 قواعد ممنوعة تحت طائلة الفشل:
 - لا تقترح رصاصة ثقيلة (أكثر من 120 غرام) إذا كان البحر "مرآوياً" أو إذا قال التفاعل "غياب تيار جانبي".
-- لا تقل أن الارتفاع الحاد في الضغط يجعل السمك يأكل (هذا خطأ بيولوجي، الارتفاع يوقف الأكل).
-- لا تبدأ بالقرار. ابدأ بالتفكيك.
+- لا تقل أن الارتفاع الحاد في الضغط يجعل السمك يأكل.
+- لا تبدأ بالقرار.
 - لا توجد عبارة "يمكن تجربة" في حالة No-Go.
+- قاعدة المنطقة الميتة: إذا ذكر التفاعل "المنطقة الميتة" أو "السمك غير موجود في منطقة الرمية"، يجب أن تترك قسم التكتيك الميداني فارغاً تماماً وتكتب: "التكتيك الميداني: غير مطبق. لا فائدة من تجويد المعدات (خيوط، فليو كربون، رصاص) لأن المشكلة هي غياب السمك المستهدف من المنطقة الضحلة وليس وضوح المعدات."
 
 اكتب بالدارجة التونسية الجافة، فقرات مترابطة، بدون مجاملات."""
 
