@@ -621,7 +621,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
 
-        # --- حساب أفضل مسافة للرمي (مضافة) ---
+        # حساب أفضل مسافة للرمي
         base_dist = 50
         if avg_h > 0.8:
             base_dist = 40
@@ -644,7 +644,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "wind_gust_peak":round(max_gust_b,1),
             "wind_dir":wc_dom, "air_temp":round(avg_air,1), "weather":weather_desc(most_code),
             "confidence": confidence,
-            "recommended_cast_distance": round(recommended_dist, 0),  # مضافة
+            "recommended_cast_distance": round(recommended_dist, 0),
             "_raw": {
                 "avg_wave_h": round(avg_h, 3), "max_wave_h": round(max_h, 3),
                 "avg_wind": round(avg_w, 1), "max_wind": round(max_w, 1),
@@ -777,7 +777,7 @@ def calculate_interactions(agg: dict) -> List[str]:
             if weed_risk.get("risk") != "منخفض":
                 interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
 
-        # إضافة أفضل مسافة للرمي (للحالتين)
+        # أفضل مسافة للرمي
         interactions.append(f"  → أفضل مسافة للرمي: حوالي {recommended_dist:.0f} متر.")
 
         avg_vis = raw.get("visibility", 10000)
@@ -825,7 +825,7 @@ def build_context(req, agg, tz_name):
             f"تقاطع سويل/موج={b.get('swell_wave_interaction','?')}"
         )
 
-    # --- إضافة سطر الملخص التنفيذي ---
+    # الملخص التنفيذي
     final_verdict = agg["final_verdict"]
     golden_windows = agg["extra_info"].get("golden_windows", [])
     best_time = "غير محدد"
@@ -851,7 +851,7 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-# [عودة إلى SYSTEM_PROMPT الكلاسيكي مع إضافة تحذير الأعشاب]
+# SYSTEM_PROMPT الكلاسيكي مع تحذير الأعشاب
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم لغة المد والجزر والساعات الذهبية.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 
@@ -897,37 +897,30 @@ async def call_openrouter(ctx):
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
 
-# ==================== فحص هلوسة صارم ====================
+# ==================== فحص هلوسة صارم (مُحسَّن) ====================
 def extract_numbers_from_text(text: str) -> List[float]:
-    """استخراج جميع الأرقام (صحيحة وعشرية) من نص التقرير."""
     pattern = r'-?\d+\.?\d*'
     matches = re.findall(pattern, text)
     return [float(m) for m in matches]
 
 def get_allowed_numbers(agg: dict) -> Set[float]:
-    """إنشاء مجموعة من الأرقام المسموح بها من البيانات والتحليلات."""
     allowed = set()
-    # من _raw في كل block
     for b in agg.get("blocks", []):
         raw = b.get("_raw", {})
         for v in raw.values():
             if isinstance(v, (int, float)):
                 allowed.add(round(v, 1))
-    # من extra_info
     extra = agg.get("extra_info", {})
     for v in extra.values():
         if isinstance(v, (int, float)):
             allowed.add(round(v, 1))
-    # من hidden_factors
     for v in agg.get("hidden_factors", {}).values():
         if isinstance(v, (int, float)):
             allowed.add(round(v, 1))
-    # من avg_sst, max_air_temp, peak_gust
     allowed.add(round(agg.get("avg_sst", 0), 1))
     allowed.add(round(extra.get("max_air_temp", 0), 1))
     allowed.add(round(extra.get("peak_gust_today", 0), 1))
-    # الأرقام الصغيرة جداً (الأوقات) مستثناة من الفحص
-    return {x for x in allowed if x > 0.5}  # نتجاهل الأرقام الصغيرة كالأوقات
+    return {x for x in allowed if x > 0.5}
 
 @app.post("/generate-report")
 @limiter.limit("10/minute")
@@ -955,15 +948,19 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # فحص هلوسة صارم (للأرقام)
+        # فحص هلوسة صارم (مصحح للأوقات)
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
-        suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers]
+        suspicious = [
+            n for n in report_numbers
+            if n > 0.5
+            and n not in allowed_numbers
+            and not (n.is_integer() and 0 <= n <= 24)
+        ]
         if suspicious:
             logger.warning(f"أرقام غير مطابقة في التقرير: {suspicious}")
             report += f"\n\n[تحذير نظام: تم اكتشاف أرقام غير دقيقة في التقرير: {suspicious}. يُرجى التحقق.]"
 
-        # التأكد من القرار النهائي
         if agg["final_verdict"] == "No-Go" and "go" in report.lower()[:100]:
             report += "\n\n[تنبيه: القرار النهائي هو No-Go، تجاهل أي إشارة إيجابية.]"
 
