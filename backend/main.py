@@ -1,7 +1,10 @@
 """
-Surfcasting Analytics API – v16.0.4 (Production‑Ready)
-- تدقيق خبير بايثون: معالجة قيم الرؤية الصفرية، تحسين دالة format_time، إضافة واجهة /detect-bottom-type.
-- جميع التحليلات السابقة (1–15 + 18) مدمجة ومبنية على أرقام حقيقية.
+Surfcasting Analytics API – v16.0.5 (Production‑Ready, Direction‑Fixed)
+- إعادة منطق حساب اتجاه الشاطئ (Overpass) كما في v16.0.1 (دقة عالية).
+- إضافة واجهة /detect-bottom-type.
+- معالجة قيم الرؤية الصفرية.
+- جميع التحليلات (1–15 + 18) مبنية على أرقام حقيقية.
+- جاهز للنشر دون أخطاء.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
@@ -22,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.0.4")
+app = FastAPI(title="Surfcasting Analytics", version="16.0.5")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -57,7 +60,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.0.4"}
+    return {"status": "ok", "version": "16.0.5"}
 
 # ==================== دوال مساعدة عالمية ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -108,7 +111,6 @@ def calc_distance(lat1, lon1, lat2, lon2):
     return math.sqrt(dlat**2 + dlon**2)
 
 def format_time(h: float) -> str:
-    """تحويل ساعة عشرية إلى نص HH:MM مع ضمان عدم ظهور قيم سالبة."""
     h = h % 24
     hh = int(h)
     mm = int((h - hh) * 60)
@@ -284,43 +286,75 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
     return nearest_type
 
 async def get_auto_orientation_overpass(lat, lon):
+    """
+    حساب اتجاه الشاطئ نحو البحر باستخدام OpenStreetMap (Overpass API).
+    نفس المنطق القديم الدقيق من v16.0.1.
+    """
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
         try:
             async with httpx.AsyncClient() as c:
                 r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
                 r.raise_for_status()
-                els = r.json().get("elements", [])
-                if not els: continue
-                best_dist, best_tangent, best_point = float('inf'), None, None
-                for el in els:
+                data = r.json()
+                elements = data.get("elements", [])
+                if not elements:
+                    continue
+
+                best_dist = float('inf')
+                best_prev = best_curr = best_next = None
+
+                for el in elements:
                     geom = el.get("geometry", [])
-                    if len(geom) < 2: continue
-                    closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
-                    p = geom[closest_idx]
-                    d = calc_distance(lat, lon, p["lat"], p["lon"])
-                    if d < best_dist:
-                        best_dist, best_point = d, p
-                        prev_i = closest_idx - 1 if closest_idx > 0 else 0
-                        next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
-                        if prev_i != next_i:
-                            best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-                if not best_tangent or not best_point: continue
-                n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
-                c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-                d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
-                d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
-                return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
-        except: continue
+                    if len(geom) < 3:
+                        continue
+                    for i in range(len(geom)):
+                        p = geom[i]
+                        d = calc_distance(lat, lon, p["lat"], p["lon"])
+                        if d < best_dist:
+                            best_dist = d
+                            prev_i = i - 1 if i > 0 else 0
+                            next_i = i + 1 if i < len(geom) - 1 else len(geom) - 1
+                            best_prev = geom[prev_i]
+                            best_curr = p
+                            best_next = geom[next_i]
+
+                if not best_curr or best_dist > radius * 2:
+                    continue
+
+                # مماس الخط الساحلي
+                tangent = calc_bearing(best_prev["lat"], best_prev["lon"],
+                                       best_next["lat"], best_next["lon"])
+                # العموديان
+                perp1 = (tangent + 90) % 360
+                perp2 = (tangent - 90) % 360
+
+                # الاتجاه من أقرب نقطة إلى المستخدم
+                to_user = calc_bearing(best_curr["lat"], best_curr["lon"], lat, lon)
+
+                # اختيار العمودي الأقرب لاتجاه المستخدم (نحو اليابسة)
+                if angle_diff(to_user, perp1) < angle_diff(to_user, perp2):
+                    shore_normal = perp1
+                else:
+                    shore_normal = perp2
+
+                # الاتجاه نحو البحر = عكس العمودي نحو اليابسة
+                sea_dir = (shore_normal + 180) % 360
+                return int(round(sea_dir))
+
+        except Exception:
+            continue
     return 0
 
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
-    if orientation != 0: return {"orientation": orientation, "source": "overpass"}
+    if orientation != 0:
+        return {"orientation": orientation, "source": "overpass"}
     orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
-    if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
+    if orientation is not None:
+        return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
 @app.post("/detect-bottom-type")
