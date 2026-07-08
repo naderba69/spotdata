@@ -1,10 +1,13 @@
 """
-Surfcasting Analytics API – v16.2.4 (Final Production Release)
-- تم إضافة: أفضل مسافة للرمي، سطر ملخص تنفيذي، تحذير أوضح للأعشاب.
+Surfcasting Analytics API – v16.3.0 (Complete Engine)
+- تحليل الموج الراجع (Backwash) وتأثيره على استقرار الرصاصة.
+- تحليل تراكم الأوساخ والصوفة على الخيط وتأثيرها على الصيد.
+- تحليل العكارة الشديدة بعد السيول وتأثيرها على رؤية السمك.
+- جدول العوامل المانعة للصيد (No‑Go Factors).
+- جميع التحليلات السابقة (سولونار، مياه ميتة، أعشاب، طعم موسمي، ثقة، رؤية، انحدار الموج).
 - فحص هلوسة صارم على الأرقام والقرار النهائي.
 - جميع الإصلاحات التقنية (HTTP client, 429 retry, ZeroDivision, tidal wrap, safe_float, cache).
 - واجهات: /auto-orientation, /detect-bottom-type, /generate-report.
-- تنسيق التقرير الكلاسيكي (بدون رموز إضافية).
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -33,7 +36,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.2.4", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.3.0", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -70,7 +73,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.2.4"}
+    return {"status": "ok", "version": "16.3.0"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -414,6 +417,39 @@ def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
         advice = "استعمل صائدات مضادة للأعشاب (Weedless hooks) وارمِ بزاوية حادة نحو البحر لتجنب الالتفاف."
     return {"risk": risk, "advice": advice}
 
+def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_height: float) -> dict:
+    """تحليل الموج الراجع (Backwash) الذي يرجع الرصاصة للشاطئ."""
+    wind_diff = angle_diff(wind_dir, orient)
+    is_onshore = wind_diff < 30
+    is_strong = wind_speed > 25
+    severity = "منخفض"
+    effect = ""
+    if is_onshore and is_strong and wave_height > 0.8:
+        severity = "مرتفع"
+        effect = f"رياح بحرية قوية ({wind_speed:.0f} كم/س) تضرب الموج نحو الشاطئ، ثم يرتد الموج بقوة نحو البحر. هذا يخلق تياراً عكسياً قوياً يرجع الرصاصة للشاطئ باستمرار. حتى مع وزن ثقيل، يصعب تثبيت الطعم."
+    elif is_onshore and wind_speed > 15:
+        severity = "متوسط"
+        effect = f"رياح بحرية ({wind_speed:.0f} كم/س) تخلق تياراً عكسياً خفيفاً. الرصاصة قد تتحرك قليلاً نحو الشاطئ لكن يمكن التحكم بها بوزن أثقل."
+    return {"severity": severity, "effect": effect}
+
+def analyze_debris_risk(sea_memory: str, past_rain: float, wind_speed: float) -> dict:
+    """تحليل خطر تراكم الأوساخ والصوفة على الخيط."""
+    has_floods = "سيول" in sea_memory
+    has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
+    is_windy = wind_speed > 20
+    risk = "منخفض"
+    effect = ""
+    if has_floods and has_weed and is_windy:
+        risk = "مرتفع"
+        effect = "السيول الأخيرة حملت كميات كبيرة من الأعشاب والأغصان والمواد العضوية إلى البحر. هذه المواد تطفو الآن وتتجمع على الخيط والرصاصة، مما يزيد الوزن ويغير شكل الطعم. الأوساخ تسد العقد وتجعل الخيط مرئياً للسمك. يجب تنظيف الخيط كل بضع رميات، والصيد شبه مستحيل."
+    elif has_weed and is_windy:
+        risk = "متوسط"
+        effect = "الأعشاب البحرية والصوفة تطفو بكثافة وتتجمع على الخيط. استعمل صائدات مضادة للأعشاب وتجنب الرمي في التيارات الجانبية."
+    elif has_floods:
+        risk = "متوسط"
+        effect = "بعد السيول، قد تكون هناك مواد عالقة في الماء تتراكم على الخيط. انتبه لنظافة الخيط."
+    return {"risk": risk, "effect": effect}
+
 def get_seasonal_bait(month: int, water_temp: float) -> str:
     if month in [12, 1, 2]: bait = "السردين أو القمبري"
     elif month in [3, 4, 5]: bait = "الحبار أو الدود البحري"
@@ -468,6 +504,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     actual_swell_exists = has_swell_data and max(swh) > 0.05
 
     sea_memory = "بحر صافي وهادئ"
+    past_rain_total = 0.0
     if past_idx:
         p_wh = aligned.get("wave_height", []); p_wp = aligned.get("wave_period", [])
         p_swh = aligned.get("swell_wave_height", []); p_swp = aligned.get("swell_wave_period", [])
@@ -486,11 +523,11 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             past_avg = weighted_past_power / total_weight if total_weight > 0 else 0
             past_sh = weighted_past_swh / total_weight if total_weight > 0 else 0
             past_onshore_ratio = past_onshore_hours / total_weight
-            past_rain = past_rain / len(valid_past)
+            past_rain_total = past_rain / len(valid_past)
             if past_avg > 6.0 and past_onshore_ratio > 0.4: sea_memory = "بحر خامر وعكر جداً."
             elif past_avg > 4.0 and past_onshore_ratio > 0.3: sea_memory = "بحر يعكر ببطء."
             if past_sh > 0.8 and past_avg > 4.0: sea_memory += " | تحذير صوفة."
-            if past_rain > 10.0: sea_memory += " | سيول."
+            if past_rain_total > 10.0: sea_memory += " | سيول."
 
     lateral_fx = 0.0; lateral_fy = 0.0; max_wh = max(wh) if wh else 0.0
     for i in range(len(wh)):
@@ -601,6 +638,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_press_b = sum(pr[i] for i in idxs)/len(idxs) if pr else 0
         avg_vis_b = sum(vis[i] for i in idxs)/len(idxs) if vis else 0
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
+        avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
 
         sea = "بحر مرآوي" if max_h < 0.4 else "هادئ" if max_h < 0.8 else "متوسط الهيجان" if max_h < 1.2 else "هائج"
         final_swd = None if avg_swd_b == 0.0 else avg_swd_b
@@ -621,14 +659,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
 
-        # حساب أفضل مسافة للرمي
+        # تحليل الموج الراجع (Backwash)
+        backwash = analyze_backwash(avg_w, avg_wd_b, orient, avg_h)
+
+        # تحليل الأوساخ والصوفة
+        debris = analyze_debris_risk(sea_memory, past_rain_total, avg_w)
+
         base_dist = 50
-        if avg_h > 0.8:
-            base_dist = 40
-        elif avg_h > 0.5:
-            base_dist = 50
-        else:
-            base_dist = 60
+        if avg_h > 0.8: base_dist = 40
+        elif avg_h > 0.5: base_dist = 50
+        else: base_dist = 60
         recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
 
         block_data = {
@@ -645,6 +685,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "wind_dir":wc_dom, "air_temp":round(avg_air,1), "weather":weather_desc(most_code),
             "confidence": confidence,
             "recommended_cast_distance": round(recommended_dist, 0),
+            "backwash": backwash,
+            "debris": debris,
             "_raw": {
                 "avg_wave_h": round(avg_h, 3), "max_wave_h": round(max_h, 3),
                 "avg_wind": round(avg_w, 1), "max_wind": round(max_w, 1),
@@ -675,7 +717,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "is_mirror_sea": is_mirror_sea, "tidal_windows": tidal_windows, "golden_windows": golden_windows,
         "has_swell_data": has_swell_data, "actual_swell_exists": actual_swell_exists,
         "solunar": solunar, "slack_times": slack_info,
-        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait
+        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
+        "past_rain_total": round(past_rain_total, 1)
     }
 
     flags = {
@@ -754,6 +797,8 @@ def calculate_interactions(agg: dict) -> List[str]:
         wind_effect_dist = raw.get("wind_effect_dist", 0)
         wp_desc = "طويل" if raw.get("wave_period",0) > 9 else "قصير" if raw.get("wave_period",0) < 5 else "متوسط"
         recommended_dist = raw.get("recommended_cast_distance", 50)
+        backwash = b.get("backwash", {})
+        debris = b.get("debris", {})
 
         interactions.append(f"[ديناميكية {name} ({time_range})] حالة البحر: {sea_state}. الثقة: {b.get('confidence',0)}%")
         if is_mirror_sea:
@@ -764,8 +809,6 @@ def calculate_interactions(agg: dict) -> List[str]:
             if has_swell: interactions.append(f"  → السويل: موجود بارتفاع {block_swell_h:.2f}م لكنه غير كافٍ لخلق حركة قاعية.")
             else: interactions.append(f"  → السويل: {b['swell_dir']}. لا مساهمة في الحركة.")
             interactions.append(f"  → القاع: ثابت، لا تحريك للرمال. الطعم يبقى ساكناً. تقنية اللونص ممنوعة.")
-            if weed_risk.get("risk") != "منخفض":
-                interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
         else:
             interactions.append(f"  → الرياح: {wind_cls} بمتوسط {avg_wind} كم/س، هبات {max_gust} كم/س. تأثير على الرمي: {wind_effect_dist:.0f}م.")
             wave_angle = b.get("wave_angle_diff")
@@ -774,8 +817,18 @@ def calculate_interactions(agg: dict) -> List[str]:
             if "بشدة" in wave_interaction: interactions.append(f"  → تقاطع السويل والموج: {wave_interaction}. فوضى دوامية.")
             if max_gust > 35: interactions.append(f"  → تحذير الهبات: {max_gust} كم/س.")
             interactions.append(f"  → فترة الموج: {wp_desc}. {'الموج الطويل يمسك الرصاصة بلطف ويحركها.' if wp_desc=='طويل' else 'الموج القصير يخلخل الرصاصة بسرعة.'}")
-            if weed_risk.get("risk") != "منخفض":
-                interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
+
+        # تحليل الموج الراجع (Backwash)
+        if backwash.get("severity") != "منخفض":
+            interactions.append(f"  → تحذير الموج الراجع (Backwash): {backwash.get('effect','')}")
+
+        # تحليل الأوساخ والصوفة
+        if debris.get("risk") != "منخفض":
+            interactions.append(f"  → تحذير الأوساخ والصوفة: {debris.get('effect','')}")
+
+        # تحذير الصوفة
+        if weed_risk.get("risk") != "منخفض":
+            interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
 
         # أفضل مسافة للرمي
         interactions.append(f"  → أفضل مسافة للرمي: حوالي {recommended_dist:.0f} متر.")
@@ -825,7 +878,6 @@ def build_context(req, agg, tz_name):
             f"تقاطع سويل/موج={b.get('swell_wave_interaction','?')}"
         )
 
-    # الملخص التنفيذي
     final_verdict = agg["final_verdict"]
     golden_windows = agg["extra_info"].get("golden_windows", [])
     best_time = "غير محدد"
@@ -851,7 +903,6 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-# SYSTEM_PROMPT الكلاسيكي مع تحذير الأعشاب
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم لغة المد والجزر والساعات الذهبية.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 
@@ -868,19 +919,27 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 
 2. التفكيك الديناميكي الزمني:
 - لكل فترة (صباح، ظهيرة، ليل)، خذ التحليل الميكانيكي من "ديناميكية الفترة" واكتبه بلغة تونسية احترافية.
-- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، أفضل مسافة للرمي، إلخ.
+- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، أفضل مسافة للرمي.
+- إذا كان هناك تحذير من الموج الراجع (Backwash)، اشرح كيف يرجع الرصاصة للشاطئ وكيف يؤثر على الصيد.
+- إذا كان هناك تحذير من الأوساخ والصوفة، اشرح كيف تتراكم على الخيط وتجعل الصيد مستحيلاً.
 - لا تكرر نفس الجملة مرتين.
 - إذا كان البحر مرآوياً، اشرح لماذا كل تقنية غير ممكنة.
 - تحدث عن تأثير فترة الموج (طويل/قصير) على الرصاصة.
 - تحدث عن تأثير الرؤية إذا كانت مذكورة (ضعيفة = إيجابية، ممتازة نهاراً = سلبية).
 
-3. التكتيك الميداني (قاعدة حفرية):
+3. العوامل التي تجعل الصيد مستحيلاً (جدول):
+- إذا كان الحسم "No-Go"، اكتب قائمة (جدول) بجميع العوامل التي تمنع الصيد اليوم (الموج الراجع، الصوفة، الأوساخ، العكارة، الضغط، المد الضعيف، الهبات).
+- صف كل عامل وتأثيره في جملة واحدة.
+
+4. التكتيك الميداني (قاعدة حفرية):
 - اكتبه إذا كان الحسم "Go" أو "Conditional Go". في حالة "Conditional Go"، أضف تحذيرات إضافية.
 - إذا كان الحسم "No-Go"، امسح هذا القسم بالكامل.
 
-4. السلامة:
+5. السلامة:
 - نصائح سلامة بسيطة حسب الظروف (تيار جانبي قوي، صخور زلقة، هبات رياح).
 - إذا كان خطر الصوفة مرتفعاً، أضف فقرة خاصة: "⚠️ تحذير صوفة وأعشاب: [نصيحة من weed_risk.advice]".
+- إذا كان هناك تحذير من الموج الراجع، أضف فقرة خاصة: "⚠️ تحذير التيار الراجع: [نصيحة من backwash.effect]".
+- إذا كان هناك تحذير من الأوساخ، أضف فقرة خاصة: "⚠️ تحذير تراكم الأوساخ: [نصيحة من debris.effect]".
 - اذكرها في نهاية التقرير.
 
 قواعد صارمة:
@@ -897,7 +956,7 @@ async def call_openrouter(ctx):
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
 
-# ==================== فحص هلوسة صارم (مُحسَّن) ====================
+# ==================== فحص هلوسة صارم ====================
 def extract_numbers_from_text(text: str) -> List[float]:
     pattern = r'-?\d+\.?\d*'
     matches = re.findall(pattern, text)
@@ -910,6 +969,12 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
         for v in raw.values():
             if isinstance(v, (int, float)):
                 allowed.add(round(v, 1))
+        if "confidence" in b:
+            allowed.add(round(b["confidence"], 1))
+        if "recommended_cast_distance" in b:
+            allowed.add(round(b["recommended_cast_distance"], 1))
+        if "wind_gust_peak" in b:
+            allowed.add(round(b["wind_gust_peak"], 1))
     extra = agg.get("extra_info", {})
     for v in extra.values():
         if isinstance(v, (int, float)):
@@ -920,6 +985,7 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     allowed.add(round(agg.get("avg_sst", 0), 1))
     allowed.add(round(extra.get("max_air_temp", 0), 1))
     allowed.add(round(extra.get("peak_gust_today", 0), 1))
+    allowed.add(round(extra.get("pressure_avg", 0), 1))
     return {x for x in allowed if x > 0.5}
 
 @app.post("/generate-report")
@@ -948,14 +1014,14 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # فحص هلوسة صارم (مصحح للأوقات)
+        # فحص هلوسة صارم
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
         suspicious = [
             n for n in report_numbers
             if n > 0.5
             and n not in allowed_numbers
-            and not (n.is_integer() and 0 <= n <= 24)
+            and not (n.is_integer() and 0 <= n <= 59)
         ]
         if suspicious:
             logger.warning(f"أرقام غير مطابقة في التقرير: {suspicious}")
