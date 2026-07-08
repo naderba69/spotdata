@@ -383,7 +383,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     seabass_sst_limit = 20.0 if month in [6, 7, 8, 9] else 18.0
     
     if avg_sst > seabass_sst_limit:
-        nogo_reasons.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص ({seabass_sst_limit}°م في {month}).
+        nogo_reasons.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص ({seabass_sst_limit}°م في {month}).")
 
     bio_matrix = {
         "قاروص": {"status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً", "reason": f"يحتاج عكراً ودرجة أقل من {seabass_sst_limit}°م."},
