@@ -1,8 +1,10 @@
 """
-Surfcasting Analytics API – v16.0.2 (Production-Ready, خالي من الأخطاء)
-- إصلاح: تعريف format_time عالميًا، وإزالته من داخل estimate_tidal_windows.
-- تدقيق: لا توجد استثناءات غير معالجة، جميع الدوال معرفة.
-- جميع التحليلات الـ 16 (1–15 + 18) مدمجة، مبنية على أرقام حقيقية.
+Surfcasting Analytics API – v16.0.3 (Production-Ready)
+- إصلاح 1: معالجة الأوقات السالبة في format_time بفضل معامل % 24.
+- إصلاح 2: تعديل منطق الحسم النهائي (No-Go) ليعتمد على حجم القائمة لا على مطابقة النصوص الهشة.
+- إصلاح 3: إعادة حساب انحدار الموج (Steepness) المفقود ودمجه في hidden_factors.
+- إصلاح 4: تفعيل بيانات الرؤية (Visibility) في التفاعلات وسياق الذكاء الاصطناعي.
+- إصلاح 5: حذف كود الموت (Dead Code) الخاص بـ wave_period_desc من extra.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
@@ -23,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.0.2")
+app = FastAPI(title="Surfcasting Analytics", version="16.0.3")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -54,7 +56,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.0.2"}
+    return {"status": "ok", "version": "16.0.3"}
 
 # ==================== دوال مساعدة عالمية ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -104,8 +106,10 @@ def calc_distance(lat1, lon1, lat2, lon2):
     dlon = (lon2 - lon1) * 111320 * math.cos(math.radians((lat1 + lat2) / 2))
     return math.sqrt(dlat**2 + dlon**2)
 
+# [إصلاح 1] معالجة الأوقات السالبة لمنع قيم مثل "00:-15"
 def format_time(h: float) -> str:
     """تحويل ساعة عشرية إلى نص HH:MM."""
+    h = h % 24  # ضمان أن القيمة دائماً بين 0 و 23.99
     hh = int(h)
     mm = int((h - hh) * 60)
     return f"{hh:02d}:{mm:02d}"
@@ -426,6 +430,11 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         elif max_cross > 45: cross_sea_risk = "بحر مختلط متوسط"
     if is_cross_sea_dangerous: nogo_reasons.append("بحر مختلط خطير: السويل والموج المحلي يتقاطعان بزاوية كبيرة.")
 
+    # [إصلاح 3] إعادة حساب انحدار الموج (Steepness) المفقود
+    steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p > 0]
+    avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
+    steepness_desc = "موج حاد وقصير" if avg_steepness > 0.06 else "موج طويل" if avg_steepness < 0.03 else "موج متوسط"
+
     tide_analysis = get_moon_and_tide_analysis(target_date_obj)
     tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude)
     solunar = calculate_solunar(target_date_obj, latitude)
@@ -520,8 +529,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if "بحرية" in wc_dom: wind_effect_dist = avg_w * 1.2
         elif "برية" in wc_dom: wind_effect_dist = -avg_w * 1.0
 
-        wave_period_desc = "طويل" if avg_wp_b > 9 else "قصير" if avg_wp_b < 5 else "متوسط"
-
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
 
@@ -561,14 +568,14 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     weed_analysis = analyze_weed_risk(sea_memory, wh, wd, orient)
     seasonal_bait = get_seasonal_bait(month, avg_sst)
 
+    # [إصلاح 5] حذف كود الموت (Dead Code) الخاص بـ wave_period_desc من extra
     extra = {
         "pressure_avg":round(avg_press,1), "peak_gust_today":round(peak_gust,1),
         "sunrise":sunrise, "sunset":sunset, "max_air_temp": round(max_air_temp, 1),
         "is_mirror_sea": is_mirror_sea, "tidal_windows": tidal_windows, "golden_windows": golden_windows,
         "has_swell_data": has_swell_data, "actual_swell_exists": actual_swell_exists,
         "solunar": solunar, "slack_times": slack_info,
-        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
-        "wave_period_desc": wave_period_desc
+        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait
     }
 
     flags = {
@@ -578,16 +585,19 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "has_golden_window": has_golden_window, "is_neap_tide": is_neap_tide, "is_spring_tide": is_spring_tide
     }
 
-    critical_nogo = [r for r in nogo_reasons if any(kw in r for kw in ["مرآوي", "مختلط خطير", "ضغط مرتفع حاد", "لا توجد ساعة ذهبية"])]
-    if critical_nogo: final_verdict = "No-Go"
-    elif warnings: final_verdict = "Conditional Go"
-    else: final_verdict = "Go"
+    # [إصلاح 2] تعديل منطق الحسم النهائي (No-Go) ليعتمد على حجم القائمة لا على مطابقة النصوص
+    if nogo_reasons:
+        final_verdict = "No-Go"
+    elif warnings:
+        final_verdict = "Conditional Go"
+    else:
+        final_verdict = "Go"
 
     return {
         "dominant_wind":dominant, "blocks":blocks, "red_flags":reds[:5], "green_flags":greens[:5],
         "sea_memory":sea_memory, "lateral_current":lateral_current, "pressure_state":pressure_state,
         "tide_analysis":tide_analysis, "sst_stability":sst_stability,
-        "hidden_factors": {"cross_sea_risk": cross_sea_risk, "golden_lock": "مد قوي" if is_spring_tide else "مد ضعيف" if is_neap_tide else "متوسط"},
+        "hidden_factors": {"cross_sea_risk": cross_sea_risk, "wave_steepness": steepness_desc, "golden_lock": "مد قوي" if is_spring_tide else "مد ضعيف" if is_neap_tide else "متوسط"},
         "bio_matrix":bio_matrix, "avg_sst":round(avg_sst,1), "extra_info":extra,
         "transitions": [], "flags": flags,
         "nogo_reasons": nogo_reasons, "warnings": warnings,
@@ -624,7 +634,7 @@ def calculate_interactions(agg: dict) -> List[str]:
     weed_risk = extra.get("weed_risk", {})
     seasonal_bait = extra.get("seasonal_bait", "غير محدد")
     slack_info = extra.get("slack_times", "غير محدد")
-    wave_period_desc = extra.get("wave_period_desc", "متوسط")
+    hidden_factors = agg.get("hidden_factors", {})
 
     hw1 = tidal_windows.get("HW1", "?"); lw1 = tidal_windows.get("LW1", "?")
     hw2 = tidal_windows.get("HW2", "?"); lw2 = tidal_windows.get("LW2", "?")
@@ -636,6 +646,7 @@ def calculate_interactions(agg: dict) -> List[str]:
         interactions.append(f"[ساعات ذهبية] {golden_windows[0] if golden_windows else 'لا توجد معلومات.'}")
     interactions.append(f"[فترات سولونار] Major: {solunar.get('major1')} و {solunar.get('major2')} | Minor: {solunar.get('minor1')} و {solunar.get('minor2')}.")
     interactions.append(f"[المياه الميتة (Slack)] {slack_info}")
+    interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
     for b in blocks:
         name = b['name']; time_range = b['time_range']; raw = b.get("_raw", {})
@@ -669,6 +680,13 @@ def calculate_interactions(agg: dict) -> List[str]:
             if weed_risk.get("risk") != "منخفض":
                 interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
 
+        # [إصلاح 4] تفعيل بيانات الرؤية (Visibility) في التفاعلات
+        avg_vis = raw.get("visibility", 10000)
+        if avg_vis < 1000:
+            interactions.append(f"  → الرؤية: ضعيفة جداً ({avg_vis:.0f}م). نقطة إيجابية قوية لإخفاء الصياد وخط الطعم.")
+        elif avg_vis > 8000 and name != "الليل":
+            interactions.append(f"  → الرؤية: ممتازة ({avg_vis:.0f}م). السمك يرى الخط والصياد بوضوح، نقطة سلبية.")
+
     interactions.append(f"[حرارة الماء] {avg_sst}°م. الاستقرار: {agg.get('sst_stability','?')}.")
     interactions.append(f"[ذاكرة البحر] {sea_memory}")
     interactions.append(f"[الضغط] {pressure_state}")
@@ -699,11 +717,13 @@ def build_context(req, agg, tz_name):
     blocks_raw_text = []
     for b in agg["blocks"]:
         r = b.get("_raw", {})
+        # [إصلاح 4] إضافة الرؤية لسياق الذكاء الاصطناعي
         blocks_raw_text.append(
             f"  {b['name']} ({b['time_range']}): بحر={b['sea_state']}, "
             f"موج أقصى={r.get('max_wave_h',0):.2f}م، رياح={b['wind_dir']} ({r.get('avg_wind',0)} كم/س), "
             f"هبات={r.get('max_gust',0)} كم/س، سويل={'موجود' if r.get('has_swell') else 'معدوم'} "
             f"({r.get('swell_h',0):.2f}م)، حرارة={r.get('air_temp',0)}°م، "
+            f"رؤية={r.get('visibility',0):.0f}م، "
             f"تقاطع سويل/موج={b.get('swell_wave_interaction','?')}"
         )
     lines = [
@@ -724,14 +744,17 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - اذكر اسم القمر وقوة المد.
 - اشرح الساعة الذهبية وتأثيرها.
 - اذكر فترات سولونار (Major/Minor) وأهميتها.
+- اذكر أوقات الـ Slack water (المياه الميتة) وتأثيرها على توقف التيار.
+- اذكر انحدار الموج (حاد/طويل) وتأثيره على الرصاصة.
 - إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه عملياً.
 
 2. التفكيك الديناميكي الزمني:
 - لكل فترة (صباح، ظهيرة، ليل)، خذ التحليل الميكانيكي من "ديناميكية الفترة" واكتبه بلغة تونسية احترافية.
-- ربط السبب بالنتيجة: الرياح، الموج، السويل، الفترة، الصوفة، الطعم الموسمي، إلخ.
+- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، إلخ.
 - لا تكرر نفس الجملة مرتين.
 - إذا كان البحر مرآوياً، اشرح لماذا كل تقنية غير ممكنة.
 - تحدث عن تأثير فترة الموج (طويل/قصير) على الرصاصة.
+- تحدث عن تأثير الرؤية إذا كانت مذكورة (ضعيفة = إيجابية، ممتازة نهاراً = سلبية).
 
 3. التكتيك الميداني (قاعدة حفرية):
 - اكتبه إذا كان الحسم "Go" أو "Conditional Go". في حالة "Conditional Go"، أضف تحذيرات إضافية.
