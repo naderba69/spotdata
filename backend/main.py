@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v16.0.7 (Production‑Ready, Precision‑Restored)
-- تمت إزالة شرط best_dist > radius * 2 من Overpass لإعادة الدقة الأصلية.
+Surfcasting Analytics API – v16.0.8 (Final Stable)
+- استعادة دالة Overpass الأصلية (v15.0.0) لتحديد اتجاه الشاطئ بدقة.
+- جميع التحليلات الإضافية (1–15 + 18) مبنية على أرقام حقيقية.
+- واجهة /detect-bottom-type مضافة.
 - لا تراجع إلى الشواطئ المحفوظة في /auto-orientation.
-- واجهة /detect-bottom-type تستخدم الشواطئ المحفوظة.
-- جميع التحليلات (1–15 + 18) مبنية على أرقام حقيقية.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.0.7")
+app = FastAPI(title="Surfcasting Analytics", version="16.0.8")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -58,7 +58,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.0.7"}
+    return {"status": "ok", "version": "16.0.8"}
 
 # ==================== دوال مساعدة عالمية ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -254,7 +254,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ المحفوظة (فقط لاستخدام /detect-bottom-type) ====================
+# ==================== الشواطئ المحفوظة (فقط لـ /detect-bottom-type) ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
@@ -273,12 +273,11 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
-# ==================== حساب اتجاه الشاطئ (Overpass فقط) – النسخة الأصلية بدون شرط المسافة ====================
+# ==================== دالة Overpass الأصلية (من v15.0.0) ====================
 async def get_auto_orientation_overpass(lat, lon):
     """
-    نفس منطق v16.0.1 تماماً: يبحث في 3 أنصاف أقطار، يأخذ أقرب نقطة ساحلية،
-    يحسب المماس والعمودي ويحدد الاتجاه نحو البحر.
-    لا يوجد شرط best_dist > radius * 2.
+    الخوارزمية الأصلية التي كانت تعمل بدقة عالية.
+    تستخدم أقرب نقطة ساحلية وتحسب الاتجاه نحو البحر بناءً على المماس.
     """
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
@@ -286,48 +285,31 @@ async def get_auto_orientation_overpass(lat, lon):
             async with httpx.AsyncClient() as c:
                 r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
                 r.raise_for_status()
-                data = r.json()
-                elements = data.get("elements", [])
-                if not elements:
+                els = r.json().get("elements", [])
+                if not els:
                     continue
-
-                best_dist = float('inf')
-                best_prev = best_curr = best_next = None
-
-                for el in elements:
+                best_dist, best_tangent, best_point = float('inf'), None, None
+                for el in els:
                     geom = el.get("geometry", [])
-                    if len(geom) < 3:
+                    if len(geom) < 2:
                         continue
-                    for i in range(len(geom)):
-                        p = geom[i]
-                        d = calc_distance(lat, lon, p["lat"], p["lon"])
-                        if d < best_dist:
-                            best_dist = d
-                            prev_i = i - 1 if i > 0 else 0
-                            next_i = i + 1 if i < len(geom) - 1 else len(geom) - 1
-                            best_prev = geom[prev_i]
-                            best_curr = p
-                            best_next = geom[next_i]
-
-                if not best_curr:   # فقط هذا الشرط كما في الأصل
+                    closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
+                    p = geom[closest_idx]
+                    d = calc_distance(lat, lon, p["lat"], p["lon"])
+                    if d < best_dist:
+                        best_dist, best_point = d, p
+                        prev_i = closest_idx - 1 if closest_idx > 0 else 0
+                        next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
+                        if prev_i != next_i:
+                            best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
+                if not best_tangent or not best_point:
                     continue
-
-                tangent = calc_bearing(best_prev["lat"], best_prev["lon"],
-                                       best_next["lat"], best_next["lon"])
-                perp1 = (tangent + 90) % 360
-                perp2 = (tangent - 90) % 360
-
-                to_user = calc_bearing(best_curr["lat"], best_curr["lon"], lat, lon)
-
-                if angle_diff(to_user, perp1) < angle_diff(to_user, perp2):
-                    shore_normal = perp1
-                else:
-                    shore_normal = perp2
-
-                sea_dir = (shore_normal + 180) % 360
-                return int(round(sea_dir))
-
-        except Exception:
+                n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
+                c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+                d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
+                d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
+                return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
+        except:
             continue
     return 0
 
