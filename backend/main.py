@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v16.3.0 (Complete Engine)
+Surfcasting Analytics API – v16.3.1 (Final Production Release)
 - تحليل الموج الراجع (Backwash) وتأثيره على استقرار الرصاصة.
 - تحليل تراكم الأوساخ والصوفة على الخيط وتأثيرها على الصيد.
 - تحليل العكارة الشديدة بعد السيول وتأثيرها على رؤية السمك.
-- جدول العوامل المانعة للصيد (No‑Go Factors).
+- قائمة العوامل المانعة للصيد (No‑Go Factors) بشكل نقاط بدلاً من جدول.
 - جميع التحليلات السابقة (سولونار، مياه ميتة، أعشاب، طعم موسمي، ثقة، رؤية، انحدار الموج).
 - فحص هلوسة صارم على الأرقام والقرار النهائي.
 - جميع الإصلاحات التقنية (HTTP client, 429 retry, ZeroDivision, tidal wrap, safe_float, cache).
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.3.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.3.1", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -73,7 +73,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.3.0"}
+    return {"status": "ok", "version": "16.3.1"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -281,6 +281,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
+# ==================== الشواطئ التونسية ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
@@ -309,6 +310,7 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
+# ==================== دوال Overpass ====================
 async def fetch_overpass(query: str, timeout: int = 15) -> dict:
     for attempt in range(1, 4):
         try:
@@ -418,7 +420,6 @@ def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
     return {"risk": risk, "advice": advice}
 
 def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_height: float) -> dict:
-    """تحليل الموج الراجع (Backwash) الذي يرجع الرصاصة للشاطئ."""
     wind_diff = angle_diff(wind_dir, orient)
     is_onshore = wind_diff < 30
     is_strong = wind_speed > 25
@@ -433,7 +434,6 @@ def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_hei
     return {"severity": severity, "effect": effect}
 
 def analyze_debris_risk(sea_memory: str, past_rain: float, wind_speed: float) -> dict:
-    """تحليل خطر تراكم الأوساخ والصوفة على الخيط."""
     has_floods = "سيول" in sea_memory
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     is_windy = wind_speed > 20
@@ -659,10 +659,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
 
-        # تحليل الموج الراجع (Backwash)
         backwash = analyze_backwash(avg_w, avg_wd_b, orient, avg_h)
-
-        # تحليل الأوساخ والصوفة
         debris = analyze_debris_risk(sea_memory, past_rain_total, avg_w)
 
         base_dist = 50
@@ -818,19 +815,13 @@ def calculate_interactions(agg: dict) -> List[str]:
             if max_gust > 35: interactions.append(f"  → تحذير الهبات: {max_gust} كم/س.")
             interactions.append(f"  → فترة الموج: {wp_desc}. {'الموج الطويل يمسك الرصاصة بلطف ويحركها.' if wp_desc=='طويل' else 'الموج القصير يخلخل الرصاصة بسرعة.'}")
 
-        # تحليل الموج الراجع (Backwash)
         if backwash.get("severity") != "منخفض":
             interactions.append(f"  → تحذير الموج الراجع (Backwash): {backwash.get('effect','')}")
-
-        # تحليل الأوساخ والصوفة
         if debris.get("risk") != "منخفض":
             interactions.append(f"  → تحذير الأوساخ والصوفة: {debris.get('effect','')}")
-
-        # تحذير الصوفة
         if weed_risk.get("risk") != "منخفض":
             interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
 
-        # أفضل مسافة للرمي
         interactions.append(f"  → أفضل مسافة للرمي: حوالي {recommended_dist:.0f} متر.")
 
         avg_vis = raw.get("visibility", 10000)
@@ -909,48 +900,41 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 هيكل التقرير الإجباري:
 
 1. التوقيت المدوي:
-- اذكر أوقات HW1, LW1, HW2, LW2 بالأرقام.
+- اذكر أوقات HW1, LW1, HW2, LW2.
 - اذكر اسم القمر وقوة المد.
 - اشرح الساعة الذهبية وتأثيرها.
-- اذكر فترات سولونار (Major/Minor) وأهميتها.
-- اذكر أوقات الـ Slack water (المياه الميتة) وتأثيرها على توقف التيار.
-- اذكر انحدار الموج (حاد/طويل) وتأثيره على الرصاصة.
-- إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه عملياً.
+- اذكر فترات سولونار (Major/Minor).
+- اذكر أوقات Slack water.
+- اذكر انحدار الموج.
+- إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه.
 
 2. التفكيك الديناميكي الزمني:
-- لكل فترة (صباح، ظهيرة، ليل)، خذ التحليل الميكانيكي من "ديناميكية الفترة" واكتبه بلغة تونسية احترافية.
-- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، أفضل مسافة للرمي.
-- إذا كان هناك تحذير من الموج الراجع (Backwash)، اشرح كيف يرجع الرصاصة للشاطئ وكيف يؤثر على الصيد.
-- إذا كان هناك تحذير من الأوساخ والصوفة، اشرح كيف تتراكم على الخيط وتجعل الصيد مستحيلاً.
-- لا تكرر نفس الجملة مرتين.
-- إذا كان البحر مرآوياً، اشرح لماذا كل تقنية غير ممكنة.
-- تحدث عن تأثير فترة الموج (طويل/قصير) على الرصاصة.
-- تحدث عن تأثير الرؤية إذا كانت مذكورة (ضعيفة = إيجابية، ممتازة نهاراً = سلبية).
+- لكل فترة (صباح، ظهيرة، ليل)، اكتب التحليل بلغة تونسية احترافية (من 3 إلى 5 جمل).
+- إذا كان هناك Backwash، اشرح تأثيره.
+- إذا كان هناك أوساخ/صوفة، اشرح تأثيرها على الخيط.
+- اذكر أفضل مسافة للرمي.
 
-3. العوامل التي تجعل الصيد مستحيلاً (جدول):
-- إذا كان الحسم "No-Go"، اكتب قائمة (جدول) بجميع العوامل التي تمنع الصيد اليوم (الموج الراجع، الصوفة، الأوساخ، العكارة، الضغط، المد الضعيف، الهبات).
-- صف كل عامل وتأثيره في جملة واحدة.
+3. العوامل التي تجعل الصيد مستحيلاً (فقط إذا كان الحسم No-Go):
+- اكتب قائمة بالنقاط (•) للعوامل المانعة للصيد.
+- كل نقطة تبدأ بالعامل ثم شرطة (-) ثم التأثير.
 
-4. التكتيك الميداني (قاعدة حفرية):
-- اكتبه إذا كان الحسم "Go" أو "Conditional Go". في حالة "Conditional Go"، أضف تحذيرات إضافية.
-- إذا كان الحسم "No-Go"، امسح هذا القسم بالكامل.
+4. التكتيك الميداني:
+- اكتبه فقط إذا كان Go أو Conditional Go.
+- إذا كان No-Go، لا تكتب هذا القسم.
 
 5. السلامة:
-- نصائح سلامة بسيطة حسب الظروف (تيار جانبي قوي، صخور زلقة، هبات رياح).
-- إذا كان خطر الصوفة مرتفعاً، أضف فقرة خاصة: "⚠️ تحذير صوفة وأعشاب: [نصيحة من weed_risk.advice]".
-- إذا كان هناك تحذير من الموج الراجع، أضف فقرة خاصة: "⚠️ تحذير التيار الراجع: [نصيحة من backwash.effect]".
-- إذا كان هناك تحذير من الأوساخ، أضف فقرة خاصة: "⚠️ تحذير تراكم الأوساخ: [نصيحة من debris.effect]".
-- اذكرها في نهاية التقرير.
+- نصائح سلامة موجزة.
+- أضف تحذير Backwash إذا كان موجوداً.
+- أضف تحذير الأوساخ إذا كان موجوداً.
 
 قواعد صارمة:
-- لا تقل "كما ذكرنا سابقاً" أو "بالنسبة لما سبق". كل قسم مستقل.
-- لا تخلق معلومات ليست في السياق.
-- لا تخترع أرقاماً غير موجودة في البيانات. استخدم فقط الأرقام الواردة في التفاعلات.
-- اكتب بالدارجة التونسية الاحترافية المفصلة."""
+- لا تستخدم جداول Markdown (لأنها تستهلك مساحة كبيرة).
+- لا تكرر المعلومات.
+- اكتب بالدارجة التونسية المفصلة."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":6000,"temperature":0.1}
+    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":8000,"temperature":0.1}
     data = await post_with_retry(OPENROUTER_URL, payload, headers)
     if "choices" in data and data["choices"]:
         return data["choices"][0]["message"]["content"]
@@ -1014,7 +998,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # فحص هلوسة صارم
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
         suspicious = [
