@@ -1,9 +1,8 @@
 """
-Surfcasting Analytics API – v16.0.8 (Final Stable)
-- استعادة دالة Overpass الأصلية (v15.0.0) لتحديد اتجاه الشاطئ بدقة.
-- جميع التحليلات الإضافية (1–15 + 18) مبنية على أرقام حقيقية.
-- واجهة /detect-bottom-type مضافة.
-- لا تراجع إلى الشواطئ المحفوظة في /auto-orientation.
+Surfcasting Analytics API – v16.0.9 (Hybrid Stable)
+- استعادة منطق v15.0.0 لتحديد الاتجاه: Overpass ثم الرجوع إلى الشواطئ المحفوظة.
+- جميع التحليلات المتقدمة (سولونار، رؤية، ثقة، طعم موسمي، سلامة...).
+- واجهة /detect-bottom-type.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
@@ -23,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.0.8")
+app = FastAPI(title="Surfcasting Analytics", version="16.0.9")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -58,7 +57,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.0.8"}
+    return {"status": "ok", "version": "16.0.9"}
 
 # ==================== دوال مساعدة عالمية ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -254,7 +253,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ المحفوظة (فقط لـ /detect-bottom-type) ====================
+# ==================== الشواطئ التونسية (للاستخدام في الاتجاه ونوع القاع) ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
@@ -262,6 +261,16 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
     {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
 ]
+
+def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
+    min_dist = float('inf')
+    nearest_orient = None
+    for b in TUNISIAN_BEACHES:
+        dist = calc_distance(b["lat"], b["lon"], lat, lon)
+        if dist < min_dist and dist < 20000:
+            min_dist = dist
+            nearest_orient = b["orientation"]
+    return nearest_orient
 
 def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
     min_dist = float('inf')
@@ -275,10 +284,6 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
 
 # ==================== دالة Overpass الأصلية (من v15.0.0) ====================
 async def get_auto_orientation_overpass(lat, lon):
-    """
-    الخوارزمية الأصلية التي كانت تعمل بدقة عالية.
-    تستخدم أقرب نقطة ساحلية وتحسب الاتجاه نحو البحر بناءً على المماس.
-    """
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
         try:
@@ -319,8 +324,11 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
     if orientation != 0:
         return {"orientation": orientation, "source": "overpass"}
-    # لا رجوع إلى الشواطئ المحفوظة
-    return {"orientation": -1, "source": "none", "message": "تعذر التحديد الدقيق. تأكد من قربك من خط الساحل."}
+    # الرجوع إلى الشواطئ المحفوظة (نفس سلوك v15.0.0)
+    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
+    if orientation is not None:
+        return {"orientation": orientation, "source": "nearest_beach"}
+    return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
@@ -624,19 +632,15 @@ def calculate_interactions(agg: dict) -> List[str]:
     extra = agg.get("extra_info", {})
     blocks = agg.get("blocks", [])
     is_mirror_sea = flags.get("is_mirror_sea", False)
-    is_lateral_strong = flags.get("is_lateral_strong", False)
     is_pressure_rising_fast = flags.get("is_pressure_rising_fast", False)
     is_pressure_dropping_fast = flags.get("is_pressure_dropping_fast", False)
-    is_cross_sea_dangerous = flags.get("is_cross_sea_dangerous", False)
     has_golden_window = flags.get("has_golden_window", False)
     is_neap_tide = flags.get("is_neap_tide", False)
     is_spring_tide = flags.get("is_spring_tide", False)
-    actual_swell_exists = extra.get("actual_swell_exists", False)
 
     golden_windows = extra.get("golden_windows", [])
     tidal_windows = extra.get("tidal_windows", {})
     tide_analysis = agg.get("tide_analysis", {})
-    bio_matrix = agg.get("bio_matrix", {})
     sea_memory = agg.get("sea_memory", "")
     avg_sst = agg.get("avg_sst", 0)
     pressure_state = agg.get("pressure_state", "")
@@ -667,7 +671,7 @@ def calculate_interactions(agg: dict) -> List[str]:
         avg_wind = raw.get("avg_wind", 0); max_gust = raw.get("max_gust", 0)
         wave_interaction = b.get("swell_wave_interaction", "")
         has_swell = raw.get("has_swell", False)
-        air_temp = raw.get("air_temp", 0); block_swell_h = raw.get("swell_h", 0)
+        block_swell_h = raw.get("swell_h", 0)
         wind_effect_dist = raw.get("wind_effect_dist", 0)
         wp_desc = "طويل" if raw.get("wave_period",0) > 9 else "قصير" if raw.get("wave_period",0) < 5 else "متوسط"
 
