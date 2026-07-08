@@ -1,16 +1,16 @@
 """
-Surfcasting Analytics API – v16.1.0 (Stable Hybrid)
-- مبني على النسخة v15.0.0 العاملة مع إضافة جميع التحليلات المتقدمة.
-- Overpass والرجوع إلى الشواطئ المحفوظة كما في v15.0.0 (دقة عالية).
-- تحليلات جديدة: سولونار، مياه ميتة، أعشاب، طعم موسمي، ثقة، رؤية، انحدار الموج.
-- واجهة /detect-bottom-type.
-- إصلاح httpx.DecodingError واستخدام json.JSONDecodeError.
-- format_time أصبحت دالة عالمية.
+Surfcasting Analytics API – v16.2.1 (Polished)
+- معالجة آمنة لتنسيق الشروق/الغروب (يتجاهل الثواني).
+- حماية متقدمة من هلوسة LLM (فحص 200 حرف وكلمات إيجابية متعددة).
+- تحذير حراري للصياد عند > 35°م.
+- مطالبة LLM بكتابة "أفضل توقيت" مع رموز تعبيرية.
+- تفصيل التكتيك (مسافة الرمي، نوع الطعم).
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -24,8 +24,16 @@ from slowapi.errors import RateLimitExceeded
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 
+http_client = httpx.AsyncClient(timeout=120.0)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await http_client.aclose()
+
+app = FastAPI(title="Surfcasting Analytics", version="16.2.1", lifespan=lifespan)
+
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.1.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -60,18 +68,17 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.1.0"}
+    return {"status": "ok", "version": "16.2.1"}
 
-# ==================== أدوات الشبكة والرياضيات ====================
-async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
+# ==================== دوال مساعدة ====================
+async def post_with_retry(url, json_data, headers, max_retries=3):
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            async with httpx.AsyncClient() as c:
-                r = await c.post(url, json=json_data, headers=headers, timeout=timeout)
-                r.raise_for_status()
-                return r.json()
-        except (httpx.HTTPStatusError, json.JSONDecodeError) as e:
+            r = await http_client.post(url, json=json_data, headers=headers)
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPStatusError, json.JSONDecodeError, httpx.DecodingError) as e:
             last_exc = e
             if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 429 and attempt < max_retries:
                 await asyncio.sleep(5 * attempt)
@@ -91,7 +98,7 @@ async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0)
 def safe_float(v):
     try:
         return 0.0 if math.isnan(float(v)) else float(v)
-    except:
+    except (TypeError, ValueError):
         return 0.0
 
 def angle_diff(w, b):
@@ -111,7 +118,6 @@ def calc_distance(lat1, lon1, lat2, lon2):
     return math.sqrt(dlat**2 + dlon**2)
 
 def format_time(h: float) -> str:
-    """تحويل ساعة عشرية إلى HH:MM مع ضمان القيم الموجبة."""
     h = h % 24
     hh = int(h)
     mm = int((h - hh) * 60)
@@ -163,14 +169,26 @@ def get_moon_and_tide_analysis(d: date):
     else: tide_strength = "مد وجزر متوسط"
     return {"name": names[idx], "phase_decimal": phase, "tide_strength": tide_strength, "idx": idx}
 
-def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
+# ─────────────────────────────────────────────────
+# [تحسين 1] معالجة آمنة لتنسيق الشروق/الغروب
+# ─────────────────────────────────────────────────
+def safe_parse_time(time_str: str) -> float:
+    """تحويل HH:MM أو HH:MM:SS إلى ساعات عشرية، مع تحمل الأخطاء."""
     try:
-        sr_h = int(sunrise_str.split(":")[0])
-        ss_h = int(sunset_str.split(":")[0])
-    except:
-        sr_h, ss_h = 6, 18
+        parts = time_str.split(":")
+        h = float(parts[0])
+        m = float(parts[1]) if len(parts) > 1 else 0.0
+        # تجاهل الثواني
+        return h + m / 60.0
+    except (ValueError, IndexError):
+        return 6.0  # افتراضي
+
+def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
+    sr_h = safe_parse_time(sunrise_str)
+    ss_h = safe_parse_time(sunset_str)
+
     moon_age_hours = moon_analysis["phase_decimal"] * 29.53 * 24
-    lunitidal_correction = (latitude - 10) * 2.5 / 60
+    lunitidal_correction = (latitude - 10) * 2.5 / 60.0
     base_hw_hour = (moon_age_hours * 0.04) % 12 + 6 + lunitidal_correction
     base_hw_hour = base_hw_hour % 24
     hw1 = base_hw_hour
@@ -180,22 +198,29 @@ def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_s
 
     windows = {"HW1": format_time(hw1), "LW1": format_time(lw1), "HW2": format_time(hw2), "LW2": format_time(lw2)}
 
+    def circular_diff(a: float, b: float) -> float:
+        diff = abs(a - b) % 24
+        return min(diff, 24 - diff)
+
+    def is_close(t1: float, t2: float, margin: float = 1.5) -> bool:
+        return circular_diff(t1, t2) <= margin
+
     golden_windows = []
-    def is_close(t1, t2, margin=1.5):
-        return abs(t1 - t2) <= margin or abs(t1 - t2) >= (24 - margin)
+    lw1_minus2 = (lw1 - 2) % 24
+    lw2_minus2 = (lw2 - 2) % 24
 
     if is_close(hw1, sr_h, 1.5):
         golden_windows.append(f"ساعة ذهبية صباحية: تزامن المد العالي (HW1={windows['HW1']}) مع الفجر ({sunrise_str}).")
     if is_close(hw2, ss_h, 1.5):
         golden_windows.append(f"ساعة ذهبية مسائية: تزامن المد العالي (HW2={windows['HW2']}) مع الغروب ({sunset_str}).")
-    if is_close(lw1 - 2, sr_h, 1.5) or is_close(lw2 - 2, sr_h, 1.5):
+    if is_close(lw1_minus2, sr_h, 1.5) or is_close(lw2_minus2, sr_h, 1.5):
         golden_windows.append("نافذة الجزر الممتازة: تزامن بداية جزر قوي مع الفجر.")
-    if is_close(lw1 - 2, ss_h, 1.5) or is_close(lw2 - 2, ss_h, 1.5):
+    if is_close(lw1_minus2, ss_h, 1.5) or is_close(lw2_minus2, ss_h, 1.5):
         golden_windows.append("نافذة الجزر الممتازة: تزامن بداية جزر قوي مع الغروب.")
 
     if not golden_windows:
-        hw1_gap = abs(hw1 - sr_h) if abs(hw1 - sr_h) < 12 else 24 - abs(hw1 - sr_h)
-        hw2_gap = abs(hw2 - ss_h) if abs(hw2 - ss_h) < 12 else 24 - abs(hw2 - ss_h)
+        hw1_gap = circular_diff(hw1, sr_h)
+        hw2_gap = circular_diff(hw2, ss_h)
         golden_windows.append(f"لا توجد ساعة ذهبية. HW1 ({windows['HW1']}) يبعد {hw1_gap:.1f} ساعة عن الفجر. HW2 ({windows['HW2']}) يبعد {hw2_gap:.1f} ساعة عن الغروب.")
 
     return windows, golden_windows
@@ -257,13 +282,12 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ التونسية ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
     {"name":"شاطئ قرطاج","lat":36.8528,"lon":10.3264,"orientation":90,"type":"sandy"},
     {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
-    {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
+    {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":90,"type":"sandy"},
 ]
 
 def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
@@ -286,38 +310,36 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
-# ==================== دالة Overpass الأصلية (v15.0.0) ====================
 async def get_auto_orientation_overpass(lat, lon):
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
         try:
-            async with httpx.AsyncClient() as c:
-                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
-                r.raise_for_status()
-                els = r.json().get("elements", [])
-                if not els:
+            r = await http_client.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT})
+            r.raise_for_status()
+            els = r.json().get("elements", [])
+            if not els:
+                continue
+            best_dist, best_tangent, best_point = float('inf'), None, None
+            for el in els:
+                geom = el.get("geometry", [])
+                if len(geom) < 2:
                     continue
-                best_dist, best_tangent, best_point = float('inf'), None, None
-                for el in els:
-                    geom = el.get("geometry", [])
-                    if len(geom) < 2:
-                        continue
-                    closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
-                    p = geom[closest_idx]
-                    d = calc_distance(lat, lon, p["lat"], p["lon"])
-                    if d < best_dist:
-                        best_dist, best_point = d, p
-                        prev_i = closest_idx - 1 if closest_idx > 0 else 0
-                        next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
-                        if prev_i != next_i:
-                            best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-                if not best_tangent or not best_point:
-                    continue
-                n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
-                c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-                d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
-                d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
-                return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
+                closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
+                p = geom[closest_idx]
+                d = calc_distance(lat, lon, p["lat"], p["lon"])
+                if d < best_dist:
+                    best_dist, best_point = d, p
+                    prev_i = closest_idx - 1 if closest_idx > 0 else 0
+                    next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
+                    if prev_i != next_i:
+                        best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
+            if not best_tangent or not best_point:
+                continue
+            n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
+            c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+            d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
+            d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
+            return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
         except:
             continue
     return 0
@@ -336,12 +358,29 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: DetectBottomRequest):
+    query = f"""[out:json];(
+        way(around:2000,{req.latitude},{req.longitude})["natural"="sand"];
+        way(around:2000,{req.latitude},{req.longitude})["natural"="shingle"];
+        way(around:2000,{req.latitude},{req.longitude})["natural"="bare_rock"];
+    );out body;"""
+    try:
+        r = await http_client.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        elements = r.json().get("elements", [])
+        if elements:
+            tags = elements[0].get("tags", {})
+            nat = tags.get("natural", "")
+            if nat == "sand": return {"bottom_type": "sandy", "source": "overpass", "confidence": "high"}
+            if nat in ["shingle", "bare_rock"]: return {"bottom_type": "rocky", "source": "overpass", "confidence": "high"}
+    except Exception:
+        pass
+
     bottom_type = find_nearest_beach_type(req.latitude, req.longitude)
     if bottom_type:
-        return {"bottom_type": bottom_type, "source": "nearby_beach", "confidence": "high"}
+        return {"bottom_type": bottom_type, "source": "nearby_beach", "confidence": "medium"}
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== التحليلات الإضافية الجديدة ====================
+# ==================== التحليلات الإضافية ====================
 def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
     risk = "منخفض"
     advice = ""
@@ -370,7 +409,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== محرك التجميع الفيزيائي (مُحسَّن) ====================
+# ==================== محرك التجميع الفيزيائي ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -458,7 +497,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         elif max_cross > 45: cross_sea_risk = "بحر مختلط متوسط"
     if is_cross_sea_dangerous: nogo_reasons.append("بحر مختلط خطير: السويل والموج المحلي يتقاطعان بزاوية كبيرة.")
 
-    steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p > 0]
+    steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p and p > 0.1]
     avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
     steepness_desc = "موج حاد وقصير" if avg_steepness > 0.06 else "موج طويل" if avg_steepness < 0.03 else "موج متوسط"
 
@@ -628,7 +667,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "final_verdict": final_verdict
     }
 
-# ==================== التفكيك الديناميكي (مُحسَّن) ====================
+# ==================== التفكيك الديناميكي ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
@@ -753,12 +792,17 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
+# [تحسينات] SYSTEM_PROMPT مُطوَّر مع طلب تلخيص بصري وتكتيك مفصّل
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم لغة المد والجزر والساعات الذهبية.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 
-هيكل التقرير الإجباري:
+هيكل التقرير الإجباري (جديد):
 
-1. التوقيت المدوي:
+1. ⏱️ أفضل توقيت للصيد اليوم:
+- ابدأ بـ ✅ أو ⚠️ أو ❌ حسب الحسم النهائي (Go / Conditional Go / No-Go).
+- في سطر واحد، لخص أفضل فترة (صباح/ظهيرة/ليل) ولماذا.
+
+2. التوقيت المدوي:
 - اذكر أوقات HW1, LW1, HW2, LW2 بالأرقام.
 - اذكر اسم القمر وقوة المد.
 - اشرح الساعة الذهبية وتأثيرها.
@@ -767,7 +811,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - اذكر انحدار الموج (حاد/طويل) وتأثيره على الرصاصة.
 - إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه عملياً.
 
-2. التفكيك الديناميكي الزمني:
+3. التفكيك الديناميكي الزمني:
 - لكل فترة (صباح، ظهيرة، ليل)، خذ التحليل الميكانيكي من "ديناميكية الفترة" واكتبه بلغة تونسية احترافية.
 - ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، إلخ.
 - لا تكرر نفس الجملة مرتين.
@@ -775,18 +819,20 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - تحدث عن تأثير فترة الموج (طويل/قصير) على الرصاصة.
 - تحدث عن تأثير الرؤية إذا كانت مذكورة (ضعيفة = إيجابية، ممتازة نهاراً = سلبية).
 
-3. التكتيك الميداني (قاعدة حفرية):
-- اكتبه إذا كان الحسم "Go" أو "Conditional Go". في حالة "Conditional Go"، أضف تحذيرات إضافية.
+4. التكتيك الميداني (قاعدة حفرية):
+- اكتبه إذا كان الحسم "Go" أو "Conditional Go".
+- اذكر: مسافة الرمي المقترحة (من 20م إلى 80م)، وزن الرصاصة، نوع الطعم (حي/ميت)، والتقنية (لونص/بوصلة/تسقيط).
 - إذا كان الحسم "No-Go"، امسح هذا القسم بالكامل.
 
-4. السلامة:
-- نصائح سلامة بسيطة حسب الظروف (تيار جانبي قوي، صخور زلقة، هبات رياح).
-- اذكرها في نهاية التقرير.
+5. السلامة:
+- نصائح سلامة حسب الظروف (تيار جانبي، صخور، هبات).
+- إذا كانت حرارة الهواء > 35°م، أضف تحذيراً منفصلاً: "🔥 تحذير حراري: تجنب الصيد في الظهيرة واشرب الماء بكثرة."
 
 قواعد صارمة:
 - لا تقل "كما ذكرنا سابقاً" أو "بالنسبة لما سبق". كل قسم مستقل.
 - لا تخلق معلومات ليست في السياق.
-- اكتب بالدارجة التونسية الاحترافية المفصلة."""
+- اكتب بالدارجة التونسية الاحترافية المفصلة.
+- استعمل الرموز التعبيرية بإتقان (✅⚠️❌🌙🔥🌊)."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
@@ -821,6 +867,13 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
+
+        # [تحسين 2] حماية متقدمة من هلوسة LLM (فحص 200 حرف)
+        if agg["final_verdict"] == "No-Go":
+            first_chunk = report[:200].lower()
+            positive_words = ["go", "ممتاز", "فرصة", "انطلق", "مثالي", "جيد جداً", "ناجح"]
+            if any(word in first_chunk for word in positive_words):
+                report += "\n\n**⚠️ تحذير نظام:** القرار النهائي هو No-Go. تجاهل أي إشارة إيجابية أعلاه."
 
         clean_blocks = [{k: v for k, v in b.items() if k != "_raw"} for b in agg["blocks"]]
 
