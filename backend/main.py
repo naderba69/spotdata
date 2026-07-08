@@ -1,10 +1,9 @@
 """
-Surfcasting Analytics API – v16.3.1 (Final Production Release)
-- تحليل الموج الراجع (Backwash) وتأثيره على استقرار الرصاصة.
-- تحليل تراكم الأوساخ والصوفة على الخيط وتأثيرها على الصيد.
-- تحليل العكارة الشديدة بعد السيول وتأثيرها على رؤية السمك.
-- قائمة العوامل المانعة للصيد (No‑Go Factors) بشكل نقاط بدلاً من جدول.
-- جميع التحليلات السابقة (سولونار، مياه ميتة، أعشاب، طعم موسمي، ثقة، رؤية، انحدار الموج).
+Surfcasting Analytics API – v16.3.2 (Complete Reports)
+- زيادة max_tokens إلى 12000.
+- إزالة قسم "بيانات الفترات الخام" من السياق لتوفير مساحة.
+- تحسين SYSTEM_PROMPT لضمان اكتمال التقرير.
+- جميع التحليلات السابقة (Backwash, أوساخ, صوفة, سولونار, مياه ميتة, أعشاب, طعم موسمي, ثقة, رؤية, انحدار الموج).
 - فحص هلوسة صارم على الأرقام والقرار النهائي.
 - جميع الإصلاحات التقنية (HTTP client, 429 retry, ZeroDivision, tidal wrap, safe_float, cache).
 - واجهات: /auto-orientation, /detect-bottom-type, /generate-report.
@@ -36,7 +35,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.3.1", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.3.2", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -73,7 +72,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.3.1"}
+    return {"status": "ok", "version": "16.3.2"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -857,17 +856,6 @@ def build_context(req, agg, tz_name):
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
     bio_text = "\n".join([f"- {fish}: {data['status']} ({data['reason']})" for fish, data in agg["bio_matrix"].items()])
-    blocks_raw_text = []
-    for b in agg["blocks"]:
-        r = b.get("_raw", {})
-        blocks_raw_text.append(
-            f"  {b['name']} ({b['time_range']}): بحر={b['sea_state']}, "
-            f"موج أقصى={r.get('max_wave_h',0):.2f}م، رياح={b['wind_dir']} ({r.get('avg_wind',0)} كم/س), "
-            f"هبات={r.get('max_gust',0)} كم/س، سويل={'موجود' if r.get('has_swell') else 'معدوم'} "
-            f"({r.get('swell_h',0):.2f}م)، حرارة={r.get('air_temp',0)}°م، "
-            f"رؤية={r.get('visibility',0):.0f}م، "
-            f"تقاطع سويل/موج={b.get('swell_wave_interaction','?')}"
-        )
 
     final_verdict = agg["final_verdict"]
     golden_windows = agg["extra_info"].get("golden_windows", [])
@@ -889,7 +877,6 @@ def build_context(req, agg, tz_name):
         "",
         "=== ملف القضية ===", "\n".join(facts), "\n",
         "=== الكائنات ===", bio_text, "\n",
-        "=== بيانات الفترات الخام ===", *blocks_raw_text, "\n",
         "=== التفكيك الديناميكي والتفاعلات ===", *chain_interactions
     ]
     return "\n".join(lines)
@@ -928,13 +915,14 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - أضف تحذير الأوساخ إذا كان موجوداً.
 
 قواعد صارمة:
-- لا تستخدم جداول Markdown (لأنها تستهلك مساحة كبيرة).
+- لا تستخدم جداول Markdown.
 - لا تكرر المعلومات.
-- اكتب بالدارجة التونسية المفصلة."""
+- اكتب بالدارجة التونسية المفصلة.
+- أكمل التقرير حتى النهاية ولا تتوقف قبل قسم السلامة."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":8000,"temperature":0.1}
+    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":12000,"temperature":0.1}
     data = await post_with_retry(OPENROUTER_URL, payload, headers)
     if "choices" in data and data["choices"]:
         return data["choices"][0]["message"]["content"]
