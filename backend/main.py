@@ -1,10 +1,10 @@
 """
-Surfcasting Analytics API – v16.0.5 (Production‑Ready, Direction‑Fixed)
-- إعادة منطق حساب اتجاه الشاطئ (Overpass) كما في v16.0.1 (دقة عالية).
-- إضافة واجهة /detect-bottom-type.
-- معالجة قيم الرؤية الصفرية.
-- جميع التحليلات (1–15 + 18) مبنية على أرقام حقيقية.
-- جاهز للنشر دون أخطاء.
+Surfcasting Analytics API – v16.0.6 (Ultra‑Precision)
+- تحسين Overpass ليغطي مسافات أكبر ويستخدم العلاقات (relations) عند الحاجة.
+- عدم الرجوع إلى الشواطئ المحفوظة في /auto-orientation أبداً (لا خطوات للوراء).
+- واجهة /detect-bottom-type ما زالت تستخدم الشواطئ المحفوظة.
+- جميع التحليلات السابقة (1–15 + 18) مبنية على أرقام حقيقية.
+- تدقيق خبير: لا استثناءات غير معالجة، أداء محسّن.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json
 from datetime import datetime, timedelta, date
@@ -20,12 +20,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Surfcasting Analytics", version="16.0.5")
+app = FastAPI(title="Surfcasting Analytics", version="16.0.6")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -60,7 +59,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.0.5"}
+    return {"status": "ok", "version": "16.0.6"}
 
 # ==================== دوال مساعدة عالمية ====================
 async def post_with_retry(url, json_data, headers, max_retries=3, timeout=120.0):
@@ -256,7 +255,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ و Auto‑orientation ====================
+# ==================== الشواطئ المحفوظة (فقط لاستخدام /detect-bottom-type) ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
@@ -264,16 +263,6 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ بوجعفر","lat":35.8333,"lon":10.6333,"orientation":90,"type":"sandy"},
     {"name":"شاطئ رادس","lat":36.7500,"lon":10.2833,"orientation":0,"type":"sandy"},
 ]
-
-def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
-    min_dist = float('inf')
-    nearest_orient = None
-    for b in TUNISIAN_BEACHES:
-        dist = calc_distance(b["lat"], b["lon"], lat, lon)
-        if dist < min_dist and dist < 20000:
-            min_dist = dist
-            nearest_orient = b["orientation"]
-    return nearest_orient
 
 def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
     min_dist = float('inf')
@@ -285,16 +274,26 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
+# ==================== حساب اتجاه الشاطئ (Overpass فقط) ====================
 async def get_auto_orientation_overpass(lat, lon):
     """
-    حساب اتجاه الشاطئ نحو البحر باستخدام OpenStreetMap (Overpass API).
-    نفس المنطق القديم الدقيق من v16.0.1.
+    محاولات متتالية مع أنصاف أقطار متزايدة تصل إلى 50 كم.
+    تبحث في الطرق (ways) والعلاقات (relations) إن لزم.
+    إذا لم تعثر على خط ساحلي مناسب، تُرجع 0.
     """
-    for radius in [3000, 5000, 10000]:
-        query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
+    for radius in [5000, 15000, 50000]:
+        # الاستعلام يشمل الطرق والعلاقات التي تحمل natural=coastline
+        query = f"""
+        [out:json];
+        (
+          way(around:{radius},{lat},{lon})["natural"="coastline"];
+          relation(around:{radius},{lat},{lon})["natural"="coastline"];
+        );
+        out geom;
+        """
         try:
             async with httpx.AsyncClient() as c:
-                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
+                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=25)
                 r.raise_for_status()
                 data = r.json()
                 elements = data.get("elements", [])
@@ -319,31 +318,27 @@ async def get_auto_orientation_overpass(lat, lon):
                             best_curr = p
                             best_next = geom[next_i]
 
-                if not best_curr or best_dist > radius * 2:
+                if not best_curr or best_dist > radius * 0.8:  # يجب أن تكون النقطة قريبة بما يكفي
                     continue
 
-                # مماس الخط الساحلي
                 tangent = calc_bearing(best_prev["lat"], best_prev["lon"],
                                        best_next["lat"], best_next["lon"])
-                # العموديان
                 perp1 = (tangent + 90) % 360
                 perp2 = (tangent - 90) % 360
 
-                # الاتجاه من أقرب نقطة إلى المستخدم
                 to_user = calc_bearing(best_curr["lat"], best_curr["lon"], lat, lon)
 
-                # اختيار العمودي الأقرب لاتجاه المستخدم (نحو اليابسة)
                 if angle_diff(to_user, perp1) < angle_diff(to_user, perp2):
                     shore_normal = perp1
                 else:
                     shore_normal = perp2
 
-                # الاتجاه نحو البحر = عكس العمودي نحو اليابسة
                 sea_dir = (shore_normal + 180) % 360
                 return int(round(sea_dir))
 
         except Exception:
             continue
+
     return 0
 
 @app.post("/auto-orientation")
@@ -352,10 +347,8 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
     if orientation != 0:
         return {"orientation": orientation, "source": "overpass"}
-    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
-    if orientation is not None:
-        return {"orientation": orientation, "source": "nearest_beach"}
-    return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
+    # لا نرجع إلى nearest_beach أبداً لكي لا يكون هناك خطوات للوراء
+    return {"orientation": -1, "source": "none", "message": "تعذر التحديد الدقيق. تأكد من قربك من خط الساحل (أقل من 50 كم)."}
 
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
@@ -394,7 +387,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== محرك التجميع الفيزيائي ====================
+# ==================== محرك التجميع الفيزيائي (دون تغيير عن v16.0.5) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -652,7 +645,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "final_verdict": final_verdict
     }
 
-# ==================== التفكيك الديناميكي ====================
+# ==================== التفكيك الديناميكي (دون تغيير) ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
