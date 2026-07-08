@@ -1,14 +1,14 @@
 """
-Surfcasting Analytics API – v16.2.1 (Polished)
-- معالجة آمنة لتنسيق الشروق/الغروب (يتجاهل الثواني).
-- حماية متقدمة من هلوسة LLM (فحص 200 حرف وكلمات إيجابية متعددة).
-- تحذير حراري للصياد عند > 35°م.
-- مطالبة LLM بكتابة "أفضل توقيت" مع رموز تعبيرية.
-- تفصيل التكتيك (مسافة الرمي، نوع الطعم).
+Surfcasting Analytics API – v16.2.4 (Final Production Release)
+- تم إضافة: أفضل مسافة للرمي، سطر ملخص تنفيذي، تحذير أوضح للأعشاب.
+- فحص هلوسة صارم على الأرقام والقرار النهائي.
+- جميع الإصلاحات التقنية (HTTP client, 429 retry, ZeroDivision, tidal wrap, safe_float, cache).
+- واجهات: /auto-orientation, /detect-bottom-type, /generate-report.
+- تنسيق التقرير الكلاسيكي (بدون رموز إضافية).
 """
-import os, math, asyncio, logging, traceback, zoneinfo, json
+import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple, Set
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -25,13 +25,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("surfcasting")
 
 http_client = httpx.AsyncClient(timeout=120.0)
+overpass_cache: Dict[Tuple[float, float], Tuple[int, float]] = {}
+CACHE_TTL = 600
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.2.1", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.2.4", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -68,7 +70,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.2.1"}
+    return {"status": "ok", "version": "16.2.4"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -169,24 +171,18 @@ def get_moon_and_tide_analysis(d: date):
     else: tide_strength = "مد وجزر متوسط"
     return {"name": names[idx], "phase_decimal": phase, "tide_strength": tide_strength, "idx": idx}
 
-# ─────────────────────────────────────────────────
-# [تحسين 1] معالجة آمنة لتنسيق الشروق/الغروب
-# ─────────────────────────────────────────────────
 def safe_parse_time(time_str: str) -> float:
-    """تحويل HH:MM أو HH:MM:SS إلى ساعات عشرية، مع تحمل الأخطاء."""
     try:
         parts = time_str.split(":")
         h = float(parts[0])
         m = float(parts[1]) if len(parts) > 1 else 0.0
-        # تجاهل الثواني
         return h + m / 60.0
     except (ValueError, IndexError):
-        return 6.0  # افتراضي
+        return 6.0
 
 def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
     sr_h = safe_parse_time(sunrise_str)
     ss_h = safe_parse_time(sunset_str)
-
     moon_age_hours = moon_analysis["phase_decimal"] * 29.53 * 24
     lunitidal_correction = (latitude - 10) * 2.5 / 60.0
     base_hw_hour = (moon_age_hours * 0.04) % 12 + 6 + lunitidal_correction
@@ -310,38 +306,67 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
-async def get_auto_orientation_overpass(lat, lon):
+async def fetch_overpass(query: str, timeout: int = 15) -> dict:
+    for attempt in range(1, 4):
+        try:
+            r = await http_client.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            if r.status_code == 429:
+                await asyncio.sleep(5 * attempt)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError:
+            if r.status_code == 429:
+                await asyncio.sleep(5 * attempt)
+                continue
+            raise
+        except Exception:
+            if attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise
+    return {}
+
+async def get_auto_orientation_overpass(lat: float, lon: float) -> int:
+    key = (round(lat, 4), round(lon, 4))
+    now = time.time()
+    if key in overpass_cache:
+        orient, ts = overpass_cache[key]
+        if now - ts < CACHE_TTL:
+            return orient
+
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
-        try:
-            r = await http_client.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
-            els = r.json().get("elements", [])
-            if not els:
-                continue
-            best_dist, best_tangent, best_point = float('inf'), None, None
-            for el in els:
-                geom = el.get("geometry", [])
-                if len(geom) < 2:
-                    continue
-                closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
-                p = geom[closest_idx]
-                d = calc_distance(lat, lon, p["lat"], p["lon"])
-                if d < best_dist:
-                    best_dist, best_point = d, p
-                    prev_i = closest_idx - 1 if closest_idx > 0 else 0
-                    next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
-                    if prev_i != next_i:
-                        best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-            if not best_tangent or not best_point:
-                continue
-            n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
-            c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-            d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
-            d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
-            return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
-        except:
+        data = await fetch_overpass(query)
+        if not data:
             continue
+        elements = data.get("elements", [])
+        if not elements:
+            continue
+        best_dist, best_tangent, best_point = float('inf'), None, None
+        for el in elements:
+            geom = el.get("geometry", [])
+            if len(geom) < 2:
+                continue
+            closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
+            p = geom[closest_idx]
+            d = calc_distance(lat, lon, p["lat"], p["lon"])
+            if d < best_dist:
+                best_dist, best_point = d, p
+                prev_i = closest_idx - 1 if closest_idx > 0 else 0
+                next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
+                if prev_i != next_i:
+                    best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"],
+                                                geom[next_i]["lat"], geom[next_i]["lon"])
+        if not best_tangent or not best_point:
+            continue
+        n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
+        c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+        d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
+        d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
+        orientation = int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
+        overpass_cache[key] = (orientation, now)
+        return orientation
     return 0
 
 @app.post("/auto-orientation")
@@ -358,15 +383,18 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: DetectBottomRequest):
+    nearest_type = find_nearest_beach_type(req.latitude, req.longitude)
+    if nearest_type:
+        return {"bottom_type": nearest_type, "source": "nearby_beach", "confidence": "medium"}
+
     query = f"""[out:json];(
         way(around:2000,{req.latitude},{req.longitude})["natural"="sand"];
         way(around:2000,{req.latitude},{req.longitude})["natural"="shingle"];
         way(around:2000,{req.latitude},{req.longitude})["natural"="bare_rock"];
     );out body;"""
     try:
-        r = await http_client.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        elements = r.json().get("elements", [])
+        data = await fetch_overpass(query)
+        elements = data.get("elements", [])
         if elements:
             tags = elements[0].get("tags", {})
             nat = tags.get("natural", "")
@@ -374,10 +402,6 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
             if nat in ["shingle", "bare_rock"]: return {"bottom_type": "rocky", "source": "overpass", "confidence": "high"}
     except Exception:
         pass
-
-    bottom_type = find_nearest_beach_type(req.latitude, req.longitude)
-    if bottom_type:
-        return {"bottom_type": bottom_type, "source": "nearby_beach", "confidence": "medium"}
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
 # ==================== التحليلات الإضافية ====================
@@ -597,6 +621,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
 
+        # --- حساب أفضل مسافة للرمي (مضافة) ---
+        base_dist = 50
+        if avg_h > 0.8:
+            base_dist = 40
+        elif avg_h > 0.5:
+            base_dist = 50
+        else:
+            base_dist = 60
+        recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
+
         block_data = {
             "name":{"morning":"الصباح","afternoon":"الظهيرة","night":"الليل"}[key],
             "time_range":f"{all_times[target_idx[idxs[0]]].strftime('%H:%M')}-{all_times[target_idx[idxs[-1]]].strftime('%H:%M')}",
@@ -610,6 +644,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "wind_gust_peak":round(max_gust_b,1),
             "wind_dir":wc_dom, "air_temp":round(avg_air,1), "weather":weather_desc(most_code),
             "confidence": confidence,
+            "recommended_cast_distance": round(recommended_dist, 0),  # مضافة
             "_raw": {
                 "avg_wave_h": round(avg_h, 3), "max_wave_h": round(max_h, 3),
                 "avg_wind": round(avg_w, 1), "max_wind": round(max_w, 1),
@@ -619,7 +654,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 "visibility": round(avg_vis_b, 0),
                 "has_swell": actual_swell_exists,
                 "wave_period": round(avg_wp_b, 1),
-                "wind_effect_dist": round(wind_effect_dist, 0)
+                "wind_effect_dist": round(wind_effect_dist, 0),
+                "recommended_cast_distance": round(recommended_dist, 0)
             }
         }
         blocks.append(block_data)
@@ -717,6 +753,7 @@ def calculate_interactions(agg: dict) -> List[str]:
         air_temp = raw.get("air_temp", 0); block_swell_h = raw.get("swell_h", 0)
         wind_effect_dist = raw.get("wind_effect_dist", 0)
         wp_desc = "طويل" if raw.get("wave_period",0) > 9 else "قصير" if raw.get("wave_period",0) < 5 else "متوسط"
+        recommended_dist = raw.get("recommended_cast_distance", 50)
 
         interactions.append(f"[ديناميكية {name} ({time_range})] حالة البحر: {sea_state}. الثقة: {b.get('confidence',0)}%")
         if is_mirror_sea:
@@ -739,6 +776,9 @@ def calculate_interactions(agg: dict) -> List[str]:
             interactions.append(f"  → فترة الموج: {wp_desc}. {'الموج الطويل يمسك الرصاصة بلطف ويحركها.' if wp_desc=='طويل' else 'الموج القصير يخلخل الرصاصة بسرعة.'}")
             if weed_risk.get("risk") != "منخفض":
                 interactions.append(f"  → تحذير صوفة/أعشاب: {weed_risk.get('advice','')}")
+
+        # إضافة أفضل مسافة للرمي (للحالتين)
+        interactions.append(f"  → أفضل مسافة للرمي: حوالي {recommended_dist:.0f} متر.")
 
         avg_vis = raw.get("visibility", 10000)
         if avg_vis > 0 and avg_vis < 1000:
@@ -784,7 +824,26 @@ def build_context(req, agg, tz_name):
             f"رؤية={r.get('visibility',0):.0f}م، "
             f"تقاطع سويل/موج={b.get('swell_wave_interaction','?')}"
         )
+
+    # --- إضافة سطر الملخص التنفيذي ---
+    final_verdict = agg["final_verdict"]
+    golden_windows = agg["extra_info"].get("golden_windows", [])
+    best_time = "غير محدد"
+    for gw in golden_windows:
+        if "تزامن" in gw:
+            best_time = gw.split(":")[0] if ":" in gw else gw
+            break
+    seasonal_bait = agg["extra_info"].get("seasonal_bait", "الطعم الموسمي")
+    if final_verdict == "Go":
+        summary = f"Go - أفضل وقت: {best_time}. استعمل {seasonal_bait}."
+    elif final_verdict == "Conditional Go":
+        summary = f"Conditional Go - فرصة مع تحفظات. أفضل فترة: {best_time}."
+    else:
+        summary = "No-Go - لا توجد فرصة للصيد المجدي اليوم. وفر وقتك."
+
     lines = [
+        f"[الملخص التنفيذي] {summary}",
+        "",
         "=== ملف القضية ===", "\n".join(facts), "\n",
         "=== الكائنات ===", bio_text, "\n",
         "=== بيانات الفترات الخام ===", *blocks_raw_text, "\n",
@@ -792,17 +851,13 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-# [تحسينات] SYSTEM_PROMPT مُطوَّر مع طلب تلخيص بصري وتكتيك مفصّل
+# [عودة إلى SYSTEM_PROMPT الكلاسيكي مع إضافة تحذير الأعشاب]
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم لغة المد والجزر والساعات الذهبية.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 
-هيكل التقرير الإجباري (جديد):
+هيكل التقرير الإجباري:
 
-1. ⏱️ أفضل توقيت للصيد اليوم:
-- ابدأ بـ ✅ أو ⚠️ أو ❌ حسب الحسم النهائي (Go / Conditional Go / No-Go).
-- في سطر واحد، لخص أفضل فترة (صباح/ظهيرة/ليل) ولماذا.
-
-2. التوقيت المدوي:
+1. التوقيت المدوي:
 - اذكر أوقات HW1, LW1, HW2, LW2 بالأرقام.
 - اذكر اسم القمر وقوة المد.
 - اشرح الساعة الذهبية وتأثيرها.
@@ -811,28 +866,28 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - اذكر انحدار الموج (حاد/طويل) وتأثيره على الرصاصة.
 - إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه عملياً.
 
-3. التفكيك الديناميكي الزمني:
+2. التفكيك الديناميكي الزمني:
 - لكل فترة (صباح، ظهيرة، ليل)، خذ التحليل الميكانيكي من "ديناميكية الفترة" واكتبه بلغة تونسية احترافية.
-- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، إلخ.
+- ربط السبب بالنتيجة: الرياح، الموج، السويل، فترة الموج، الرؤية، الصوفة، الطعم الموسمي، أفضل مسافة للرمي، إلخ.
 - لا تكرر نفس الجملة مرتين.
 - إذا كان البحر مرآوياً، اشرح لماذا كل تقنية غير ممكنة.
 - تحدث عن تأثير فترة الموج (طويل/قصير) على الرصاصة.
 - تحدث عن تأثير الرؤية إذا كانت مذكورة (ضعيفة = إيجابية، ممتازة نهاراً = سلبية).
 
-4. التكتيك الميداني (قاعدة حفرية):
-- اكتبه إذا كان الحسم "Go" أو "Conditional Go".
-- اذكر: مسافة الرمي المقترحة (من 20م إلى 80م)، وزن الرصاصة، نوع الطعم (حي/ميت)، والتقنية (لونص/بوصلة/تسقيط).
+3. التكتيك الميداني (قاعدة حفرية):
+- اكتبه إذا كان الحسم "Go" أو "Conditional Go". في حالة "Conditional Go"، أضف تحذيرات إضافية.
 - إذا كان الحسم "No-Go"، امسح هذا القسم بالكامل.
 
-5. السلامة:
-- نصائح سلامة حسب الظروف (تيار جانبي، صخور، هبات).
-- إذا كانت حرارة الهواء > 35°م، أضف تحذيراً منفصلاً: "🔥 تحذير حراري: تجنب الصيد في الظهيرة واشرب الماء بكثرة."
+4. السلامة:
+- نصائح سلامة بسيطة حسب الظروف (تيار جانبي قوي، صخور زلقة، هبات رياح).
+- إذا كان خطر الصوفة مرتفعاً، أضف فقرة خاصة: "⚠️ تحذير صوفة وأعشاب: [نصيحة من weed_risk.advice]".
+- اذكرها في نهاية التقرير.
 
 قواعد صارمة:
 - لا تقل "كما ذكرنا سابقاً" أو "بالنسبة لما سبق". كل قسم مستقل.
 - لا تخلق معلومات ليست في السياق.
-- اكتب بالدارجة التونسية الاحترافية المفصلة.
-- استعمل الرموز التعبيرية بإتقان (✅⚠️❌🌙🔥🌊)."""
+- لا تخترع أرقاماً غير موجودة في البيانات. استخدم فقط الأرقام الواردة في التفاعلات.
+- اكتب بالدارجة التونسية الاحترافية المفصلة."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
@@ -841,6 +896,38 @@ async def call_openrouter(ctx):
     if "choices" in data and data["choices"]:
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
+
+# ==================== فحص هلوسة صارم ====================
+def extract_numbers_from_text(text: str) -> List[float]:
+    """استخراج جميع الأرقام (صحيحة وعشرية) من نص التقرير."""
+    pattern = r'-?\d+\.?\d*'
+    matches = re.findall(pattern, text)
+    return [float(m) for m in matches]
+
+def get_allowed_numbers(agg: dict) -> Set[float]:
+    """إنشاء مجموعة من الأرقام المسموح بها من البيانات والتحليلات."""
+    allowed = set()
+    # من _raw في كل block
+    for b in agg.get("blocks", []):
+        raw = b.get("_raw", {})
+        for v in raw.values():
+            if isinstance(v, (int, float)):
+                allowed.add(round(v, 1))
+    # من extra_info
+    extra = agg.get("extra_info", {})
+    for v in extra.values():
+        if isinstance(v, (int, float)):
+            allowed.add(round(v, 1))
+    # من hidden_factors
+    for v in agg.get("hidden_factors", {}).values():
+        if isinstance(v, (int, float)):
+            allowed.add(round(v, 1))
+    # من avg_sst, max_air_temp, peak_gust
+    allowed.add(round(agg.get("avg_sst", 0), 1))
+    allowed.add(round(extra.get("max_air_temp", 0), 1))
+    allowed.add(round(extra.get("peak_gust_today", 0), 1))
+    # الأرقام الصغيرة جداً (الأوقات) مستثناة من الفحص
+    return {x for x in allowed if x > 0.5}  # نتجاهل الأرقام الصغيرة كالأوقات
 
 @app.post("/generate-report")
 @limiter.limit("10/minute")
@@ -868,12 +955,17 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # [تحسين 2] حماية متقدمة من هلوسة LLM (فحص 200 حرف)
-        if agg["final_verdict"] == "No-Go":
-            first_chunk = report[:200].lower()
-            positive_words = ["go", "ممتاز", "فرصة", "انطلق", "مثالي", "جيد جداً", "ناجح"]
-            if any(word in first_chunk for word in positive_words):
-                report += "\n\n**⚠️ تحذير نظام:** القرار النهائي هو No-Go. تجاهل أي إشارة إيجابية أعلاه."
+        # فحص هلوسة صارم (للأرقام)
+        allowed_numbers = get_allowed_numbers(agg)
+        report_numbers = extract_numbers_from_text(report)
+        suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers]
+        if suspicious:
+            logger.warning(f"أرقام غير مطابقة في التقرير: {suspicious}")
+            report += f"\n\n[تحذير نظام: تم اكتشاف أرقام غير دقيقة في التقرير: {suspicious}. يُرجى التحقق.]"
+
+        # التأكد من القرار النهائي
+        if agg["final_verdict"] == "No-Go" and "go" in report.lower()[:100]:
+            report += "\n\n[تنبيه: القرار النهائي هو No-Go، تجاهل أي إشارة إيجابية.]"
 
         clean_blocks = [{k: v for k, v in b.items() if k != "_raw"} for b in agg["blocks"]]
 
