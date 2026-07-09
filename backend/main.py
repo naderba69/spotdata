@@ -1,7 +1,10 @@
 """
-Surfcasting Analytics API – v16.5.1 (Embedded Debug Numbers)
-- يضيف حقل computed_numbers إلى meta في /generate-report.
-- يحتوي على جميع الأرقام المحسوبة لتصحيح التقرير ومقارنته.
+Surfcasting Analytics API – v16.5.2 (Full Production + Debug Numbers)
+- يحتوي حقل computed_numbers في meta على جميع الأرقام المحسوبة.
+- إصلاح نهائي لظهور التحذير على الفروق الزمنية.
+- جميع التحليلات (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, انحدار الموج).
+- فحص هلوسة صارم.
+- جاهز للنشر الفوري.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +33,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.5.1", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.5.2", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -67,7 +70,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.5.1"}
+    return {"status": "ok", "version": "16.5.2"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -728,7 +731,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "solunar": solunar, "slack_times": slack_info,
         "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
         "past_rain_total": round(past_rain_total, 1),
-        "pressure_change": round(press_change, 1)  # أضفنا هذا
+        "pressure_change": round(press_change, 1)
     }
 
     flags = {
@@ -1095,6 +1098,51 @@ async def generate_report(request: Request, req: RawDataReportRequest):
     except Exception as e:
         logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail="فشل إنشاء التقرير")
+
+@app.post("/debug-report")
+@limiter.limit("5/minute")
+async def debug_report(request: Request, req: RawDataReportRequest):
+    try:
+        marine_hourly = req.marine_data.get("hourly", req.marine_data)
+        weather_hourly = req.weather_data.get("hourly", {})
+        daily = req.weather_data.get("daily", {})
+        tz_name = req.marine_data.get("timezone", "Africa/Tunis")
+        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
+        target_dt = resolve_target_date(req.target_date, now_tn.date())
+        sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
+        sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
+        latitude = req.marine_data.get("latitude", 36.8)
+
+        all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
+        if not all_times:
+            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+
+        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
+
+        ctx = build_context(req, agg, tz_name)
+        report = await call_openrouter(ctx)
+
+        return {
+            "report": report,
+            "raw_data": {
+                "input_parameters": {
+                    "beach_orientation": req.beach_orientation,
+                    "beach_type": req.beach_type,
+                    "target_date": str(target_dt),
+                    "sunrise": sunrise,
+                    "sunset": sunset,
+                    "latitude": latitude
+                },
+                "aligned_hourly_data": aligned,
+                "aggregated_physics": agg,
+                "interactions": calculate_interactions(agg)
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"debug-report error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail="فشل إنشاء تقرير التصحيح")
 
 if __name__ == "__main__":
     import uvicorn
