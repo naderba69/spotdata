@@ -1,9 +1,10 @@
 """
-Surfcasting Analytics API – v17.0.0 (Major Upgrade: 50+ Beaches, New Fish Species, Stormglass Tides)
-- تمت إضافة أكثر من 50 شاطئ تونسي مع إحداثيات واتجاهات دقيقة.
-- تمت إضافة أسماك جديدة: الشلبة، التريلية، البغبغان، السوبيا (الحبار) مع تفضيلات كاملة.
-- تحسين أوقات المد باستخدام Stormglass API (عند توفر المفتاح) مع الرجوع التلقائي للتقدير المحلي.
-- جميع الميزات السابقة محفوظة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
+Surfcasting Analytics API – v17.1.0 (Production‑Ready, Live Data)
+- إذا لم تُرسَل marine_data أو weather_data، تُجلَب تلقائياً من Open‑Meteo (بدون مفتاح).
+- أكثر من 50 شاطئ تونسي مع إحداثيات واتجاهات.
+- أسماك: قاروص، دنيس، بوري، سارغ، مرمار، شلبة، تريلية، بغبغان، سوبيا مع تفضيلات كاملة.
+- تحليلات: الموج الراجع (Backwash)، الأوساخ والصوفة، سولونار، Slack water، ثقة، رؤية، انحدار الموج.
+- فحص هلوسة صارم + أرقام مرجعية مرفقة بنهاية كل تقرير.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -20,6 +21,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+# -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 
@@ -27,14 +29,12 @@ http_client = httpx.AsyncClient(timeout=120.0)
 overpass_cache: Dict[Tuple[float, float], Tuple[int, float]] = {}
 CACHE_TTL = 600
 
-STORMGLASS_API_KEY = os.getenv("STORMGLASS_API_KEY")  # مفتاح اختياري
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="17.0.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="17.1.0", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -57,8 +57,10 @@ class RawDataReportRequest(BaseModel):
     beach_orientation: int = Field(..., ge=0, le=360)
     beach_type: str = Field(..., pattern="^(sandy|rocky)$")
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
-    marine_data: dict
-    weather_data: dict
+    marine_data: Optional[dict] = None
+    weather_data: Optional[dict] = None
+    latitude: Optional[float] = 36.8
+    longitude: Optional[float] = 10.1
 
 class DetectBottomRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
@@ -71,7 +73,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "17.0.0"}
+    return {"status": "ok", "version": "17.1.0"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -181,45 +183,6 @@ def safe_parse_time(time_str: str) -> float:
     except (ValueError, IndexError):
         return 6.0
 
-# ==================== Stormglass Tides API ====================
-async def fetch_tides_from_stormglass(lat: float, lon: float, target_d: date) -> Optional[Dict]:
-    """محاولة جلب أوقات المد والجزر من Stormglass API."""
-    if not STORMGLASS_API_KEY:
-        return None
-    start = datetime.combine(target_d, datetime.min.time())
-    end = start + timedelta(days=1)
-    params = {
-        "lat": lat,
-        "lng": lon,
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
-        "params": "tide"
-    }
-    headers = {"Authorization": STORMGLASS_API_KEY}
-    try:
-        r = await http_client.get("https://api.stormglass.io/v2/tide/extremes/point",
-                                  params=params, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        extremes = {"HW1": None, "LW1": None, "HW2": None, "LW2": None}
-        # تجميع أول مد وجزرين
-        for item in data:
-            t = datetime.fromisoformat(item["time"].replace("Z", "+00:00"))
-            local_t = t.astimezone(zoneinfo.ZoneInfo("Africa/Tunis"))
-            hour = local_t.hour + local_t.minute / 60.0
-            if item["type"] == "high":
-                if not extremes["HW1"]: extremes["HW1"] = hour
-                elif not extremes["HW2"]: extremes["HW2"] = hour
-            elif item["type"] == "low":
-                if not extremes["LW1"]: extremes["LW1"] = hour
-                elif not extremes["LW2"]: extremes["LW2"] = hour
-        # إذا توفرت جميع القيم
-        if all(extremes.values()):
-            return {k: format_time(v) for k, v in extremes.items()}
-    except Exception as e:
-        logger.warning(f"Stormglass tide fetch failed: {e}")
-    return None
-
 def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
     sr_h = safe_parse_time(sunrise_str)
     ss_h = safe_parse_time(sunset_str)
@@ -318,9 +281,8 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== 50+ شاطئ تونسي ====================
+# ==================== الشواطئ التونسية ====================
 TUNISIAN_BEACHES = [
-    # الشمال
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
     {"name":"شاطئ بنزرت", "lat":37.2744, "lon":9.8739, "orientation":90, "type":"sandy"},
@@ -330,7 +292,6 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ قليبية", "lat":36.8500, "lon":11.1000, "orientation":45, "type":"sandy"},
     {"name":"شاطئ الهوارية", "lat":37.0575, "lon":11.0153, "orientation":0, "type":"rocky"},
     {"name":"شاطئ سيدي علي المكي", "lat":37.1611, "lon":10.2564, "orientation":45, "type":"sandy"},
-    # تونس الكبرى
     {"name":"شاطئ قرطاج", "lat":36.8528, "lon":10.3264, "orientation":90, "type":"sandy"},
     {"name":"شاطئ المرسى", "lat":36.8794, "lon":10.3244, "orientation":90, "type":"sandy"},
     {"name":"شاطئ حلق الوادي", "lat":36.8167, "lon":10.3047, "orientation":90, "type":"sandy"},
@@ -338,25 +299,20 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ الزهراء", "lat":36.7222, "lon":10.3000, "orientation":90, "type":"sandy"},
     {"name":"شاطئ حمام الأنف", "lat":36.7183, "lon":10.3342, "orientation":90, "type":"sandy"},
     {"name":"شاطئ سليمان", "lat":36.6950, "lon":10.4939, "orientation":90, "type":"sandy"},
-    # الوطن القبلي
     {"name":"شاطئ نابل", "lat":36.4561, "lon":10.7389, "orientation":90, "type":"sandy"},
     {"name":"شاطئ الحمامات", "lat":36.4000, "lon":10.6167, "orientation":90, "type":"sandy"},
     {"name":"شاطئ ياسمين الحمامات", "lat":36.3667, "lon":10.5333, "orientation":90, "type":"sandy"},
     {"name":"شاطئ هرقلة", "lat":36.0333, "lon":10.5000, "orientation":90, "type":"sandy"},
     {"name":"شاطئ الشابة", "lat":35.9039, "lon":10.5739, "orientation":90, "type":"sandy"},
-    # الساحل
     {"name":"شاطئ سوسة", "lat":35.8250, "lon":10.6400, "orientation":90, "type":"sandy"},
     {"name":"شاطئ القنطاوي", "lat":35.8750, "lon":10.5950, "orientation":90, "type":"sandy"},
     {"name":"شاطئ المنستير", "lat":35.7667, "lon":10.8167, "orientation":90, "type":"sandy"},
     {"name":"شاطئ سقانص", "lat":35.7583, "lon":10.8028, "orientation":90, "type":"sandy"},
     {"name":"شاطئ المهدية", "lat":35.5047, "lon":11.0622, "orientation":90, "type":"sandy"},
-    {"name":"شاطئ الشابة", "lat":35.9039, "lon":10.5739, "orientation":90, "type":"sandy"},
     {"name":"شاطئ قصور الساف", "lat":35.6167, "lon":10.8833, "orientation":90, "type":"sandy"},
-    # صفاقس
     {"name":"شاطئ صفاقس", "lat":34.7400, "lon":10.7600, "orientation":90, "type":"sandy"},
     {"name":"شاطئ قرقنة", "lat":34.7042, "lon":11.2389, "orientation":90, "type":"sandy"},
     {"name":"شاطئ اللوزة", "lat":34.5833, "lon":10.4167, "orientation":90, "type":"sandy"},
-    # الجنوب
     {"name":"شاطئ قابس", "lat":33.8881, "lon":10.0981, "orientation":90, "type":"sandy"},
     {"name":"شاطئ جرجيس", "lat":33.5000, "lon":11.1167, "orientation":90, "type":"sandy"},
     {"name":"شاطئ جربة (ميدون)", "lat":33.8075, "lon":10.9931, "orientation":90, "type":"sandy"},
@@ -364,7 +320,6 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ جربة (أغير)", "lat":33.8167, "lon":11.0500, "orientation":90, "type":"sandy"},
     {"name":"شاطئ الزارات", "lat":33.6833, "lon":10.3500, "orientation":90, "type":"sandy"},
     {"name":"شاطئ بنقردان", "lat":33.1381, "lon":11.2167, "orientation":90, "type":"sandy"},
-    # شواطئ إضافية
     {"name":"شاطئ طبرقة 2", "lat":36.9600, "lon":8.7600, "orientation":315, "type":"sandy"},
     {"name":"شاطئ ماطر", "lat":37.0600, "lon":9.6600, "orientation":45, "type":"sandy"},
     {"name":"شاطئ أوتيك", "lat":37.1481, "lon":10.0617, "orientation":45, "type":"sandy"},
@@ -428,13 +383,11 @@ async def get_auto_orientation_overpass(lat, lon):
                 r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
                 r.raise_for_status()
                 els = r.json().get("elements", [])
-                if not els:
-                    continue
+                if not els: continue
                 best_dist, best_tangent, best_point = float('inf'), None, None
                 for el in els:
                     geom = el.get("geometry", [])
-                    if len(geom) < 2:
-                        continue
+                    if len(geom) < 2: continue
                     closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
                     p = geom[closest_idx]
                     d = calc_distance(lat, lon, p["lat"], p["lon"])
@@ -444,35 +397,29 @@ async def get_auto_orientation_overpass(lat, lon):
                         next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
                         if prev_i != next_i:
                             best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-                if not best_tangent or not best_point:
-                    continue
+                if not best_tangent or not best_point: continue
                 n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
                 c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
                 d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
                 d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
                 return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
-        except:
-            continue
+        except: continue
     return 0
 
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
-    if orientation != 0:
-        return {"orientation": orientation, "source": "overpass"}
+    if orientation != 0: return {"orientation": orientation, "source": "overpass"}
     orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
-    if orientation is not None:
-        return {"orientation": orientation, "source": "nearest_beach"}
+    if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     nearest_type = find_nearest_beach_type(req.latitude, req.longitude)
-    if nearest_type:
-        return {"bottom_type": nearest_type, "source": "nearby_beach", "confidence": "medium"}
-
+    if nearest_type: return {"bottom_type": nearest_type, "source": "nearby_beach", "confidence": "medium"}
     query = f"""[out:json];(
         way(around:2000,{req.latitude},{req.longitude})["natural"="sand"];
         way(around:2000,{req.latitude},{req.longitude})["natural"="shingle"];
@@ -486,14 +433,44 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
             nat = tags.get("natural", "")
             if nat == "sand": return {"bottom_type": "sandy", "source": "overpass", "confidence": "high"}
             if nat in ["shingle", "bare_rock"]: return {"bottom_type": "rocky", "source": "overpass", "confidence": "high"}
-    except Exception:
-        pass
+    except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
+
+# ==================== جلب بيانات الطقس والبحر من Open‑Meteo ====================
+async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
+    url = "https://marine-api.open-meteo.com/v1/marine"
+    params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": "wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature",
+        "timezone": "Africa/Tunis", "forecast_days": 3
+    }
+    try:
+        r = await http_client.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Open-Meteo marine fetch failed: {e}")
+        return None
+
+async def fetch_weather_data_from_openmeteo(lat: float, lon: float):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,precipitation,visibility,weather_code",
+        "daily": "sunrise,sunset",
+        "timezone": "Africa/Tunis", "forecast_days": 3
+    }
+    try:
+        r = await http_client.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Open-Meteo weather fetch failed: {e}")
+        return None
 
 # ==================== التحليلات الإضافية ====================
 def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
-    risk = "منخفض"
-    advice = ""
+    risk = "منخفض"; advice = ""
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     if has_weed:
         risk = "مرتفع" if "تحذير صوفة" in sea_memory else "متوسط"
@@ -504,8 +481,7 @@ def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_hei
     wind_diff = angle_diff(wind_dir, orient)
     is_onshore = wind_diff < 30
     is_strong = wind_speed > 25
-    severity = "منخفض"
-    effect = ""
+    severity = "منخفض"; effect = ""
     if is_onshore and is_strong and wave_height > 0.8:
         severity = "مرتفع"
         effect = f"رياح بحرية قوية ({wind_speed:.0f} كم/س) تضرب الموج نحو الشاطئ، ثم يرتد الموج بقوة نحو البحر. هذا يخلق تياراً عكسياً قوياً يرجع الرصاصة للشاطئ باستمرار. حتى مع وزن ثقيل، يصعب تثبيت الطعم."
@@ -518,8 +494,7 @@ def analyze_debris_risk(sea_memory: str, past_rain: float, wind_speed: float) ->
     has_floods = "سيول" in sea_memory
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     is_windy = wind_speed > 20
-    risk = "منخفض"
-    effect = ""
+    risk = "منخفض"; effect = ""
     if has_floods and has_weed and is_windy:
         risk = "مرتفع"
         effect = "السيول الأخيرة حملت كميات كبيرة من الأعشاب والأغصان والمواد العضوية إلى البحر. هذه المواد تطفو الآن وتتجمع على الخيط والرصاصة، مما يزيد الوزن ويغير شكل الطعم. الأوساخ تسد العقد وتجعل الخيط مرئياً للسمك. يجب تنظيف الخيط كل بضع رميات، والصيد شبه مستحيل."
@@ -532,10 +507,10 @@ def analyze_debris_risk(sea_memory: str, past_rain: float, wind_speed: float) ->
     return {"risk": risk, "effect": effect}
 
 def get_seasonal_bait(month: int, water_temp: float) -> str:
-    if month in [12, 1, 2]: bait = "السردين أو القمبري"
-    elif month in [3, 4, 5]: bait = "الحبار أو الدود البحري"
-    elif month in [6, 7, 8]: bait = "القمبري (الأفضل) أو الحبار"
-    elif month in [9, 10, 11]: bait = "السردين المهاجر أو الحبار"
+    if month in [12,1,2]: bait = "السردين أو القمبري"
+    elif month in [3,4,5]: bait = "الحبار أو الدود البحري"
+    elif month in [6,7,8]: bait = "القمبري (الأفضل) أو الحبار"
+    elif month in [9,10,11]: bait = "السردين المهاجر أو الحبار"
     else: bait = "القمبري (طوال السنة)"
     if water_temp > 22: bait += " (يفضل الطعم الحي أو المتحرك)"
     return bait
@@ -565,8 +540,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     empty_res = {
         "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "No-Go"
     }
-    if not target_idx:
-        return empty_res
+    if not target_idx: return empty_res
 
     def pick(k): 
         arr = aligned.get(k, [])
@@ -660,7 +634,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     is_weedy = "صوفة" in sea_memory
     max_air_temp = max(ta) if ta else 0
     month = target_date_obj.month
-    seabass_sst_limit = 20.0 if month in [6, 7, 8, 9] else 18.0
+    seabass_sst_limit = 20.0 if month in [6,7,8,9] else 18.0
     if avg_sst > seabass_sst_limit: warnings.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص.")
 
     avg_press = sum(pr)/len(pr) if pr else 0
@@ -672,7 +646,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     elif is_pressure_rising_fast: pressure_state = f"ارتفاع حاد ({press_change:+.1f}). توقف فوري."
     else: pressure_state = f"مستقر ({press_change:+.1f})."
 
-    # مصفوفة الكائنات الموسعة
     bio_matrix = {
         "قاروص": {
             "status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
@@ -847,12 +820,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "has_golden_window": has_golden_window, "is_neap_tide": is_neap_tide, "is_spring_tide": is_spring_tide
     }
 
-    if nogo_reasons:
-        final_verdict = "No-Go"
-    elif warnings:
-        final_verdict = "Conditional Go"
-    else:
-        final_verdict = "Go"
+    if nogo_reasons: final_verdict = "No-Go"
+    elif warnings: final_verdict = "Conditional Go"
+    else: final_verdict = "Go"
 
     return {
         "dominant_wind":dominant, "blocks":blocks, "red_flags":reds[:5], "green_flags":greens[:5],
@@ -865,7 +835,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "final_verdict": final_verdict
     }
 
-# ==================== التفكيك الديناميكي (يُظهر جميع الأسماك) ====================
+# ==================== التفكيك الديناميكي ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
@@ -986,15 +956,14 @@ def build_context(req, agg, tz_name):
         f"حرارة الماء: {agg['avg_sst']}°م. الهواء القصوى: {extra.get('max_air_temp', 'N/A')}°م.",
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
-
     final_verdict = agg["final_verdict"]
-    golden_windows = agg["extra_info"].get("golden_windows", [])
+    golden_windows = extra.get("golden_windows", [])
     best_time = "غير محدد"
     for gw in golden_windows:
         if "تزامن" in gw:
             best_time = gw.split(":")[0] if ":" in gw else gw
             break
-    seasonal_bait = agg["extra_info"].get("seasonal_bait", "الطعم الموسمي")
+    seasonal_bait = extra.get("seasonal_bait", "الطعم الموسمي")
     if final_verdict == "Go":
         summary = f"Go - أفضل وقت: {best_time}. استعمل {seasonal_bait}."
     elif final_verdict == "Conditional Go":
@@ -1032,7 +1001,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - إذا كان هناك Backwash، اشرح تأثيره.
 - إذا كان هناك أوساخ/صوفة، اشرح تأثيرها على الخيط.
 - اذكر أفضل مسافة للرمي.
-- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم. يجب ذكر كل الأنواع (القاروص، الدنيس، البوري، السارغ، المرمار، الشلبة، التريلية، البغبغان، السوبيا) ولو بشكل موجز.
+- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم (الحرارة، البحر، التيار، العكارة، الوقت، الطعم). يجب ذكر كل الأسماك ولو بشكل موجز.
 
 3. العوامل التي تجعل الصيد مستحيلاً (فقط إذا كان الحسم No-Go):
 - اكتب قائمة بالنقاط (•) للعوامل المانعة للصيد.
@@ -1060,7 +1029,7 @@ async def call_openrouter(ctx):
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
 
-# ==================== فحص هلوسة + الأرقام المرجعية ====================
+# ==================== فحص الهلوسة والأرقام المرجعية ====================
 def extract_numbers_from_text(text: str) -> List[float]:
     pattern = r'-?\d+\.?\d*'
     matches = re.findall(pattern, text)
@@ -1073,12 +1042,9 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
         for v in raw.values():
             if isinstance(v, (int, float)):
                 allowed.add(round(v, 1))
-        if "confidence" in b:
-            allowed.add(round(b["confidence"], 1))
-        if "recommended_cast_distance" in b:
-            allowed.add(round(b["recommended_cast_distance"], 1))
-        if "wind_gust_peak" in b:
-            allowed.add(round(b["wind_gust_peak"], 1))
+        if "confidence" in b: allowed.add(round(b["confidence"], 1))
+        if "recommended_cast_distance" in b: allowed.add(round(b["recommended_cast_distance"], 1))
+        if "wind_gust_peak" in b: allowed.add(round(b["wind_gust_peak"], 1))
     extra = agg.get("extra_info", {})
     for v in extra.values():
         if isinstance(v, (int, float)):
@@ -1099,43 +1065,44 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
         for key in ["HW1", "HW2", "LW1", "LW2"]:
             t_str = tidal.get(key, "00:00")
             t_h = safe_parse_time(t_str)
-            gap_sr = abs(t_h - sr_h) % 24
-            gap_sr = min(gap_sr, 24 - gap_sr)
+            gap_sr = abs(t_h - sr_h) % 24; gap_sr = min(gap_sr, 24 - gap_sr)
             allowed.add(round(gap_sr, 1))
-            gap_ss = abs(t_h - ss_h) % 24
-            gap_ss = min(gap_ss, 24 - gap_ss)
+            gap_ss = abs(t_h - ss_h) % 24; gap_ss = min(gap_ss, 24 - gap_ss)
             allowed.add(round(gap_ss, 1))
-    except:
-        pass
+    except: pass
     return {x for x in allowed if x > 0.5}
 
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
-        marine_hourly = req.marine_data.get("hourly", req.marine_data)
-        weather_hourly = req.weather_data.get("hourly", {})
-        daily = req.weather_data.get("daily", {})
-        tz_name = req.marine_data.get("timezone", "Africa/Tunis")
+        if not req.marine_data or not req.weather_data:
+            logger.info("جلب البيانات الحية من Open‑Meteo...")
+            lat = req.latitude or 36.8
+            lon = req.longitude or 10.1
+            marine_data = await fetch_marine_data_from_openmeteo(lat, lon)
+            weather_data = await fetch_weather_data_from_openmeteo(lat, lon)
+            if not marine_data or not weather_data:
+                raise HTTPException(502, "تعذر جلب بيانات الطقس/البحر من المصادر الخارجية")
+        else:
+            marine_data = req.marine_data
+            weather_data = req.weather_data
+
+        marine_hourly = marine_data.get("hourly", marine_data)
+        weather_hourly = weather_data.get("hourly", {})
+        daily = weather_data.get("daily", {})
+        tz_name = marine_data.get("timezone", "Africa/Tunis")
         now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
         target_dt = resolve_target_date(req.target_date, now_tn.date())
         sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
         sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
-        latitude = req.marine_data.get("latitude", 36.8)
+        latitude = req.latitude or 36.8
 
         all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
         if not all_times:
             raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
 
-        # محاولة جلب مد وجزر دقيق من Stormglass
-        stormglass_tides = None
-        if STORMGLASS_API_KEY:
-            stormglass_tides = await fetch_tides_from_stormglass(latitude, req.longitude if hasattr(req, 'longitude') else 10.0, target_dt)
         agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
-        # استبدال أوقات المد إذا توفرت بيانات Stormglass
-        if stormglass_tides:
-            agg["extra_info"]["tidal_windows"] = stormglass_tides
-            agg["extra_info"]["tide_source"] = "stormglass"
 
         if agg["extra_info"]["peak_gust_today"] > 60 or any(b["_raw"]["max_wave_h"] > 2.5 for b in agg["blocks"] if b["_raw"]["max_wave_h"]):
             return {"report": "قرار نهائي: No-Go مطلق. ظروف بحرية خطرة تهدد حياتك.", "meta": {"hard_nogo": True}}
@@ -1153,8 +1120,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         computed_text += f"نوع التيار الجانبي: {agg['lateral_current']}\n"
         computed_text += f"ذاكرة البحر: {agg['sea_memory']}\n"
         computed_text += f"انحدار الموج: {agg['hidden_factors']['wave_steepness']}\n"
-        if stormglass_tides:
-            computed_text += f"مصدر المد والجزر: Stormglass API\n"
         computed_text += "\n"
         for b in agg['blocks']:
             r = b['_raw']
