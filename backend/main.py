@@ -1,7 +1,8 @@
 """
-Surfcasting Analytics API – v16.4.0 (Species Targeting Guide)
-- تمت إضافة حقل "preferences" لكل سمكة في bio_matrix.
-- يتم عرض التفضيلات كجزء من قسم الكائنات في التقرير.
+Surfcasting Analytics API – v16.5.0 (Full Debug & Complete Species Reporting)
+- إضافة واجهة /debug-report لإرجاع التقرير + جميع البيانات الخام للتحقق من الصحة.
+- إلزام النموذج بذكر جميع الأسماك الموجودة في قسم "الكائنات" مع تفضيلاتها.
+- تجميعية العوامل المفضلة لكل سمكة مدمجة في bio_matrix.
 - جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
 - فحص هلوسة صارم.
 """
@@ -32,7 +33,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.4.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.5.0", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -69,7 +70,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.4.0"}
+    return {"status": "ok", "version": "16.5.0"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -925,7 +926,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - إذا كان هناك Backwash، اشرح تأثيره.
 - إذا كان هناك أوساخ/صوفة، اشرح تأثيرها على الخيط.
 - اذكر أفضل مسافة للرمي.
-- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم (الحرارة، البحر، التيار، العكارة، الوقت، الطعم).
+- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم (الحرارة، البحر، التيار، العكارة، الوقت، الطعم). يجب ذكر كل الأسماك (القاروص، الدنيس، البوري، السارغ، المرمار) ولو بشكل موجز.
 
 3. العوامل التي تجعل الصيد مستحيلاً (فقط إذا كان الحسم No-Go):
 - اكتب قائمة بالنقاط (•) للعوامل المانعة للصيد.
@@ -942,7 +943,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - لا تستخدم جداول Markdown.
 - لا تكرر المعلومات.
 - اكتب بالدارجة التونسية المفصلة.
-- أكمل التقرير حتى النهاية ولا تتوقف قبل قسم السلامة."""
+- أكمل التقرير حتى النهاية ولا تتوقف قبل قسم السلامة.
+- اذكر جميع الأسماك الواردة في "الكائنات" (القاروص، الدنيس، البوري، السارغ، المرمار) في التفكيك الديناميكي."""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
@@ -1043,6 +1045,56 @@ async def generate_report(request: Request, req: RawDataReportRequest):
     except Exception as e:
         logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail="فشل إنشاء التقرير")
+
+# ==================== واجهة التصحيح (Debug) ====================
+@app.post("/debug-report")
+@limiter.limit("5/minute")
+async def debug_report(request: Request, req: RawDataReportRequest):
+    """
+    يرجع التقرير النهائي + جميع البيانات الخام التي بُني عليها.
+    استخدم هذا لتدقيق صحة التقرير ومقارنة الأرقام.
+    """
+    try:
+        marine_hourly = req.marine_data.get("hourly", req.marine_data)
+        weather_hourly = req.weather_data.get("hourly", {})
+        daily = req.weather_data.get("daily", {})
+        tz_name = req.marine_data.get("timezone", "Africa/Tunis")
+        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
+        target_dt = resolve_target_date(req.target_date, now_tn.date())
+        sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
+        sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
+        latitude = req.marine_data.get("latitude", 36.8)
+
+        all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
+        if not all_times:
+            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+
+        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
+
+        ctx = build_context(req, agg, tz_name)
+        report = await call_openrouter(ctx)
+
+        return {
+            "report": report,
+            "raw_data": {
+                "input_parameters": {
+                    "beach_orientation": req.beach_orientation,
+                    "beach_type": req.beach_type,
+                    "target_date": str(target_dt),
+                    "sunrise": sunrise,
+                    "sunset": sunset,
+                    "latitude": latitude
+                },
+                "aligned_hourly_data": aligned,
+                "aggregated_physics": agg,
+                "interactions": calculate_interactions(agg)
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"debug-report error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail="فشل إنشاء تقرير التصحيح")
 
 if __name__ == "__main__":
     import uvicorn
