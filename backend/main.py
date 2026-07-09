@@ -1,6 +1,7 @@
 """
-Surfcasting Analytics API – v17.1.0 (Production‑Ready, Live Data)
-- إذا لم تُرسَل marine_data أو weather_data، تُجلَب تلقائياً من Open‑Meteo (بدون مفتاح).
+Surfcasting Analytics API – v17.1.1 (Production‑Ready, Live Data)
+- إذا تم إرسال marine_data و weather_data من العميل، يتم استخدامها مباشرة.
+- إذا لم تُرسَل، يتم جلبها تلقائياً من Open‑Meteo (بدون مفتاح).
 - أكثر من 50 شاطئ تونسي مع إحداثيات واتجاهات.
 - أسماك: قاروص، دنيس، بوري، سارغ، مرمار، شلبة، تريلية، بغبغان، سوبيا مع تفضيلات كاملة.
 - تحليلات: الموج الراجع (Backwash)، الأوساخ والصوفة، سولونار، Slack water، ثقة، رؤية، انحدار الموج.
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="17.1.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="17.1.1", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -73,7 +74,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "17.1.0"}
+    return {"status": "ok", "version": "17.1.1"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -281,7 +282,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ التونسية ====================
+# ==================== 50+ شاطئ تونسي ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -1076,7 +1077,12 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
-        if not req.marine_data or not req.weather_data:
+        # إذا تم إرسال بيانات من العميل، استخدمها. وإلا اجلب من Open‑Meteo.
+        if req.marine_data and req.weather_data:
+            marine_data = req.marine_data
+            weather_data = req.weather_data
+            logger.info("تم استخدام البيانات المُرسَلة من العميل.")
+        else:
             logger.info("جلب البيانات الحية من Open‑Meteo...")
             lat = req.latitude or 36.8
             lon = req.longitude or 10.1
@@ -1084,9 +1090,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
             weather_data = await fetch_weather_data_from_openmeteo(lat, lon)
             if not marine_data or not weather_data:
                 raise HTTPException(502, "تعذر جلب بيانات الطقس/البحر من المصادر الخارجية")
-        else:
-            marine_data = req.marine_data
-            weather_data = req.weather_data
 
         marine_hourly = marine_data.get("hourly", marine_data)
         weather_hourly = weather_data.get("hourly", {})
