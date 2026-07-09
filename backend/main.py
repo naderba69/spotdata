@@ -1,10 +1,9 @@
 """
-Surfcasting Analytics API – v16.5.2 (Full Production + Debug Numbers)
-- يحتوي حقل computed_numbers في meta على جميع الأرقام المحسوبة.
-- إصلاح نهائي لظهور التحذير على الفروق الزمنية.
-- جميع التحليلات (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, انحدار الموج).
+Surfcasting Analytics API – v16.5.3 (Report + All Computed Numbers)
+- يتم إلحاق جميع الأرقام المحسوبة في نهاية التقرير (قسم "الأرقام المرجعية").
+- يمكن نسخ التقرير كاملاً وإرساله للتحليل.
+- جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
 - فحص هلوسة صارم.
-- جاهز للنشر الفوري.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -33,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.5.2", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.5.3", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -70,7 +69,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.5.2"}
+    return {"status": "ok", "version": "16.5.3"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -1030,67 +1029,55 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
+        # إضافة الأرقام المرجعية إلى التقرير
+        computed_text = "\n\n--- الأرقام المرجعية (للتحقق) ---\n"
+        computed_text += f"متوسط حرارة الماء: {agg['avg_sst']}°م\n"
+        computed_text += f"أقصى حرارة هواء: {agg['extra_info']['max_air_temp']}°م\n"
+        computed_text += f"أقصى هبات رياح اليوم: {agg['extra_info']['peak_gust_today']} كم/س\n"
+        computed_text += f"الضغط الجوي المتوسط: {agg['extra_info']['pressure_avg']} hPa\n"
+        computed_text += f"تغير الضغط: {agg['extra_info'].get('pressure_change', 'غير متوفر')}\n"
+        computed_text += f"نوع التيار الجانبي: {agg['lateral_current']}\n"
+        computed_text += f"ذاكرة البحر: {agg['sea_memory']}\n"
+        computed_text += f"انحدار الموج: {agg['hidden_factors']['wave_steepness']}\n"
+        computed_text += "\n"
+        for b in agg['blocks']:
+            r = b['_raw']
+            computed_text += f"فترة {b['name']}:\n"
+            computed_text += f"  الثقة: {b['confidence']}%\n"
+            computed_text += f"  أفضل مسافة رمي: {b['recommended_cast_distance']} متر\n"
+            computed_text += f"  متوسط ارتفاع الموج: {r['avg_wave_h']}م\n"
+            computed_text += f"  أقصى ارتفاع موج: {r['max_wave_h']}م\n"
+            computed_text += f"  متوسط الرياح: {r['avg_wind']} كم/س\n"
+            computed_text += f"  أقصى هبات: {r['max_gust']} كم/س\n"
+            computed_text += f"  السويل: {r['swell_h']}م (دور {r['swell_p']}ث)\n"
+            computed_text += f"  تأثير الرياح على المسافة: {r['wind_effect_dist']}م\n"
+            if b['backwash']['severity'] != 'منخفض':
+                computed_text += f"  تحذير الموج الراجع: {b['backwash']['effect']}\n"
+            if b['debris']['risk'] != 'منخفض':
+                computed_text += f"  تحذير الأوساخ: {b['debris']['effect']}\n"
+            computed_text += "\n"
+
+        report += computed_text
+
+        # فحص الهلوسة
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
-        suspicious = [
-            n for n in report_numbers
-            if n > 0.5
-            and n not in allowed_numbers
-            and not (n.is_integer() and 0 <= n <= 59)
-        ]
+        suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers and not (n.is_integer() and 0 <= n <= 59)]
         if suspicious:
             logger.warning(f"أرقام غير مطابقة في التقرير: {suspicious}")
-            report += f"\n\n[تحذير نظام: تم اكتشاف أرقام غير دقيقة في التقرير: {suspicious}. يُرجى التحقق.]"
-
-        if agg["final_verdict"] == "No-Go" and "go" in report.lower()[:100]:
-            report += "\n\n[تنبيه: القرار النهائي هو No-Go، تجاهل أي إشارة إيجابية.]"
+            report += f"\n[تحذير نظام: أرقام غير دقيقة {suspicious}]"
 
         clean_blocks = [{k: v for k, v in b.items() if k != "_raw"} for b in agg["blocks"]]
 
-        # تجميع كل الأرقام المحسوبة لتصحيح التقرير
-        computed = {
-            "avg_sst": agg["avg_sst"],
-            "max_air_temp": agg["extra_info"]["max_air_temp"],
-            "peak_gust_today": agg["extra_info"]["peak_gust_today"],
-            "pressure_avg": agg["extra_info"]["pressure_avg"],
-            "pressure_change": agg["extra_info"].get("pressure_change"),
-            "tide": agg["extra_info"]["tidal_windows"],
-            "golden_windows": agg["extra_info"]["golden_windows"],
-            "solunar": agg["extra_info"]["solunar"],
-            "slack_times": agg["extra_info"]["slack_times"],
-            "sea_memory": agg["sea_memory"],
-            "lateral_current": agg["lateral_current"],
-            "wave_steepness": agg["hidden_factors"]["wave_steepness"],
-            "cross_sea_risk": agg["hidden_factors"]["cross_sea_risk"],
-            "golden_lock": agg["hidden_factors"]["golden_lock"],
-            "blocks": []
-        }
-        for b in agg["blocks"]:
-            block_nums = {
-                "name": b["name"],
-                "confidence": b["confidence"],
-                "recommended_cast_distance": b["recommended_cast_distance"],
-                "backwash_severity": b["backwash"]["severity"] if b["backwash"] else None,
-                "debris_risk": b["debris"]["risk"] if b["debris"] else None,
-                "wave_angle_diff": b["wave_angle_diff"],
-                "swell_angle_diff": b["swell_angle_diff"],
-                "wind_gust_peak": b["wind_gust_peak"],
-                **b["_raw"]
-            }
-            computed["blocks"].append(block_nums)
-
         meta = {
-            "timezone": tz_name,
-            "target_date": target_dt.isoformat(),
-            "hard_nogo": False,
+            "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
             "tidal_estimation": agg["extra_info"]["tidal_windows"],
             "golden_windows_detected": agg["extra_info"]["golden_windows"],
             "solunar": agg["extra_info"]["solunar"],
             "final_verdict": agg["final_verdict"],
             "nogo_reasons": agg["nogo_reasons"],
             "warnings": agg.get("warnings", []),
-            "blocks": clean_blocks,
-            "computed_numbers": computed
+            "blocks": clean_blocks
         }
         return {"report": report, "meta": meta}
     except HTTPException:
@@ -1098,51 +1085,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
     except Exception as e:
         logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail="فشل إنشاء التقرير")
-
-@app.post("/debug-report")
-@limiter.limit("5/minute")
-async def debug_report(request: Request, req: RawDataReportRequest):
-    try:
-        marine_hourly = req.marine_data.get("hourly", req.marine_data)
-        weather_hourly = req.weather_data.get("hourly", {})
-        daily = req.weather_data.get("daily", {})
-        tz_name = req.marine_data.get("timezone", "Africa/Tunis")
-        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
-        target_dt = resolve_target_date(req.target_date, now_tn.date())
-        sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
-        sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
-        latitude = req.marine_data.get("latitude", 36.8)
-
-        all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
-        if not all_times:
-            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
-
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
-
-        ctx = build_context(req, agg, tz_name)
-        report = await call_openrouter(ctx)
-
-        return {
-            "report": report,
-            "raw_data": {
-                "input_parameters": {
-                    "beach_orientation": req.beach_orientation,
-                    "beach_type": req.beach_type,
-                    "target_date": str(target_dt),
-                    "sunrise": sunrise,
-                    "sunset": sunset,
-                    "latitude": latitude
-                },
-                "aligned_hourly_data": aligned,
-                "aggregated_physics": agg,
-                "interactions": calculate_interactions(agg)
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"debug-report error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, detail="فشل إنشاء تقرير التصحيح")
 
 if __name__ == "__main__":
     import uvicorn
