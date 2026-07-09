@@ -1,10 +1,7 @@
 """
-Surfcasting Analytics API – v16.5.0 (Full Debug & Complete Species Reporting)
-- إضافة واجهة /debug-report لإرجاع التقرير + جميع البيانات الخام للتحقق من الصحة.
-- إلزام النموذج بذكر جميع الأسماك الموجودة في قسم "الكائنات" مع تفضيلاتها.
-- تجميعية العوامل المفضلة لكل سمكة مدمجة في bio_matrix.
-- جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
-- فحص هلوسة صارم.
+Surfcasting Analytics API – v16.5.1 (Embedded Debug Numbers)
+- يضيف حقل computed_numbers إلى meta في /generate-report.
+- يحتوي على جميع الأرقام المحسوبة لتصحيح التقرير ومقارنته.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -33,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.5.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.5.1", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -70,7 +67,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.5.0"}
+    return {"status": "ok", "version": "16.5.1"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -464,7 +461,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== محرك التجميع الفيزيائي (مع التفضيلات) ====================
+# ==================== محرك التجميع الفيزيائي ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -730,7 +727,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "has_swell_data": has_swell_data, "actual_swell_exists": actual_swell_exists,
         "solunar": solunar, "slack_times": slack_info,
         "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
-        "past_rain_total": round(past_rain_total, 1)
+        "past_rain_total": round(past_rain_total, 1),
+        "pressure_change": round(press_change, 1)  # أضفنا هذا
     }
 
     flags = {
@@ -758,7 +756,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "final_verdict": final_verdict
     }
 
-# ==================== التفكيك الديناميكي (يُظهر التفضيلات) ====================
+# ==================== التفكيك الديناميكي ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
@@ -850,7 +848,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     interactions.append(f"[الضغط] {pressure_state}")
     interactions.append(f"[الطعم الموسمي] {seasonal_bait}")
 
-    # عرض الكائنات مع التفضيلات
     bio_lines = []
     for fish, data in bio_matrix.items():
         prefs = data.get("preferences", "")
@@ -984,6 +981,24 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     allowed.add(round(extra.get("max_air_temp", 0), 1))
     allowed.add(round(extra.get("peak_gust_today", 0), 1))
     allowed.add(round(extra.get("pressure_avg", 0), 1))
+    # إضافة الفروق الزمنية بين أوقات المد والشروق/الغروب
+    tidal = agg.get("extra_info", {}).get("tidal_windows", {})
+    sunrise_str = agg.get("extra_info", {}).get("sunrise", "06:00")
+    sunset_str = agg.get("extra_info", {}).get("sunset", "18:00")
+    try:
+        sr_h = safe_parse_time(sunrise_str)
+        ss_h = safe_parse_time(sunset_str)
+        for key in ["HW1", "HW2", "LW1", "LW2"]:
+            t_str = tidal.get(key, "00:00")
+            t_h = safe_parse_time(t_str)
+            gap_sr = abs(t_h - sr_h) % 24
+            gap_sr = min(gap_sr, 24 - gap_sr)
+            allowed.add(round(gap_sr, 1))
+            gap_ss = abs(t_h - ss_h) % 24
+            gap_ss = min(gap_ss, 24 - gap_ss)
+            allowed.add(round(gap_ss, 1))
+    except:
+        pass
     return {x for x in allowed if x > 0.5}
 
 @app.post("/generate-report")
@@ -1029,15 +1044,50 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         clean_blocks = [{k: v for k, v in b.items() if k != "_raw"} for b in agg["blocks"]]
 
+        # تجميع كل الأرقام المحسوبة لتصحيح التقرير
+        computed = {
+            "avg_sst": agg["avg_sst"],
+            "max_air_temp": agg["extra_info"]["max_air_temp"],
+            "peak_gust_today": agg["extra_info"]["peak_gust_today"],
+            "pressure_avg": agg["extra_info"]["pressure_avg"],
+            "pressure_change": agg["extra_info"].get("pressure_change"),
+            "tide": agg["extra_info"]["tidal_windows"],
+            "golden_windows": agg["extra_info"]["golden_windows"],
+            "solunar": agg["extra_info"]["solunar"],
+            "slack_times": agg["extra_info"]["slack_times"],
+            "sea_memory": agg["sea_memory"],
+            "lateral_current": agg["lateral_current"],
+            "wave_steepness": agg["hidden_factors"]["wave_steepness"],
+            "cross_sea_risk": agg["hidden_factors"]["cross_sea_risk"],
+            "golden_lock": agg["hidden_factors"]["golden_lock"],
+            "blocks": []
+        }
+        for b in agg["blocks"]:
+            block_nums = {
+                "name": b["name"],
+                "confidence": b["confidence"],
+                "recommended_cast_distance": b["recommended_cast_distance"],
+                "backwash_severity": b["backwash"]["severity"] if b["backwash"] else None,
+                "debris_risk": b["debris"]["risk"] if b["debris"] else None,
+                "wave_angle_diff": b["wave_angle_diff"],
+                "swell_angle_diff": b["swell_angle_diff"],
+                "wind_gust_peak": b["wind_gust_peak"],
+                **b["_raw"]
+            }
+            computed["blocks"].append(block_nums)
+
         meta = {
-            "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
+            "timezone": tz_name,
+            "target_date": target_dt.isoformat(),
+            "hard_nogo": False,
             "tidal_estimation": agg["extra_info"]["tidal_windows"],
             "golden_windows_detected": agg["extra_info"]["golden_windows"],
             "solunar": agg["extra_info"]["solunar"],
             "final_verdict": agg["final_verdict"],
             "nogo_reasons": agg["nogo_reasons"],
             "warnings": agg.get("warnings", []),
-            "blocks": clean_blocks
+            "blocks": clean_blocks,
+            "computed_numbers": computed
         }
         return {"report": report, "meta": meta}
     except HTTPException:
@@ -1045,56 +1095,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
     except Exception as e:
         logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail="فشل إنشاء التقرير")
-
-# ==================== واجهة التصحيح (Debug) ====================
-@app.post("/debug-report")
-@limiter.limit("5/minute")
-async def debug_report(request: Request, req: RawDataReportRequest):
-    """
-    يرجع التقرير النهائي + جميع البيانات الخام التي بُني عليها.
-    استخدم هذا لتدقيق صحة التقرير ومقارنة الأرقام.
-    """
-    try:
-        marine_hourly = req.marine_data.get("hourly", req.marine_data)
-        weather_hourly = req.weather_data.get("hourly", {})
-        daily = req.weather_data.get("daily", {})
-        tz_name = req.marine_data.get("timezone", "Africa/Tunis")
-        now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
-        target_dt = resolve_target_date(req.target_date, now_tn.date())
-        sunrise = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
-        sunset = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
-        latitude = req.marine_data.get("latitude", 36.8)
-
-        all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
-        if not all_times:
-            raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
-
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
-
-        ctx = build_context(req, agg, tz_name)
-        report = await call_openrouter(ctx)
-
-        return {
-            "report": report,
-            "raw_data": {
-                "input_parameters": {
-                    "beach_orientation": req.beach_orientation,
-                    "beach_type": req.beach_type,
-                    "target_date": str(target_dt),
-                    "sunrise": sunrise,
-                    "sunset": sunset,
-                    "latitude": latitude
-                },
-                "aligned_hourly_data": aligned,
-                "aggregated_physics": agg,
-                "interactions": calculate_interactions(agg)
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"debug-report error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, detail="فشل إنشاء تقرير التصحيح")
 
 if __name__ == "__main__":
     import uvicorn
