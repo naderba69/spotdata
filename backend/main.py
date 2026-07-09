@@ -1,12 +1,9 @@
 """
-Surfcasting Analytics API – v16.3.2 (Complete Reports)
-- زيادة max_tokens إلى 12000.
-- إزالة قسم "بيانات الفترات الخام" من السياق لتوفير مساحة.
-- تحسين SYSTEM_PROMPT لضمان اكتمال التقرير.
-- جميع التحليلات السابقة (Backwash, أوساخ, صوفة, سولونار, مياه ميتة, أعشاب, طعم موسمي, ثقة, رؤية, انحدار الموج).
-- فحص هلوسة صارم على الأرقام والقرار النهائي.
-- جميع الإصلاحات التقنية (HTTP client, 429 retry, ZeroDivision, tidal wrap, safe_float, cache).
-- واجهات: /auto-orientation, /detect-bottom-type, /generate-report.
+Surfcasting Analytics API – v16.4.0 (Species Targeting Guide)
+- تمت إضافة حقل "preferences" لكل سمكة في bio_matrix.
+- يتم عرض التفضيلات كجزء من قسم الكائنات في التقرير.
+- جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
+- فحص هلوسة صارم.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -35,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.3.2", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.4.0", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -72,7 +69,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.3.2"}
+    return {"status": "ok", "version": "16.4.0"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -280,7 +277,6 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== الشواطئ التونسية ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ الحمامات","lat":36.4000,"lon":10.6167,"orientation":90,"type":"sandy"},
     {"name":"شاطئ قليبية","lat":36.8500,"lon":11.1000,"orientation":45,"type":"sandy"},
@@ -309,7 +305,6 @@ def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
             nearest_type = b["type"]
     return nearest_type
 
-# ==================== دوال Overpass ====================
 async def fetch_overpass(query: str, timeout: int = 15) -> dict:
     for attempt in range(1, 4):
         try:
@@ -468,7 +463,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== محرك التجميع الفيزيائي ====================
+# ==================== محرك التجميع الفيزيائي (مع التفضيلات) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -590,13 +585,33 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     elif is_pressure_rising_fast: pressure_state = f"ارتفاع حاد ({press_change:+.1f}). توقف فوري."
     else: pressure_state = f"مستقر ({press_change:+.1f})."
 
+    # مصفوفة الكائنات مع التفضيلات الكاملة
     bio_matrix = {
-        "قاروص": {"status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
-                  "reason": f"يحتاج عكراً ودرجة أقل من {seabass_sst_limit}°م. الضغط {'' if is_pressure_dropping_fast else 'لا '}يحفزه."},
-        "دوراد": {"status": "نشط" if (avg_sst > 18 and not is_murky) else "خامل", "reason": "يحب النظافة ويأتي مع المد العالي ليلاً."},
-        "بوري": {"status": "نشط" if (not is_murky and not is_weedy and not is_mirror_sea) else "خامل",
-                 "reason": "يحتاج حركة سطحية. في بحر مرآوي يختفي تماماً." if is_mirror_sea else "يحتاج حركة سطحية."},
-        "سارغ": {"status": "ضعيف", "reason": "يتأثر بالحرارة."}
+        "قاروص": {
+            "status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
+            "reason": f"يحتاج عكراً ودرجة أقل من {seabass_sst_limit}°م. الضغط {'' if is_pressure_dropping_fast else 'لا '}يحفزه.",
+            "preferences": "🌡️14-20°م | 🌊متوسط الهيجان | 🧭تيار معتدل | 🟫عكارة خفيفة-متوسطة | 🌅الفجر، الغروب، الليل | 🪱السردين، القمبري، الحبار"
+        },
+        "دنيس": {
+            "status": "نشط" if (avg_sst > 18 and not is_murky and not is_mirror_sea) else "خامل",
+            "reason": "يحب الماء النظيف والدافئ، وينشط قرب الصخور عند الغروب والفجر.",
+            "preferences": "🌡️18-24°م | 🌊هادئ-متوسط | 🧭تيار ضعيف-متوسط | 🟫ماء نظيف | 🌅الفجر، الغروب | 🪱الحبار، الدود، القمبري"
+        },
+        "بوري": {
+            "status": "نشط" if (not is_murky and not is_weedy and not is_mirror_sea) else "خامل",
+            "reason": "يحتاج حركة سطحية. في بحر مرآوي يختفي تماماً." if is_mirror_sea else "يحتاج حركة سطحية.",
+            "preferences": "🌡️16-26°م | 🌊أي حالة | 🧭تيار سطحي للعوالق | 🟫ماء نظيف | 🌅النهار كله | 🪱عجينة، دود، خبز"
+        },
+        "سارغ": {
+            "status": "ضعيف" if avg_sst > 22 else "نشط",
+            "reason": "يتأثر بالحرارة." if avg_sst > 22 else "درجة الحرارة مناسبة.",
+            "preferences": "🌡️16-22°م | 🌊هادئ-متوسط | 🧭أي تيار | 🟫ماء نظيف | 🌅الفجر والغروب | 🪱القمبري، الحبار، الدود"
+        },
+        "مرمار": {
+            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea and lateral_force_ratio > 0.2) else "خامل",
+            "reason": "يتجمع في أسراب نهاراً، يحتاج تياراً يجلب العوالق.",
+            "preferences": "🌡️18-26°م | 🌊هادئ-متوسط | 🧭تيار معتدل | 🟫ماء نظيف-قليل العكارة | 🌅النهار | 🪱دود، قمبري صغير، عجينة"
+        }
     }
 
     peak_gust = max(wg) if wg else 0.0
@@ -742,7 +757,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "final_verdict": final_verdict
     }
 
-# ==================== التفكيك الديناميكي ====================
+# ==================== التفكيك الديناميكي (يُظهر التفضيلات) ====================
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
@@ -833,6 +848,15 @@ def calculate_interactions(agg: dict) -> List[str]:
     interactions.append(f"[ذاكرة البحر] {sea_memory}")
     interactions.append(f"[الضغط] {pressure_state}")
     interactions.append(f"[الطعم الموسمي] {seasonal_bait}")
+
+    # عرض الكائنات مع التفضيلات
+    bio_lines = []
+    for fish, data in bio_matrix.items():
+        prefs = data.get("preferences", "")
+        bio_lines.append(f"- {fish}: {data['status']} ({data['reason']}) | التفضيلات: {prefs}")
+    bio_text = "\n".join(bio_lines)
+    interactions.append(f"[الكائنات]\n{bio_text}")
+
     if final_verdict == "Conditional Go":
         interactions.append(f"[الحسم النهائي - Conditional Go] توجد فرصة مع تحفظات: {', '.join(warnings)}")
     elif final_verdict == "No-Go":
@@ -855,7 +879,6 @@ def build_context(req, agg, tz_name):
         f"حرارة الماء: {agg['avg_sst']}°م. الهواء القصوى: {extra.get('max_air_temp', 'N/A')}°م.",
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
-    bio_text = "\n".join([f"- {fish}: {data['status']} ({data['reason']})" for fish, data in agg["bio_matrix"].items()])
 
     final_verdict = agg["final_verdict"]
     golden_windows = agg["extra_info"].get("golden_windows", [])
@@ -876,7 +899,6 @@ def build_context(req, agg, tz_name):
         f"[الملخص التنفيذي] {summary}",
         "",
         "=== ملف القضية ===", "\n".join(facts), "\n",
-        "=== الكائنات ===", bio_text, "\n",
         "=== التفكيك الديناميكي والتفاعلات ===", *chain_interactions
     ]
     return "\n".join(lines)
@@ -885,6 +907,9 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 
 هيكل التقرير الإجباري:
+
+0. الملخص التنفيذي:
+- اكتب سطراً واحداً يلخص القرار النهائي وأفضل فترة والطعم المقترح.
 
 1. التوقيت المدوي:
 - اذكر أوقات HW1, LW1, HW2, LW2.
@@ -900,14 +925,13 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم �
 - إذا كان هناك Backwash، اشرح تأثيره.
 - إذا كان هناك أوساخ/صوفة، اشرح تأثيرها على الخيط.
 - اذكر أفضل مسافة للرمي.
+- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم (الحرارة، البحر، التيار، العكارة، الوقت، الطعم).
 
 3. العوامل التي تجعل الصيد مستحيلاً (فقط إذا كان الحسم No-Go):
 - اكتب قائمة بالنقاط (•) للعوامل المانعة للصيد.
-- كل نقطة تبدأ بالعامل ثم شرطة (-) ثم التأثير.
 
 4. التكتيك الميداني:
 - اكتبه فقط إذا كان Go أو Conditional Go.
-- إذا كان No-Go، لا تكتب هذا القسم.
 
 5. السلامة:
 - نصائح سلامة موجزة.
