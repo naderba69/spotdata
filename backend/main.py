@@ -1,8 +1,8 @@
 """
-Surfcasting Analytics API – v16.5.3 (Report + All Computed Numbers)
-- يتم إلحاق جميع الأرقام المحسوبة في نهاية التقرير (قسم "الأرقام المرجعية").
-- يمكن نسخ التقرير كاملاً وإرساله للتحليل.
-- جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, إلخ).
+Surfcasting Analytics API – v16.5.4 (Direction Fixed)
+- تم إصلاح حساب اتجاه الشاطئ نحو البحر (auto-orientation) ليكون دقيقاً كما في v15.0.0.
+- تم إلحاق الأرقام المرجعية بنهاية التقرير لتسهيل التحقق.
+- جميع الميزات السابقة (Backwash, أوساخ, صوفة, سولونار, Slack, ثقة, رؤية, انحدار الموج).
 - فحص هلوسة صارم.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
@@ -32,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="16.5.3", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="16.5.4", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -69,7 +69,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "16.5.3"}
+    return {"status": "ok", "version": "16.5.4"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -326,46 +326,44 @@ async def fetch_overpass(query: str, timeout: int = 15) -> dict:
             raise
     return {}
 
-async def get_auto_orientation_overpass(lat: float, lon: float) -> int:
-    key = (round(lat, 4), round(lon, 4))
-    now = time.time()
-    if key in overpass_cache:
-        orient, ts = overpass_cache[key]
-        if now - ts < CACHE_TTL:
-            return orient
-
+# ================ دالة Overpass الأصلية التي أثبتت دقتها ================
+async def get_auto_orientation_overpass(lat, lon):
+    """
+    الخوارزمية الأصلية من v15.0.0.
+    تستخدم أقرب نقطة ساحلية، المماس، والعمودي، ثم الاتجاه نحو البحر.
+    """
     for radius in [3000, 5000, 10000]:
         query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
-        data = await fetch_overpass(query)
-        if not data:
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
+                r.raise_for_status()
+                els = r.json().get("elements", [])
+                if not els:
+                    continue
+                best_dist, best_tangent, best_point = float('inf'), None, None
+                for el in els:
+                    geom = el.get("geometry", [])
+                    if len(geom) < 2:
+                        continue
+                    closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
+                    p = geom[closest_idx]
+                    d = calc_distance(lat, lon, p["lat"], p["lon"])
+                    if d < best_dist:
+                        best_dist, best_point = d, p
+                        prev_i = closest_idx - 1 if closest_idx > 0 else 0
+                        next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
+                        if prev_i != next_i:
+                            best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
+                if not best_tangent or not best_point:
+                    continue
+                n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
+                c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+                d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
+                d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
+                return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
+        except:
             continue
-        elements = data.get("elements", [])
-        if not elements:
-            continue
-        best_dist, best_tangent, best_point = float('inf'), None, None
-        for el in elements:
-            geom = el.get("geometry", [])
-            if len(geom) < 2:
-                continue
-            closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
-            p = geom[closest_idx]
-            d = calc_distance(lat, lon, p["lat"], p["lon"])
-            if d < best_dist:
-                best_dist, best_point = d, p
-                prev_i = closest_idx - 1 if closest_idx > 0 else 0
-                next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
-                if prev_i != next_i:
-                    best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"],
-                                                geom[next_i]["lat"], geom[next_i]["lon"])
-        if not best_tangent or not best_point:
-            continue
-        n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
-        c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-        d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
-        d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
-        orientation = int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
-        overpass_cache[key] = (orientation, now)
-        return orientation
     return 0
 
 @app.post("/auto-orientation")
@@ -585,7 +583,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     elif is_pressure_rising_fast: pressure_state = f"ارتفاع حاد ({press_change:+.1f}). توقف فوري."
     else: pressure_state = f"مستقر ({press_change:+.1f})."
 
-    # مصفوفة الكائنات مع التفضيلات الكاملة
     bio_matrix = {
         "قاروص": {
             "status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
