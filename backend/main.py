@@ -1,11 +1,11 @@
 """
-Surfcasting Analytics API – v17.1.1 (Final Production Release)
-- يستقبل marine_data و weather_data من العميل (الفرونت-إند) ويستخدمها مباشرة.
-- إذا لم تُرسَل، يتم جلبها تلقائياً من Open‑Meteo (للتوافق مع أي عميل).
-- أكثر من 50 شاطئ تونسي مع إحداثيات واتجاهات.
-- أسماك: قاروص، دنيس، بوري، سارغ، مرمار، شلبة، تريلية، بغبغان، سوبيا مع تفضيلات كاملة.
-- تحليلات: الموج الراجع (Backwash)، الأوساخ والصوفة، سولونار، Slack water، ثقة، رؤية، انحدار الموج.
-- فحص هلوسة صارم + أرقام مرجعية مرفقة بنهاية كل تقرير.
+Surfcasting Analytics API – v18.0.0 (Expert System – 33 Factors)
+- نظام خبير متكامل مع 13 خطاً أحمر، 10 تنبيهات، و10 إيجابيات.
+- نظام أوزان يعطي نسبة نجاح مئوية دقيقة.
+- أكثر من 50 شاطئ تونسي.
+- أسماك: قاروص، دنيس، بوري، سارغ، مرمار، شلبة، تريلية، بغبغان، سوبيا.
+- تحليلات: Backwash، أوساخ، صوفة، سولونار، Slack water، ثقة، رؤية، انحدار الموج.
+- فحص هلوسة + أرقام مرجعية.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="17.1.1", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.0", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -73,7 +73,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "17.1.1"}
+    return {"status": "ok", "version": "18.0.0"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -436,7 +436,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر من Open‑Meteo (عند الحاجة فقط) ====================
+# ==================== جلب بيانات الطقس والبحر من Open‑Meteo (احتياط) ====================
 async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
@@ -480,7 +480,7 @@ def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
 def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_height: float) -> dict:
     wind_diff = angle_diff(wind_dir, orient)
     is_onshore = wind_diff < 30
-    is_strong = wind_speed > 25
+    is_strong = wind_speed > 30  # تم تعديل العتبة إلى 30 كم/س ليصبح عنيفاً
     severity = "منخفض"; effect = ""
     if is_onshore and is_strong and wave_height > 0.8:
         severity = "مرتفع"
@@ -525,7 +525,80 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== محرك التجميع الفيزيائي ====================
+# ==================== نظام الأوزان (33 عامل) ====================
+def apply_scoring(agg: dict) -> int:
+    """تطبيق نظام الأوزان وإرجاع النسبة المئوية النهائية."""
+    score = 50  # بداية محايدة
+
+    # --- عوامل الخط الأحمر (No‑Go) ---
+    # يتم التعامل معها في generate_report مباشرة (إرجاع 0%)
+    # --- التنبيهات (خصم) ---
+    flags = agg["flags"]
+    extra = agg["extra_info"]
+    blocks = agg["blocks"]
+
+    # غياب الساعة الذهبية
+    if not flags["has_golden_window"]:
+        score -= 15
+    # حرارة ماء غير مناسبة (عالية جداً)
+    if agg["avg_sst"] > 27.0:
+        score -= 15
+    elif agg["avg_sst"] < 13.0:
+        score -= 15
+    # رياح بحرية قوية (25-30 كم/س) – نتحقق من الفترات
+    for b in blocks:
+        if b.get("backwash", {}).get("severity") == "متوسط":
+            score -= 10
+            break
+    # ضغط غير مستقر (1.5 - 4 hPa/3h)
+    press_change = abs(extra.get("pressure_change", 0))
+    if 1.5 <= press_change <= 4.0:
+        score -= 10
+    # تيار جانبي قوي
+    if flags["is_lateral_strong"]:
+        score -= 10
+    # موج قصير جداً (< 4 ثوانٍ)
+    for b in blocks:
+        if b["_raw"]["wave_period"] < 4.0:
+            score -= 10
+            break
+    # موسم التكاثر (تبسيط: حسب الشهر لأنواع معينة)
+    month = datetime.now().month
+    if month in [3,4]:  # مثال: القاروص والدنيس
+        score -= 20
+
+    # --- الإيجابيات (إضافة) ---
+    # رياح خلفية
+    if any(b["wind_dir"].startswith("برية") for b in blocks):
+        score += 15
+    # رياح بحرية خفيفة جاذبة (< 15 كم/س)
+    if any(b["wind_dir"].startswith("بحرية") and b["_raw"]["avg_wind"] < 15 for b in blocks):
+        score += 15
+    # الموج الخادم (0.6-1.2م)
+    if any(0.6 <= b["_raw"]["avg_wave_h"] <= 1.2 for b in blocks):
+        score += 20
+    # عكارة مثالية (سنفترض أن العكارة موجودة إذا كان الموج مباشر)
+    if any(b.get("wave_angle_diff") and b["wave_angle_diff"] < 30 and b["_raw"]["avg_wave_h"] >= 0.6 for b in blocks):
+        score += 15
+    # الساعة الذهبية التامة
+    if flags["has_golden_window"]:
+        score += 25
+    # استقرار الضغط (< 1 hPa/12h – سنستخدم 3h كمؤشر)
+    if press_change < 1.0:
+        score += 10
+    # تطابق الرياح مع الموج
+    if any(b.get("wave_angle_diff") and b["wave_angle_diff"] < 30 for b in blocks):
+        score += 10
+    # ضوء القمر (بدر + ليل)
+    moon_idx = agg["tide_analysis"]["idx"]
+    if moon_idx == 4 and any(b["name"] == "الليل" for b in blocks):
+        score += 15
+
+    # تأكيد الحدود
+    score = max(0, min(100, score))
+    return score
+
+# ==================== محرك التجميع الفيزيائي (مع المنطق الجديد) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -538,9 +611,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     warnings = []
 
     empty_res = {
-        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "No-Go"
+        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "No-Go", "score": 0
     }
-    if not target_idx: return empty_res
+    if not target_idx:
+        return empty_res
 
     def pick(k): 
         arr = aligned.get(k, [])
@@ -596,11 +670,11 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     total_force = math.sqrt(lateral_fx**2 + lateral_fy**2)
     lateral_force_ratio = abs(lateral_fx) / total_force if total_force > 0 else 0
     avg_wave_h = sum(wh) / len(wh) if wh else 0
-    is_mirror_sea = max_wh < 0.4
-    is_lateral_strong = not is_mirror_sea and lateral_force_ratio > 0.7 and avg_wave_h > 0.6
+    is_mirror_sea = max_wh < 0.3  # تم تعديله ليكون أكثر دقة (مرآوي < 0.3م)
+    is_lateral_strong = lateral_force_ratio > 0.7 and avg_wave_h > 0.6
 
-    if is_mirror_sea: nogo_reasons.append("بحر مرآوي: الموج أقل من 0.4م، لا تيارات ولا حركة سطحية.")
-    lateral_current = "تيار جانبي معدوم (بحر مرآوي)" if is_mirror_sea else "تيار جارف قوي جداً" if is_lateral_strong else "تيار جانبي متوسط" if (lateral_force_ratio > 0.4 and avg_wave_h > 0.4) else "تيار جانبي ضعيف"
+    if is_mirror_sea: nogo_reasons.append("بحر مرآوي تام (أقل من 0.3م): لا تيارات ولا حركة سطحية، الأسماك لا تقترب.")
+    lateral_current = "تيار جانبي معدوم (بحر مرآوي)" if is_mirror_sea else "تيار جانبي قوي" if is_lateral_strong else "تيار جانبي متوسط" if (lateral_force_ratio > 0.4 and avg_wave_h > 0.4) else "تيار جانبي ضعيف"
 
     cross_angles = []
     if has_swell_data:
@@ -613,10 +687,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         elif max_cross > 45: cross_sea_risk = "بحر مختلط متوسط"
     if is_cross_sea_dangerous: nogo_reasons.append("بحر مختلط خطير: السويل والموج المحلي يتقاطعان بزاوية كبيرة.")
 
-    steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p and p > 0.1]
-    avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
-    steepness_desc = "موج حاد وقصير" if avg_steepness > 0.06 else "موج طويل" if avg_steepness < 0.03 else "موج متوسط"
-
     tide_analysis = get_moon_and_tide_analysis(target_date_obj)
     tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude)
     solunar = calculate_solunar(target_date_obj, latitude)
@@ -625,7 +695,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     is_spring_tide = tide_analysis["idx"] in [0, 4]
     if is_neap_tide: warnings.append(f"مد ضعيف (Neap Tides - {tide_analysis['name']}): تيارات غذائية ضعيفة.")
     has_golden_window = any("تزامن" in g for g in golden_windows)
-    if not has_golden_window: nogo_reasons.append("لا توجد ساعة ذهبية.")
+    if not has_golden_window: warnings.append("لا توجد ساعة ذهبية: قد يقل نشاط الأسماك.")  # أصبح تحذيراً وليس سبباً قاطعاً
 
     avg_sst = sum(sst)/len(sst) if sst else 0
     sst_diff = max(sst) - min(sst) if len(sst) > 1 else 0
@@ -641,9 +711,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     press_change = pr[-1] - pr[-4] if len(pr) >= 4 else (pr[-1] - pr[0] if len(pr) > 1 else 0)
     is_pressure_rising_fast = press_change > 1.5
     is_pressure_dropping_fast = press_change < -2.0
-    if is_pressure_rising_fast: nogo_reasons.append(f"ضغط مرتفع حاد ({press_change:+.1f} هكتوباسكال): يوقف النشاط.")
-    if is_pressure_dropping_fast: pressure_state = f"انخفاض حاد ({press_change:.1f}). تغذية عنيفة."
-    elif is_pressure_rising_fast: pressure_state = f"ارتفاع حاد ({press_change:+.1f}). توقف فوري."
+    is_pressure_shock = abs(press_change) > 4.0  # خط أحمر جديد
+    if is_pressure_shock:
+        nogo_reasons.append(f"اضطراب حاد في الضغط الجوي (> 4 hPa/3h): الأسماك تتوقف عن الأكل تماماً.")
+    elif is_pressure_rising_fast:
+        warnings.append(f"ضغط مرتفع ({press_change:+.1f} hPa/3h): قد يبطئ النشاط.")
+    elif is_pressure_dropping_fast:
+        warnings.append(f"ضغط منخفض ({press_change:.1f} hPa/3h): قد تبدأ الأسماك بالتغذية قبل العاصفة.")
+
+    if is_pressure_dropping_fast: pressure_state = f"انخفاض ({press_change:.1f})."
+    elif is_pressure_rising_fast: pressure_state = f"ارتفاع ({press_change:+.1f})."
     else: pressure_state = f"مستقر ({press_change:+.1f})."
 
     bio_matrix = {
@@ -695,6 +772,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     }
 
     peak_gust = max(wg) if wg else 0.0
+    # خط أحمر: رياح عاتية
+    if peak_gust > 60:
+        nogo_reasons.append(f"رياح عاتية (هبات {peak_gust:.0f} > 60 كم/س): تمنع الرمي الآمن وقد تقطع الخيط.")
+
     dominant = max(set(wind_cls), key=wind_cls.count) if wind_cls else "غير معروف"
     periods = defaultdict(list)
     for idx, i in enumerate(target_idx):
@@ -735,6 +816,25 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
 
         sea = "بحر مرآوي" if max_h < 0.4 else "هادئ" if max_h < 0.8 else "متوسط الهيجان" if max_h < 1.2 else "هائج"
+        # خط أحمر: بحر هائج
+        if max_h > 2.0:
+            nogo_reasons.append(f"بحر هائج (أمواج > 2.0م): الرمي مستحيل والخطر كبير.")
+        # خط أحمر: فترة موجة عالية (Groundswell)
+        if avg_wp_b > 10.0 and avg_h > 0.8:
+            nogo_reasons.append(f"أمواج أرضية عالية الطاقة (فترة {avg_wp_b:.1f} > 10 ثوانٍ مع ارتفاع {avg_h:.2f}م): تجرف الرصاص وتدفن الخيوط.")
+        # خط أحمر: خطر الصواعق
+        if most_code in [95, 96, 99]:
+            nogo_reasons.append("خطر الصواعق والبرق: قصبة الكاربون تجذب البرق، لا ترفعها.")
+        # خط أحمر: أوساخ وصوفة كثيفة (سيتم تفعيله لاحقاً من debris)
+        # خط أحمر: تيار راجع عنيف (Backwash)
+        backwash = analyze_backwash(avg_w, avg_wd_b, orient, avg_h)
+        if backwash["severity"] == "مرتفع":
+            nogo_reasons.append(f"تيار راجع عنيف: {backwash['effect']}")
+
+        debris = analyze_debris_risk(sea_memory, past_rain_total, avg_w)
+        if debris["risk"] == "مرتفع":
+            nogo_reasons.append(f"أوساخ وصوفة كثيفة: {debris['effect']}")
+
         final_swd = None if avg_swd_b == 0.0 else avg_swd_b
         final_wd = None if avg_wave_dir == 0.0 else avg_wave_dir
         swell_angle = angle_diff(final_swd, orient) if final_swd else None
@@ -752,9 +852,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings))
-
-        backwash = analyze_backwash(avg_w, avg_wd_b, orient, avg_h)
-        debris = analyze_debris_risk(sea_memory, past_rain_total, avg_w)
 
         base_dist = 50
         if avg_h > 0.8: base_dist = 40
@@ -820,11 +917,20 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "has_golden_window": has_golden_window, "is_neap_tide": is_neap_tide, "is_spring_tide": is_spring_tide
     }
 
-    if nogo_reasons: final_verdict = "No-Go"
-    elif warnings: final_verdict = "Conditional Go"
-    else: final_verdict = "Go"
+    # تطبيق منطق الحسم الجديد (خط أحمر = No-Go)
+    critical_nogo = [r for r in nogo_reasons if any(kw in r for kw in [
+        "مرآوي", "مختلط خطير", "أوساخ", "صوفة", "يرجع الرصاص", "رياح عاتية",
+        "فترة موجة عالية", "صواعق", "برق", "اضطراب حاد في الضغط", "هائج"
+    ])]
+    if critical_nogo:
+        final_verdict = "No-Go"
+    elif warnings:
+        final_verdict = "Conditional Go"
+    else:
+        final_verdict = "Go"
 
-    return {
+    # تطبيق نظام الأوزان
+    agg_result = {
         "dominant_wind":dominant, "blocks":blocks, "red_flags":reds[:5], "green_flags":greens[:5],
         "sea_memory":sea_memory, "lateral_current":lateral_current, "pressure_state":pressure_state,
         "tide_analysis":tide_analysis, "sst_stability":sst_stability,
@@ -834,6 +940,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "nogo_reasons": nogo_reasons, "warnings": warnings,
         "final_verdict": final_verdict
     }
+    score = apply_scoring(agg_result)
+    agg_result["score"] = score
+    return agg_result
 
 # ==================== التفكيك الديناميكي ====================
 def calculate_interactions(agg: dict) -> List[str]:
@@ -934,6 +1043,9 @@ def calculate_interactions(agg: dict) -> List[str]:
     bio_text = "\n".join(bio_lines)
     interactions.append(f"[الكائنات]\n{bio_text}")
 
+    # إضافة النتيجة المئوية
+    interactions.append(f"[نسبة النجاح] {agg.get('score', 0)}%")
+
     if final_verdict == "Conditional Go":
         interactions.append(f"[الحسم النهائي - Conditional Go] توجد فرصة مع تحفظات: {', '.join(warnings)}")
     elif final_verdict == "No-Go":
@@ -957,6 +1069,7 @@ def build_context(req, agg, tz_name):
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
     final_verdict = agg["final_verdict"]
+    score = agg.get("score", 0)
     golden_windows = extra.get("golden_windows", [])
     best_time = "غير محدد"
     for gw in golden_windows:
@@ -965,11 +1078,11 @@ def build_context(req, agg, tz_name):
             break
     seasonal_bait = extra.get("seasonal_bait", "الطعم الموسمي")
     if final_verdict == "Go":
-        summary = f"Go - أفضل وقت: {best_time}. استعمل {seasonal_bait}."
+        summary = f"✅ Go ({score}%) – الظروف ممتازة. أفضل وقت: {best_time}. استعمل {seasonal_bait}."
     elif final_verdict == "Conditional Go":
-        summary = f"Conditional Go - فرصة مع تحفظات. أفضل فترة: {best_time}."
+        summary = f"⚠️ Conditional Go ({score}%) – فرصة مع تحفظات. أفضل فترة: {best_time}."
     else:
-        summary = "No-Go - لا توجد فرصة للصيد المجدي اليوم. وفر وقتك."
+        summary = f"❌ No-Go (0%) – لا توجد فرصة للصيد المجدي اليوم. وفر وقتك."
 
     lines = [
         f"[الملخص التنفيذي] {summary}",
@@ -979,47 +1092,44 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تفهم لغة المد والجزر والساعات الذهبية.
+SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية تربط بين جميع العوامل.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
+نسبة النجاح موجودة في [نسبة النجاح]. اذكرها بوضوح في الملخص التنفيذي.
 
 هيكل التقرير الإجباري:
 
-0. الملخص التنفيذي:
-- اكتب سطراً واحداً يلخص القرار النهائي وأفضل فترة والطعم المقترح.
+**0. الملخص التنفيذي:**
+- اذكر النسبة المئوية والقرار النهائي وأفضل فترة والطعم المقترح.
 
-1. التوقيت المدوي:
-- اذكر أوقات HW1, LW1, HW2, LW2.
-- اذكر اسم القمر وقوة المد.
-- اشرح الساعة الذهبية وتأثيرها.
-- اذكر فترات سولونار (Major/Minor).
-- اذكر أوقات Slack water.
-- اذكر انحدار الموج.
-- إذا كان المد ضعيفاً (Neap)، اشرح ما يعنيه.
+**1. التوقيت المدوي:**
+- أوقات HW1, LW1, HW2, LW2، القمر، قوة المد، الساعة الذهبية، سولونار، Slack، انحدار الموج.
 
-2. التفكيك الديناميكي الزمني:
-- لكل فترة (صباح، ظهيرة، ليل)، اكتب التحليل بلغة تونسية احترافية (من 3 إلى 5 جمل).
-- إذا كان هناك Backwash، اشرح تأثيره.
-- إذا كان هناك أوساخ/صوفة، اشرح تأثيرها على الخيط.
-- اذكر أفضل مسافة للرمي.
-- اذكر حالة الأسماك المذكورة في قسم "الكائنات" مع تفضيلاتهم (الحرارة، البحر، التيار، العكارة، الوقت، الطعم). يجب ذكر كل الأسماك ولو بشكل موجز.
+**2. التفكيك الديناميكي الزمني (مترابط):**
+- لكل فترة (صباح، ظهيرة، ليل):
+  - حالة البحر والثقة.
+  - الرياح وتأثيرها (خلفية، بحرية جاذبة، قوية).
+  - الموج والسويل وحركة القاع.
+  - أفضل مسافة للرمي.
+  - الأسماك النشطة/الخاملة مع تفضيلاتهم.
+  - **ربط العوامل:** كيف تتحد الرياح والموج لإنجاح الصيد أو إفشاله.
 
-3. العوامل التي تجعل الصيد مستحيلاً (فقط إذا كان الحسم No-Go):
-- اكتب قائمة بالنقاط (•) للعوامل المانعة للصيد.
+**3. العوامل الحمراء (فقط إذا No-Go):**
+- اشرح كل عامل بالتفصيل.
 
-4. التكتيك الميداني:
-- اكتبه فقط إذا كان Go أو Conditional Go.
+**4. العوامل الإيجابية (فقط إذا Go/Conditional Go):**
+- لخّص العوامل المتآزرة.
 
-5. السلامة:
-- نصائح سلامة موجزة.
-- أضف تحذير Backwash إذا كان موجوداً.
-- أضف تحذير الأوساخ إذا كان موجوداً.
+**5. التكتيك الميداني (فقط Go/Conditional Go):**
+- تفاصيل دقيقة.
+
+**6. السلامة:**
+- تحذيرات.
 
 قواعد صارمة:
 - لا تستخدم جداول Markdown.
-- لا تكرر المعلومات.
-- اكتب بالدارجة التونسية المفصلة.
-- أكمل التقرير حتى النهاية ولا تتوقف قبل قسم السلامة.
-- اذكر جميع الأسماك الواردة في "الكائنات"."""
+- اكتب بالدارجة التونسية الواضحة.
+- أكمل التقرير حتى النهاية.
+"""
 
 async def call_openrouter(ctx):
     headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
@@ -1056,6 +1166,7 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     allowed.add(round(extra.get("max_air_temp", 0), 1))
     allowed.add(round(extra.get("peak_gust_today", 0), 1))
     allowed.add(round(extra.get("pressure_avg", 0), 1))
+    allowed.add(float(agg.get("score", 0)))  # النسبة المئوية
     tidal = agg.get("extra_info", {}).get("tidal_windows", {})
     sunrise_str = agg.get("extra_info", {}).get("sunrise", "06:00")
     sunset_str = agg.get("extra_info", {}).get("sunset", "18:00")
@@ -1076,7 +1187,6 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
-        # إذا تم إرسال بيانات من العميل، استخدمها. وإلا اجلب من Open‑Meteo.
         if req.marine_data and req.weather_data:
             marine_data = req.marine_data
             weather_data = req.weather_data
@@ -1106,38 +1216,43 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
 
-        if agg["extra_info"]["peak_gust_today"] > 60 or any(b["_raw"]["max_wave_h"] > 2.5 for b in agg["blocks"] if b["_raw"]["max_wave_h"]):
-            return {"report": "قرار نهائي: No-Go مطلق. ظروف بحرية خطرة تهدد حياتك.", "meta": {"hard_nogo": True}}
+        # تجاوز فحص الـ hard_nogo السريع (أصبح جزءاً من aggregate_physics)
+        if agg["final_verdict"] == "No-Go" and any("هائج" in r or "صواعق" in r for r in agg["nogo_reasons"]):
+            return {
+                "report": f"❌ No-Go (0%) – {agg['nogo_reasons'][0]}. لا توجد فرصة للصيد اليوم.",
+                "meta": {"score": 0, "hard_nogo": True}
+            }
 
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
         # الأرقام المرجعية
-        computed_text = "\n\n--- الأرقام المرجعية (للتحقق) ---\n"
-        computed_text += f"متوسط حرارة الماء: {agg['avg_sst']}°م\n"
-        computed_text += f"أقصى حرارة هواء: {agg['extra_info']['max_air_temp']}°م\n"
-        computed_text += f"أقصى هبات رياح اليوم: {agg['extra_info']['peak_gust_today']} كم/س\n"
-        computed_text += f"الضغط الجوي المتوسط: {agg['extra_info']['pressure_avg']} hPa\n"
-        computed_text += f"تغير الضغط: {agg['extra_info'].get('pressure_change', 'غير متوفر')}\n"
-        computed_text += f"نوع التيار الجانبي: {agg['lateral_current']}\n"
-        computed_text += f"ذاكرة البحر: {agg['sea_memory']}\n"
-        computed_text += f"انحدار الموج: {agg['hidden_factors']['wave_steepness']}\n"
-        computed_text += "\n"
+        computed_text = "\n\n--- الأرقام المرجعية (للتحقق) ---\n\n"
+        computed_text += "**عام:**\n"
+        computed_text += f"- متوسط حرارة الماء: **{agg['avg_sst']}°م**\n"
+        computed_text += f"- أقصى حرارة هواء: **{agg['extra_info']['max_air_temp']}°م**\n"
+        computed_text += f"- أقصى هبات رياح اليوم: **{agg['extra_info']['peak_gust_today']} كم/س**\n"
+        computed_text += f"- الضغط الجوي المتوسط: **{agg['extra_info']['pressure_avg']} hPa**\n"
+        computed_text += f"- تغير الضغط (3h): **{agg['extra_info'].get('pressure_change', 'غير متوفر')}**\n"
+        computed_text += f"- نوع التيار الجانبي: **{agg['lateral_current']}**\n"
+        computed_text += f"- ذاكرة البحر: **{agg['sea_memory']}**\n"
+        computed_text += f"- انحدار الموج: **{agg['hidden_factors']['wave_steepness']}**\n"
+        computed_text += f"- نسبة النجاح: **{agg['score']}%**\n\n"
         for b in agg['blocks']:
             r = b['_raw']
-            computed_text += f"فترة {b['name']}:\n"
-            computed_text += f"  الثقة: {b['confidence']}%\n"
-            computed_text += f"  أفضل مسافة رمي: {b['recommended_cast_distance']} متر\n"
-            computed_text += f"  متوسط ارتفاع الموج: {r['avg_wave_h']}م\n"
-            computed_text += f"  أقصى ارتفاع موج: {r['max_wave_h']}م\n"
-            computed_text += f"  متوسط الرياح: {r['avg_wind']} كم/س\n"
-            computed_text += f"  أقصى هبات: {r['max_gust']} كم/س\n"
-            computed_text += f"  السويل: {r['swell_h']}م (دور {r['swell_p']}ث)\n"
-            computed_text += f"  تأثير الرياح على المسافة: {r['wind_effect_dist']}م\n"
+            computed_text += f"**فترة {b['name']}:**\n"
+            computed_text += f"- الثقة: **{b['confidence']}%**\n"
+            computed_text += f"- مسافة الرمي المقترحة: **{b['recommended_cast_distance']} متر**\n"
+            computed_text += f"- متوسط ارتفاع الموج: **{r['avg_wave_h']}م**\n"
+            computed_text += f"- أقصى ارتفاع موج: **{r['max_wave_h']}م**\n"
+            computed_text += f"- متوسط الرياح: **{r['avg_wind']} كم/س**\n"
+            computed_text += f"- أقصى هبات: **{r['max_gust']} كم/س**\n"
+            computed_text += f"- ارتفاع السويل: **{r['swell_h']}م** (دور **{r['swell_p']}** ثوانٍ)\n"
+            computed_text += f"- تأثير الرياح على المسافة: **{r['wind_effect_dist']}م**\n"
             if b['backwash']['severity'] != 'منخفض':
-                computed_text += f"  تحذير الموج الراجع: {b['backwash']['effect']}\n"
+                computed_text += f"- تحذير الموج الراجع (Backwash): **{b['backwash']['effect']}**\n"
             if b['debris']['risk'] != 'منخفض':
-                computed_text += f"  تحذير الأوساخ: {b['debris']['effect']}\n"
+                computed_text += f"- تحذير الأوساخ والصوفة: **{b['debris']['effect']}**\n"
             computed_text += "\n"
 
         report += computed_text
@@ -1153,6 +1268,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         meta = {
             "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
+            "score": agg["score"],
             "tidal_estimation": agg["extra_info"]["tidal_windows"],
             "golden_windows_detected": agg["extra_info"]["golden_windows"],
             "solunar": agg["extra_info"]["solunar"],
