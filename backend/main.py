@@ -1,10 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.10 (Bidi & Readability Production Fix)
-- حل جذري لتشوه الأرقام: دالة fix_bidi_text تضيف علامات Unicode (LRM/RLM) لعزل الأرقام والكلمات اللاتينية.
-- تحسين clean_report_text لمعالجة تداخل الأوقات والمسافات.
-- توسيع get_allowed_numbers ليشمل فروقات التوقيت المحسوبة (مثل 5.1) لتجنب الإنذار الكاذب.
-- SYSTEM_PROMPT معدل لتوجيه النموذج لتجنب تنسيقات Bidi المعقدة.
-- كافة تحسينات الإصدارات السابقة (18.0.6 -> 18.0.9) مدمجة.
+Surfcasting Analytics API – v18.0.11 (Bidi Rollback, Readability Fixes & Haml Days)
+- إزالة دالة fix_bidi_text (تسببت في تشوه النص).
+- تحسين clean_report_text لإضافة فواصل واضحة بين النقاط والأقسام (سطور جديدة).
+- إضافة حساب "أيام الحمل" (الفساد البحري) بناءً على عمر القمر وإدراجها في التقرير.
+- SYSTEM_PROMPT معدل لتوجيه النموذج لتنسيق واضح مع سطور منفصلة.
+- كافة تحسينات الإصدارات السابقة (18.0.6 -> 18.0.10) مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.10", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.11", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -76,7 +76,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.10"}
+    return {"status": "ok", "version": "18.0.11"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -196,6 +196,26 @@ def safe_parse_time(time_str: str) -> float:
         return h + m / 60.0
     except (ValueError, IndexError):
         return 6.0
+
+def get_moon_age_days(d: date) -> float:
+    """حساب عمر القمر بالأيام منذ آخر محاق."""
+    y, m, day = d.year, d.month, d.day
+    if m < 3: y -= 1; m += 12
+    a = int(y / 100)
+    b = 2 - a + int(a / 4)
+    jd = 365.25 * (y + 4716) + 30.6001 * (m + 1) + day + b - 1524.5
+    days_since_new = jd - 2451550.1
+    age = days_since_new % 29.53058867
+    return age
+
+def get_haml_status(age_days: float) -> dict:
+    """تحديد حالة الحمل (الفساد البحري) بناءً على عمر القمر."""
+    if 13 <= age_days <= 16:
+        return {"status": "حمل البدر", "description": "أيام الحمل القمري (قرب البدر): البحر غالباً هائج، تيارات قوية، قد يفسد الصيد."}
+    elif 28 <= age_days or age_days <= 1:
+        return {"status": "حمل المحاق", "description": "أيام الحمل القمري (قرب المحاق): البحر غير مستقر، تيارات قوية، يُنصح بتجنب الصيد."}
+    else:
+        return {"status": "أيام عادية", "description": "لا توجد مؤشرات حمل قمري قوي، البحر في حالة طبيعية نسبياً."}
 
 def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
     sr_h = safe_parse_time(sunrise_str)
@@ -681,6 +701,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude)
     solunar = calculate_solunar(target_date_obj, latitude)
 
+    # حساب الحمل القمري
+    moon_age = get_moon_age_days(target_date_obj)
+    haml_info = get_haml_status(moon_age)
+
     is_neap_tide = tide_analysis["idx"] in [2, 6]
     is_spring_tide = tide_analysis["idx"] in [0, 4]
     if is_neap_tide: warnings.append(f"مد ضعيف (Neap Tides - {tide_analysis['name']}): تيارات غذائية ضعيفة، الأسماك أقل تجمعاً.")
@@ -803,7 +827,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
         avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
 
-        # تصنيف البحر (حدود 0.9 هادئ، 1.3 متوسط)
         if max_h < 0.4:
             sea = "بحر مرآوي"
         elif max_h < 0.9:
@@ -905,7 +928,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "solunar": solunar, "slack_times": slack_info,
         "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
         "past_rain_total": round(past_rain_total, 1),
-        "pressure_change": round(press_change, 1)
+        "pressure_change": round(press_change, 1),
+        "moon_age_days": round(moon_age, 1),
+        "haml_status": haml_info["status"],
+        "haml_description": haml_info["description"]
     }
 
     flags = {
@@ -982,8 +1008,13 @@ def calculate_interactions(agg: dict) -> List[str]:
     interactions.append(f"[المياه الميتة (Slack)] {slack_info}. نصيحة: ركز على بداية الجريان (قبل أو بعد الـ Slack) وليس أثناء المياه الراكدة.")
     if is_neap_tide:
         interactions.append(f"[تأثير المد الضعيف] المد من نوع Neap، التيارات ضعيفة جداً. هذا يقلل من جلب الغذاء ويجعل الأسماك أقل تجمعاً وأكثر تشتتاً، مما يفسر خمول بعض الأنواع.")
-    elif not is_spring_tide:  # مد متوسط
+    elif not is_spring_tide:
         interactions.append(f"[تأثير المد المتوسط] المد ليس ضعيفاً ولا قوياً جداً. التيارات معتدلة، قد تكون كافية لتحريك الطعم وجلب بعض الغذاء، لكنها لا تخلق تجمعات كثيفة للأسماك.")
+    # إضافة معلومات الحمل
+    moon_age_days = extra.get("moon_age_days", 0)
+    haml_status = extra.get("haml_status", "")
+    haml_desc = extra.get("haml_description", "")
+    interactions.append(f"[أيام الحمل (الفساد البحري)] عمر القمر: {moon_age_days} يوم. الحالة: {haml_status}. {haml_desc}")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
     current_sea_state = blocks[0]["sea_state"] if blocks else "غير معروف"
@@ -1087,6 +1118,7 @@ def build_context(req, agg, tz_name):
         f"الضغط: {agg['pressure_state']}",
         f"القمر: {agg['tide_analysis']['tide_strength']}.",
         f"حرارة الماء: {agg['avg_sst']}°م. الهواء القصوى: {extra.get('max_air_temp', 'N/A')}°م.",
+        f"أيام الحمل: {extra.get('haml_status', 'غير معروف')} (عمر القمر {extra.get('moon_age_days', 0)} يوم).",
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
     final_verdict = agg["final_verdict"]
@@ -1124,33 +1156,36 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 
 **1. التوقيت المدوي:**
 - أوقات HW1, LW1, HW2, LW2، القمر، قوة المد، الساعة الذهبية، سولونار، Slack، انحدار الموج.
-- لا تركز على فترات المياه الميتة (Slack Water). انصح بالتركيز على بداية الجريان (قبل/بعد الـ Slack بساعة).
-- وضّح تأثير المد: إذا كان متوسطاً، اشرح أن التيارات معتدلة وتوفر حركة كافية لتحريك الطعم دون تجمعات كثيفة.
+- أضف معلومات "أيام الحمل" (الفساد القمري) مع تفسير مختصر.
+- لا تركز على Slack Water، انصح ببداية الجريان.
 - استخدم صيغة واضحة: HW1 (10:11) وليس HW1:10:11.
 
 **2. التفكيك الديناميكي الزمني (مترابط):**
 - لكل فترة (صباح، ظهيرة، ليل):
   - حالة البحر والثقة.
   - الرياح وتأثيرها.
-  - الموج والسويل وحركة القاع. اذكر التوصية بنوع الرصاص إذا كانت موجودة. لا تربط انخفاض الانحدار بصعوبة التثبيت؛ المشكلة هي قِصَر الفترة.
+  - الموج والسويل وحركة القاع. اذكر التوصية بنوع الرصاص إذا كانت موجودة.
   - أفضل مسافة للرمي.
   - الأسماك النشطة/الخاملة مع تفضيلاتهم. لا تذكر أن القاروص ينشط إذا كان "غائب تقريباً".
-  - ربط العوامل.
+  - **ربط العوامل:** كيف تتحد الرياح والموج لإنجاح الصيد أو إفشاله.
+  - استخدم مصطلح "منخفض الانحدار (سلس)" للانحدار المنخفض، ووضح أن المشكلة في قِصَر الفترة وليس الانحدار.
 
-**3. العوامل الحمراء (فقط No-Go):** ...
+**3. العوامل الحمراء (فقط No-Go):** اشرح كل عامل.
 
-**4. العوامل الإيجابية (فقط Go/Conditional Go):** ...
+**4. العوامل الإيجابية (فقط Go/Conditional Go):** لخّص العوامل المتآزرة.
 
-**5. التكتيك الميداني (فقط Go/Conditional Go):** ...
+**5. التكتيك الميداني (فقط Go/Conditional Go):** تفاصيل دقيقة تشمل الرصاص والتوقيت والمسافة.
 
-**6. السلامة:** ...
+**6. السلامة:** تحذيرات.
 
 قواعد صارمة:
-- لا تستخدم تنسيق Markdown ( ** ** ) أو جداول. استخدم نقاطًا عادية.
+- لا تستخدم تنسيق Markdown ( ** ** ) أو جداول.
+- استخدم نقاطًا عادية مع سطر جديد لكل نقطة.
+- اترك مسافة بادئة قبل كل نقطة (مثلاً: "   • النص") أو ابدأ السطر بـ "* " أو "- ".
 - اكتب بالدارجة التونسية الواضحة.
 - أكمل التقرير حتى النهاية.
-- تأكد أن الأرقام معروضة بوضوح، بدون التصاق (27.8°م وليس 27.8°م ملتصقة).
-- لا تُدخل أي علامات تنسيق اتجاه (RTL/LTR) في النص؛ سنقوم بمعالجتها لاحقاً.
+- تأكد أن جميع الأرقام معروضة بوضوح، مع مسافة بين الرقم والوحدة (27.8°م، 9.7 كم/س).
+- لا تستخدم أي علامات تنسيق اتجاه (RTL/LTR)؛ سنتكفل بذلك.
 """
 
 async def call_openrouter(ctx):
@@ -1161,7 +1196,7 @@ async def call_openrouter(ctx):
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
 
-# ==================== دوال معالجة النص ====================
+# ==================== فحص الهلوسة والأرقام المرجعية ====================
 def extract_numbers_from_text(text: str) -> List[float]:
     pattern = r'-?\d+\.?\d*'
     matches = re.findall(pattern, text)
@@ -1200,7 +1235,6 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     allowed.add(round(extra.get("pressure_avg", 0), 1))
     allowed.add(float(agg.get("score", 0)))
 
-    # إضافة فروقات التوقيت المحتملة (مثل 5.1، 3.0)
     tidal = agg.get("extra_info", {}).get("tidal_windows", {})
     sunrise_str = agg.get("extra_info", {}).get("sunrise", "06:00")
     sunset_str = agg.get("extra_info", {}).get("sunset", "18:00")
@@ -1218,7 +1252,7 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     return {x for x in allowed if x > 0.5}
 
 def clean_report_text(text: str) -> str:
-    """تنظيف مبدئي لإصلاح تداخل الأوقات والمسافات."""
+    """تنظيف النص لإصلاح تداخل الأوقات والمسافات، وضمان وضوح الفقرات."""
     # إصلاح تداخل التوقيت: "HW1:10:11" -> "HW1: 10:11"
     text = re.sub(r'(HW\d|LW\d):(\d{2}:\d{2})', r'\1: \2', text)
     # إصلاح أي مسافات زائدة قبل النقطتين
@@ -1229,32 +1263,13 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
     # ضبط النقاط الحرارية
     text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
+    # إضافة سطر جديد قبل كل جملة تبدأ برقم متبوع بنقطة (مثل "0. الملخص")
+    text = re.sub(r'(?<!\n)(\d+\.\s)', r'\n\1', text)
+    # إضافة سطر جديد قبل كل جملة تبدأ بـ "* " أو "- "
+    text = re.sub(r'(?<!\n)(\* |- )', r'\n\1', text)
     # إزالة فراغات مفرطة
     text = re.sub(r'\n{3,}', '\n\n', text)
-    return text
-
-def fix_bidi_text(text: str) -> str:
-    """
-    حل جذري لخلط العربية والفرنسية/الأرقام:
-    إضافة علامات Left-to-Right Mark (U+200E) قبل وبعد كل كتلة لاتينية أو رقمية
-    لإجبار العرض بالاتجاه الصحيح داخل النص العربي.
-    """
-    # نمط يطابق الأرقام (بما فيها العشرية) والكلمات اللاتينية والمختصرات (مثل HW1, km/h)
-    # نستخدم قاعدة: أي تسلسل من أحرف لاتينية، أرقام، نقط، نقطتين، شرط، شرطة مائلة، درجة مئوية
-    pattern = re.compile(r'([A-Za-z0-9.:/°%+\-]+(?:[A-Za-z0-9.:/°%+\-]*)*)')
-    # نضيف علامة LRM قبل وبعد كل كتلة لاتينية (إذا كانت محاطة بنص عربي أو في البداية/النهاية)
-    # لكن نتجنب إضافة علامات متعددة متجاورة.
-    def replace_latin(m):
-        chunk = m.group(0)
-        # إذا كان النص المحيط عربياً، نضيف LRM حوله
-        return f"\u200E{chunk}\u200E"
-    # نطبق فقط إذا كان النص يحتوي على أحرف عربية
-    if re.search(r'[\u0600-\u06FF]', text):
-        # نستبدل أي كتلة لاتينية/رقمية داخل السياق العربي
-        text = pattern.sub(replace_latin, text)
-    # إزالة علامات LRM المتجاورة (قد تحدث فراغات)
-    text = re.sub(r'\u200E\s*\u200E', '\u200E', text)
-    return text
+    return text.strip()
 
 @app.post("/generate-report")
 @limiter.limit("10/minute")
@@ -1301,9 +1316,8 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # تطبيق التنظيف ومعالجة ثنائية الاتجاه
+        # تنظيف النص
         report = clean_report_text(report)
-        report = fix_bidi_text(report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         computed_text += "📊 الأرقام المرجعية (للتحقق)\n"
@@ -1336,7 +1350,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         report += computed_text
 
-        # فحص الأرقام (مع الأرقام الموسعة)
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
         suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers and not (n.is_integer() and 0 <= n <= 59)]
