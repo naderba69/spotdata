@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v18.0.31 (Free Gemini 2.5 Flash, Production Ready)
-- استخدام Google Gemini 2.5 Flash المجاني عبر Google AI Studio API.
-- معالجة تلقائية للخطأ 429 (Rate Limit) عن طريق الانتظار التدريجي.
-- جميع تحسينات التنسيق: فترات الجريان الثلاثية، الحياء والمات، إصلاح الكسر، فواصل عربية.
-- فقرة "فترات الحركة مقابل المياه الميتة" تُنشأ تلقائياً من الكود.
+Surfcasting Analytics API – v18.0.33 (Template Perfection + Date in Summary)
+- إضافة التاريخ إلى الملخص التنفيذي (ليوم dd_mm_yy).
+- تنسيق التقرير بالكامل ليطابق القالب الاحترافي المطلوب.
+- استخدام Google Gemini 2.5 Flash المجاني.
+- جميع تحسينات التنسيق السابقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.31", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.33", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -74,9 +74,9 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.31"}
+    return {"status": "ok", "version": "18.0.33"}
 
-# ==================== دوال مساعدة ====================
+# ==================== دوال مساعدة (كما هي) ====================
 async def post_with_retry(url, json_data, headers, max_retries=5, is_gemini=False):
     last_exc = None
     for attempt in range(1, max_retries + 1):
@@ -228,7 +228,7 @@ def get_haml_mat_status(age_days: float) -> dict:
         return {
             "status": "أيام الحياء",
             "phase": "حمل المحاق",
-            "description": f"اليوم {day_in} في حمل المحاق. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ.",
+            "description": f"اليوم {day_in} في حمل المحاق. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).",
             "score_delta": 15
         }
     elif 7 <= age_days <= 9 or 21 <= age_days <= 23:
@@ -364,7 +364,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== 50+ شاطئ تونسي ====================
+# ==================== 50+ شاطئ تونسي (كما هي) ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -501,7 +501,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر ====================
+# ==================== جلب بيانات الطقس والبحر (كما هي) ====================
 async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
@@ -533,7 +533,7 @@ async def fetch_weather_data_from_openmeteo(lat: float, lon: float):
         logger.error(f"Open-Meteo weather fetch failed: {e}")
         return None
 
-# ==================== التحليلات الإضافية ====================
+# ==================== التحليلات الإضافية (كما هي) ====================
 def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
     risk = "منخفض"; advice = ""
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
@@ -594,7 +594,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان ====================
+# ==================== نظام الأوزان (كما هو) ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -656,7 +656,7 @@ def apply_scoring(agg: dict) -> int:
     score = max(0, min(100, score))
     return score
 
-# ==================== محرك التجميع الفيزيائي ====================
+# ==================== محرك التجميع الفيزيائي (كما هو) ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -1030,26 +1030,23 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     agg_result["score"] = score
     return agg_result
 
-# ==================== التفكيك الديناميكي ====================
+# ==================== التفكيك الديناميكي (تعديل build_context للتاريخ) ====================
 def format_tidal_flow_periods(tidal_windows: dict) -> dict:
     periods = {}
     for key, time_str in tidal_windows.items():
         h = safe_parse_time(time_str)
+        flow_start = format_time((h - 1.5) % 24)
+        flow_end = format_time((h + 1.5) % 24)
         slack_start = format_time((h - 0.5) % 24)
         slack_end = format_time((h + 0.5) % 24)
-        early_start = format_time((h - 1.5) % 24)
-        early_end = slack_start
-        late_start = slack_end
-        late_end = format_time((h + 1.5) % 24)
         name = "المد العالي" if key.startswith("HW") else "الجزر المنخفض"
         periods[key] = {
             "name": name,
             "time": time_str,
-            "early_flow": f"{early_start} - {early_end}",
+            "flow": f"{flow_start} - {flow_end}",
             "slack": f"{slack_start} - {slack_end}",
-            "late_flow": f"{late_start} - {late_end}",
-            "combined_flow": f"🟢 جريان مبكر {early_start} - {early_end}  |  🟢 جريان متأخر {late_start} - {late_end}",
-            "display_slack": f"🔴 مياه ميتة {slack_start} - {slack_end}"
+            "display_flow": f"🟢 فترة الجريان: {flow_start} - {flow_end}",
+            "display_slack": f"🔴 المياه الميتة: {slack_start} - {slack_end}"
         }
     return periods
 
@@ -1057,90 +1054,48 @@ def build_flow_section(tidal_windows: dict) -> str:
     periods = format_tidal_flow_periods(tidal_windows)
     lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة"]
     for key, data in periods.items():
-        lines.append(f"* {data['name']} ({data['time']}):")
-        lines.append(f"   {data['combined_flow']}")
-        lines.append(f"   {data['display_slack']}")
-    lines.append("↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
+        lines.append(f" * 🌊 {data['name']} ({data['time']}):")
+        lines.append(f"   * {data['display_flow']}")
+        lines.append(f"   * {data['display_slack']}")
     return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
-    flags = agg.get("flags", {})
     extra = agg.get("extra_info", {})
     blocks = agg.get("blocks", [])
-    is_mirror_sea = flags.get("is_mirror_sea", False)
-    is_pressure_rising_fast = flags.get("is_pressure_rising_fast", False)
-    is_pressure_dropping_fast = flags.get("is_pressure_dropping_fast", False)
-    has_golden_window = flags.get("has_golden_window", False)
-    is_neap_tide = flags.get("is_neap_tide", False)
-    is_spring_tide = flags.get("is_spring_tide", False)
-
-    golden_windows = extra.get("golden_windows", [])
-    tide_analysis = agg.get("tide_analysis", {})
-    bio_matrix = agg.get("bio_matrix", {})
-    sea_memory = agg.get("sea_memory", "")
-    avg_sst = agg.get("avg_sst", 0)
-    pressure_state = agg.get("pressure_state", "")
-    nogo_reasons = agg.get("nogo_reasons", [])
-    warnings = agg.get("warnings", [])
-    final_verdict = agg.get("final_verdict", "غير مناسب")
-    solunar = extra.get("solunar", {})
-    weed_risk = extra.get("weed_risk", {})
-    seasonal_bait = extra.get("seasonal_bait", "غير محدد")
+    flags = agg.get("flags", {})
     hidden_factors = agg.get("hidden_factors", {})
+    solunar = extra.get("solunar", {})
+    bio_matrix = agg.get("bio_matrix", {})
+    warnings = agg.get("warnings", [])
+    nogo_reasons = agg.get("nogo_reasons", [])
+    final_verdict = agg.get("final_verdict", "غير مناسب")
 
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
     haml_desc = extra.get("haml_description", "")
     platform_advice = extra.get("platform_advice", "")
     interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {haml_desc} {platform_advice}")
-
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
-    interactions.append(f"[فترات سولونار] رئيسي: {solunar.get('major1')} و {solunar.get('major2')} | ثانوي: {solunar.get('minor1')} و {solunar.get('minor2')}")
-
-    if is_neap_tide:
-        interactions.append(f"[تأثير المد] مد محاقي ضعيف، تيارات غذائية ضعيفة.")
-    elif not is_spring_tide:
-        interactions.append(f"[تأثير المد] مد متوسط، تيارات معتدلة.")
-
-    current_sea_state = blocks[0]["sea_state"] if blocks else "غير معروف"
-    interactions.append(f"[حالة البحر العامة] {current_sea_state}")
+    interactions.append(f"[فترات سولونار] 🎯 الفترات الرئيسية: {solunar.get('major1')} | {solunar.get('major2')} 🎯 الفترات الثانوية: {solunar.get('minor1')} | {solunar.get('minor2')}")
 
     for b in blocks:
         name = b['name']; time_range = b['time_range']; raw = b.get("_raw", {})
-        sea_state = b['sea_state']; wind_cls = b['wind_dir']
-        avg_wind = raw.get("avg_wind", 0); max_gust = raw.get("max_gust", 0)
-        wind_effect = raw.get("wind_effect_dist", 0)
-        wave_p = raw.get("wave_period", 0)
-        recommended_dist = raw.get("recommended_cast_distance", 50)
-
         interactions.append(f"[{name} ({time_range})]")
-        interactions.append(f"  البحر: {sea_state} | الثقة: {b.get('confidence',0)}%")
-        sign = '+' if wind_effect >= 0 else ''
-        interactions.append(f"  الرياح: {wind_cls} {avg_wind:.1f} كم/س (هبات {max_gust} كم/س) | تأثير الرمي: {sign}{wind_effect:.0f}م")
-        interactions.append(f"  الموج: مباشر وقصير ({wave_p} ث) | المسافة: {recommended_dist:.0f}م")
+        interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}%")
+        sign = '+' if raw.get('wind_effect_dist', 0) >= 0 else ''
+        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (الهبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{raw.get('wind_effect_dist',0):.0f}م")
+        interactions.append(f"  🌊 الموج والمسافة: {raw.get('wave_period',0)} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م")
+        active_fish = [f for f, d in bio_matrix.items() if "نشط" in d['status']]
+        inactive_fish = [f for f, d in bio_matrix.items() if "نشط" not in d['status']]
+        interactions.append(f"  🐟 نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
+        interactions.append(f"  💤 خامل: {', '.join(inactive_fish) if inactive_fish else 'لا يوجد'}")
 
-        active_fish = []
-        inactive_fish = []
-        for fish, data in bio_matrix.items():
-            if "نشط" in data['status']:
-                active_fish.append(fish)
-            else:
-                inactive_fish.append(fish)
-        interactions.append(f"  نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
-        interactions.append(f"  خامل: {', '.join(inactive_fish) if inactive_fish else 'لا يوجد'}")
-
-    interactions.append(f"[حرارة الماء] {avg_sst}°م. الاستقرار: {agg.get('sst_stability')}")
-    interactions.append(f"[ذاكرة البحر] {sea_memory}")
-    interactions.append(f"[الضغط] {pressure_state}")
-    interactions.append(f"[الطعم الموسمي] {seasonal_bait}")
     interactions.append(f"[نسبة النجاح] {agg.get('score', 0)}%")
-
     if final_verdict == "فرصة مع تحفظات":
         interactions.append(f"[الحسم النهائي] فرصة مع تحفظات: {', '.join(warnings) if warnings else 'ظروف متغيرة'}")
     elif final_verdict == "غير مناسب":
-        reasons = " | ".join(nogo_reasons) if nogo_reasons else "ظروف غير كافية"
-        interactions.append(f"[الحسم النهائي] غير مناسب: {reasons}")
+        interactions.append(f"[الحسم النهائي] غير مناسب: {', '.join(nogo_reasons)}")
     else:
         interactions.append(f"[الحسم النهائي] مناسب، الظروف ممتازة.")
     return interactions
@@ -1149,67 +1104,101 @@ def build_context(req, agg, tz_name):
     beach = "رملي" if req.beach_type == "sandy" else "صخري"
     extra = agg["extra_info"]
     chain_interactions = calculate_interactions(agg)
+    target_date = resolve_target_date(req.target_date, datetime.now(zoneinfo.ZoneInfo(tz_name)).date())
+    date_str = target_date.strftime("%d_%m_%y")
 
     facts = [
-        f"شاطئ {beach} (اتجاه {req.beach_orientation}°).",
-        f"ذاكرة البحر: {agg['sea_memory']}",
-        f"الضغط: {agg['pressure_state']}",
-        f"القمر: {agg['tide_analysis']['tide_strength']}.",
-        f"حرارة الماء: {agg['avg_sst']}°م. الهواء: {extra.get('max_air_temp', 'N/A')}°م.",
-        f"مؤشر الشاطئ: {extra.get('haml_status', 'غير معروف')} ({extra.get('haml_phase', '')}).",
-        f"نصيحة الصيد: {extra.get('platform_advice', '')}",
+        f"🎯 0. الملخص التنفيذي ليوم {date_str}",
+        f"> نسبة النجاح: {agg['score']}%",
+        f">  * القرار النهائي: {agg['final_verdict']}",
+        f">  * الطعم المستهدف: {extra.get('seasonal_bait', '')}",
     ]
-    final_verdict = agg["final_verdict"]
-    score = agg.get("score", 0)
-    seasonal_bait = extra.get("seasonal_bait", "الطعم الموسمي")
-
-    if final_verdict == "مناسب":
-        summary = f"✅ مناسب ({score}%) – الظروف ممتازة. الطعم: {seasonal_bait}."
-    elif final_verdict == "فرصة مع تحفظات":
-        summary = f"⚠️ فرصة مع تحفظات ({score}%) – توجد فرصة. الطعم: {seasonal_bait}."
-    else:
-        summary = f"❌ غير مناسب ({score}%) – لا توجد فرصة."
+    facts.append("⏱️ 1. التوقيت المدوي وحركة المياه")
+    facts.append("🌊 مواقيت المد والجزر")
+    for k, v in extra.get("tidal_windows", {}).items():
+        name = "المد العالي" if k.startswith("HW") else "الجزر المنخفض"
+        facts.append(f" * 🔹 {name}: الساعة {v}")
+    facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
+    facts.append(f" * 🌊 الوضعية: {extra.get('haml_status', '')} ({extra.get('haml_phase', '')}).")
+    facts.append(f" * 📌 حالة البحر: {extra.get('haml_description', '')}")
 
     lines = [
-        f"[الملخص التنفيذي] {summary}",
+        "\n".join(facts),
         "",
-        "=== معلومات أساسية ===", "\n".join(facts), "\n",
         "=== التفاعلات ===", *chain_interactions
     ]
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة.
+# SYSTEM_PROMPT معدل ليطابق القالب الجديد
+SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
 القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
 نسبة النجاح في [نسبة النجاح].
 
-استخدم الهيكل التالي مع أيقونات:
+استخدم الهيكل التالي مع الأيقونات والمسافات البادئة المحددة:
 
-🎯 0. الملخص التنفيذي
-> نسبة النجاح: (أدخل النسبة). القرار: (أدخل القرار). الطعم: (أدخل الطعم).
-
+🎯 0. الملخص التنفيذي ليوم (التاريخ)
+> نسبة النجاح العامة: (أدخل النسبة)%
+>  * القرار النهائي: (أدخل القرار)
+>  * الطعم المستهدف: (أدخل الطعم)
+> 
 ⏱️ 1. التوقيت المدوي وحركة المياه
-* 🌊 مواقيت المد والجزر
-* 🏖️ مؤشر الشاطئ (أيام الحياء والمات)
-* ⏳ فترات سولونار
+🌊 مواقيت المد والجزر
+ * 🔹 المد العالي الأول: الساعة (الوقت)
+ * 🔹 الجزر المنخفض الأول: الساعة (الوقت)
+...
+🏖️ مؤشر الشاطئ (أيام الحياء والمات)
+ * 🌊 الوضعية: (أدخل الحالة)
+ * 📌 حالة البحر: (أدخل الوصف)
+⏳ فترات سولونار (Solunar Periods)
+ * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
+ * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
 
 🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة
-(سيتم إنشاؤها تلقائياً، لا تكتب هذا القسم)
+(سيتم إنشاؤها تلقائياً)
 
 🕒 3. التفكيك الديناميكي الزمني
-* لكل فترة (صباح، ظهيرة، ليل): استخدم أيقونات 🌅 ☀️ 🌙.
-* لا تكسر الوقت في عنوان الفترة. اكتب: * 🌅 الصباح (04:00 - 11:00)
+🌅 الفترة الصباحية (04:00 - 11:00)
+ * 📊 حالة البحر والثقة: ...
+ * 💨 الرياح والرمي: ...
+ * 🌊 الموج والمسافة: ...
+ * 🐟 الأسماك النشطة: ...
+ * 💤 الأسماك الخاملة: ...
+ * 🔄 ربط العوامل الميدانية: ...
+☀️ فترة الظهيرة (12:00 - 17:00)
+... (نفس الهيكل)
+🌃 الفترة الليلية (00:00 - 23:00)
+... (نفس الهيكل)
 
 ⚖️ 4. ميزان العوامل الميدانية
+🔴 العوامل الحمراء (المعوقات)
+ * ...
+🟢 العوامل الإيجابية (الفرص)
+ * ...
+
 🏹 5. التكتيك الميداني والسلامة
-📊 6. الأرقام المرجعية
+ * 🛠️ ثقل الرصاص: ...
+ * ⏱️ أفضل توقيت: ...
+ * 🎯 المسافة والاتجاه: ...
+ * 🦐 إستراتيجية الطعم: ...
+> ⚠️ إرشادات السلامة الحتمية:
+> ...
+
+📊 6. الأرقام المرجعية (للمراجعة والتحقق)
+🌡️ القياسات العامة
+ * حرارة الماء: ...
+ * حرارة الهواء القصوى: ...
+ * الضغط الجوي المتوسط: ...
+ * أقصى هبات رياح مسجلة: ...
+📐 فترات الرمي والموج
+ * الصباح: ...
+ * الظهيرة: ...
+ * الليل: ...
 
 قواعد:
 - لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
-- استخدم دائمًا النطاقات الزمنية من الأصغر إلى الأكبر.
-- لا تذكر المركب.
-- لا تستخدم حروفًا لاتينية.
+- استخدم المسافات البادئة الموضحة ( ` * ` قبل كل نقطة).
+- لا تذكر المركب. لا تستخدم حروفًا لاتينية.
 - اكتب بالدارجة التونسية.
-- كل نقطة بيانات تكون في سطر منفصل.
 """
 
 async def call_gemini(ctx):
@@ -1217,7 +1206,7 @@ async def call_gemini(ctx):
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 12000}
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 15000}
     }
     data = await post_with_retry(url, payload, headers, max_retries=5, is_gemini=True)
     try:
@@ -1226,7 +1215,7 @@ async def call_gemini(ctx):
         logger.error(f"Unexpected Gemini response format: {data}")
         raise Exception("تنسيق استجابة Gemini غير متوقع")
 
-# ==================== دوال معالجة النص ====================
+# ==================== دوال معالجة النص (كما هي) ====================
 def fix_time_ranges(text: str) -> str:
     pattern = r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})'
     def repl(m):
@@ -1254,14 +1243,8 @@ def enforce_line_breaks(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        if ' - ' in stripped and len(re.split(r'\s+-\s+', stripped)) > 2:
-            parts = re.split(r'\s+-\s+', stripped)
-            new_lines.append(parts[0].strip())
-            for part in parts[1:]:
-                new_lines.append(f"   * {part.strip()}")
-            continue
         if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped):
-            if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]) and not re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', new_lines[-1]):
+            if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]):
                 new_lines.append('')
         new_lines.append(stripped)
     return '\n'.join(new_lines)
