@@ -1,11 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.8 (Expert Refinements – Production Ready)
-- تحسين حدود تصنيف البحر: 0.9م للهادئ بدلاً من 0.8م، مما يجعل 0.8م هادئاً وليس متوسط الهيجان.
-- تحسين وصف انحدار الموج: "منخفض الانحدار (سلس)" بدلاً من "طويل" لتفادي الالتباس مع فترة الموج القصيرة.
-- تعزيز SYSTEM_PROMPT بشرح تأثير المد الضعيف/المتوسط على تشتت الأسماك.
-- تعديل وصف الموج في التقرير ليعكس أنه سلس وليس طويلاً.
-- دالة تنظيف النص clean_report_text لضمان قراءة الأرقام.
-- إصلاحات v18.0.6 و v18.0.7 مدمجة.
+Surfcasting Analytics API – v18.0.10 (Bidi & Readability Production Fix)
+- حل جذري لتشوه الأرقام: دالة fix_bidi_text تضيف علامات Unicode (LRM/RLM) لعزل الأرقام والكلمات اللاتينية.
+- تحسين clean_report_text لمعالجة تداخل الأوقات والمسافات.
+- توسيع get_allowed_numbers ليشمل فروقات التوقيت المحسوبة (مثل 5.1) لتجنب الإنذار الكاذب.
+- SYSTEM_PROMPT معدل لتوجيه النموذج لتجنب تنسيقات Bidi المعقدة.
+- كافة تحسينات الإصدارات السابقة (18.0.6 -> 18.0.9) مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -32,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.8", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.10", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -77,7 +76,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.8"}
+    return {"status": "ok", "version": "18.0.10"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -115,12 +114,10 @@ def angle_diff(w, b):
     return 360 - d if d > 180 else d
 
 def signed_angle_diff(w, b):
-    """فرق موقّع: موجب = يمين، سالب = يسار"""
     d = (w - b + 180) % 360 - 180
     return d
 
 def circular_diff(a: float, b: float) -> float:
-    """الفرق الدائري بين قيمتين في نطاق [0,24)."""
     diff = abs(a - b) % 24
     return min(diff, 24 - diff)
 
@@ -177,7 +174,6 @@ def resolve_target_date(txt, real_today):
     return real_today + timedelta(days=2)
 
 def get_moon_and_tide_analysis(d: date):
-    """حساب طور القمر باستخدام Julian Date بدقة عشرية."""
     y, m, day = d.year, d.month, d.day
     if m < 3: y -= 1; m += 12
     a = int(y / 100)
@@ -429,7 +425,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر من Open‑Meteo (احتياط) ====================
+# ==================== جلب بيانات الطقس والبحر من Open‑Meteo ====================
 async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
@@ -807,7 +803,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
         avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
 
-        # تصنيف البحر (حدود محسّنة)
+        # تصنيف البحر (حدود 0.9 هادئ، 1.3 متوسط)
         if max_h < 0.4:
             sea = "بحر مرآوي"
         elif max_h < 0.9:
@@ -986,6 +982,8 @@ def calculate_interactions(agg: dict) -> List[str]:
     interactions.append(f"[المياه الميتة (Slack)] {slack_info}. نصيحة: ركز على بداية الجريان (قبل أو بعد الـ Slack) وليس أثناء المياه الراكدة.")
     if is_neap_tide:
         interactions.append(f"[تأثير المد الضعيف] المد من نوع Neap، التيارات ضعيفة جداً. هذا يقلل من جلب الغذاء ويجعل الأسماك أقل تجمعاً وأكثر تشتتاً، مما يفسر خمول بعض الأنواع.")
+    elif not is_spring_tide:  # مد متوسط
+        interactions.append(f"[تأثير المد المتوسط] المد ليس ضعيفاً ولا قوياً جداً. التيارات معتدلة، قد تكون كافية لتحريك الطعم وجلب بعض الغذاء، لكنها لا تخلق تجمعات كثيفة للأسماك.")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
     current_sea_state = blocks[0]["sea_state"] if blocks else "غير معروف"
@@ -1126,38 +1124,33 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 
 **1. التوقيت المدوي:**
 - أوقات HW1, LW1, HW2, LW2، القمر، قوة المد، الساعة الذهبية، سولونار، Slack، انحدار الموج.
-- لا تركز على فترات المياه الميتة (Slack Water). بدلاً من ذلك، انصح بالتركيز على بداية الجريان: قبل الـ Slack بساعة أو بعدها، وليس أثناءها.
-- اشرح تأثير المد إذا كان ضعيفاً (Neap) أو متوسطاً على تشتت الأسماك وقلة جلب الغذاء.
-- عند عرض الأوقات، استخدم الصيغة: HW1 (10:11) وليس HW1: 10:11.
+- لا تركز على فترات المياه الميتة (Slack Water). انصح بالتركيز على بداية الجريان (قبل/بعد الـ Slack بساعة).
+- وضّح تأثير المد: إذا كان متوسطاً، اشرح أن التيارات معتدلة وتوفر حركة كافية لتحريك الطعم دون تجمعات كثيفة.
+- استخدم صيغة واضحة: HW1 (10:11) وليس HW1:10:11.
 
 **2. التفكيك الديناميكي الزمني (مترابط):**
 - لكل فترة (صباح، ظهيرة، ليل):
   - حالة البحر والثقة.
-  - الرياح وتأثيرها (خلفية، بحرية جاذبة، قوية).
-  - الموج والسويل وحركة القاع. اذكر التوصية بنوع الرصاص إذا كانت موجودة.
+  - الرياح وتأثيرها.
+  - الموج والسويل وحركة القاع. اذكر التوصية بنوع الرصاص إذا كانت موجودة. لا تربط انخفاض الانحدار بصعوبة التثبيت؛ المشكلة هي قِصَر الفترة.
   - أفضل مسافة للرمي.
-  - الأسماك النشطة/الخاملة مع تفضيلاتهم. لا تذكر أبداً أن القاروص ينشط إذا كانت حالته "غائب تقريباً" أو "خامل".
-  - **ربط العوامل:** كيف تتحد الرياح والموج لإنجاح الصيد أو إفشاله.
-  - استخدم مصطلح "منخفض الانحدار (سلس)" لوصف الموج إذا كان الانحدار منخفضاً، ولا تصفه بأنه "طويل" إذا كانت فترته قصيرة.
+  - الأسماك النشطة/الخاملة مع تفضيلاتهم. لا تذكر أن القاروص ينشط إذا كان "غائب تقريباً".
+  - ربط العوامل.
 
-**3. العوامل الحمراء (فقط إذا No-Go):**
-- اشرح كل عامل بالتفصيل.
+**3. العوامل الحمراء (فقط No-Go):** ...
 
-**4. العوامل الإيجابية (فقط إذا Go/Conditional Go):**
-- لخّص العوامل المتآزرة.
+**4. العوامل الإيجابية (فقط Go/Conditional Go):** ...
 
-**5. التكتيك الميداني (فقط Go/Conditional Go):**
-- تفاصيل دقيقة تشمل نوع الرصاص المقترح ومتى تستخدمه.
+**5. التكتيك الميداني (فقط Go/Conditional Go):** ...
 
-**6. السلامة:**
-- تحذيرات.
+**6. السلامة:** ...
 
 قواعد صارمة:
-- لا تستخدم جداول Markdown أو تنسيق ** ** عريض. استخدم نقاطًا عادية (- أو *) بمسافات واضحة.
+- لا تستخدم تنسيق Markdown ( ** ** ) أو جداول. استخدم نقاطًا عادية.
 - اكتب بالدارجة التونسية الواضحة.
 - أكمل التقرير حتى النهاية.
-- استخدم وصف حالة البحر الحالية (موجودة في [حالة البحر الحالية]) لوصف البحر، وليس ذاكرة البحر. ذاكرة البحر تصف آخر 48 ساعة فقط.
-- تأكد أن جميع الأرقام معروضة بوضوح بدون فواصل غير ضرورية (مثلاً "27.8°م" وليس "27.8 ° م").
+- تأكد أن الأرقام معروضة بوضوح، بدون التصاق (27.8°م وليس 27.8°م ملتصقة).
+- لا تُدخل أي علامات تنسيق اتجاه (RTL/LTR) في النص؛ سنقوم بمعالجتها لاحقاً.
 """
 
 async def call_openrouter(ctx):
@@ -1168,7 +1161,7 @@ async def call_openrouter(ctx):
         return data["choices"][0]["message"]["content"]
     raise Exception("OpenRouter استجابة فارغة")
 
-# ==================== فحص الهلوسة والأرقام المرجعية ====================
+# ==================== دوال معالجة النص ====================
 def extract_numbers_from_text(text: str) -> List[float]:
     pattern = r'-?\d+\.?\d*'
     matches = re.findall(pattern, text)
@@ -1206,6 +1199,8 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     allowed.add(round(extra.get("peak_gust_today", 0), 1))
     allowed.add(round(extra.get("pressure_avg", 0), 1))
     allowed.add(float(agg.get("score", 0)))
+
+    # إضافة فروقات التوقيت المحتملة (مثل 5.1، 3.0)
     tidal = agg.get("extra_info", {}).get("tidal_windows", {})
     sunrise_str = agg.get("extra_info", {}).get("sunrise", "06:00")
     sunset_str = agg.get("extra_info", {}).get("sunset", "18:00")
@@ -1223,11 +1218,42 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     return {x for x in allowed if x > 0.5}
 
 def clean_report_text(text: str) -> str:
-    """تنظيف النص لتحسين القراءة."""
-    text = re.sub(r'(\w)\s+:\s+(\d)', r'\1: \2', text)
+    """تنظيف مبدئي لإصلاح تداخل الأوقات والمسافات."""
+    # إصلاح تداخل التوقيت: "HW1:10:11" -> "HW1: 10:11"
+    text = re.sub(r'(HW\d|LW\d):(\d{2}:\d{2})', r'\1: \2', text)
+    # إصلاح أي مسافات زائدة قبل النقطتين
+    text = re.sub(r'(\w)\s+:\s+', r'\1: ', text)
+    # إصلاح "10:11 22:35" -> "10:11 و 22:35"
+    text = re.sub(r'(\d{2}:\d{2})\s+(\d{2}:\d{2})', r'\1 و \2', text)
+    # إزالة تنسيق ** **
     text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
+    # ضبط النقاط الحرارية
     text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
+    # إزالة فراغات مفرطة
     text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
+def fix_bidi_text(text: str) -> str:
+    """
+    حل جذري لخلط العربية والفرنسية/الأرقام:
+    إضافة علامات Left-to-Right Mark (U+200E) قبل وبعد كل كتلة لاتينية أو رقمية
+    لإجبار العرض بالاتجاه الصحيح داخل النص العربي.
+    """
+    # نمط يطابق الأرقام (بما فيها العشرية) والكلمات اللاتينية والمختصرات (مثل HW1, km/h)
+    # نستخدم قاعدة: أي تسلسل من أحرف لاتينية، أرقام، نقط، نقطتين، شرط، شرطة مائلة، درجة مئوية
+    pattern = re.compile(r'([A-Za-z0-9.:/°%+\-]+(?:[A-Za-z0-9.:/°%+\-]*)*)')
+    # نضيف علامة LRM قبل وبعد كل كتلة لاتينية (إذا كانت محاطة بنص عربي أو في البداية/النهاية)
+    # لكن نتجنب إضافة علامات متعددة متجاورة.
+    def replace_latin(m):
+        chunk = m.group(0)
+        # إذا كان النص المحيط عربياً، نضيف LRM حوله
+        return f"\u200E{chunk}\u200E"
+    # نطبق فقط إذا كان النص يحتوي على أحرف عربية
+    if re.search(r'[\u0600-\u06FF]', text):
+        # نستبدل أي كتلة لاتينية/رقمية داخل السياق العربي
+        text = pattern.sub(replace_latin, text)
+    # إزالة علامات LRM المتجاورة (قد تحدث فراغات)
+    text = re.sub(r'\u200E\s*\u200E', '\u200E', text)
     return text
 
 @app.post("/generate-report")
@@ -1274,7 +1300,10 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
+
+        # تطبيق التنظيف ومعالجة ثنائية الاتجاه
         report = clean_report_text(report)
+        report = fix_bidi_text(report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         computed_text += "📊 الأرقام المرجعية (للتحقق)\n"
@@ -1307,6 +1336,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         report += computed_text
 
+        # فحص الأرقام (مع الأرقام الموسعة)
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
         suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers and not (n.is_integer() and 0 <= n <= 59)]
