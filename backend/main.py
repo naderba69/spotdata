@@ -1,8 +1,8 @@
 """
-Surfcasting Analytics API – v18.0.26 (Free Gemini Flash, Production Ready)
-- استخدام Google Gemini 2.0 Flash المجاني بدلاً من OpenRouter.
-- دالة call_gemini ترسل الطلب مباشرة إلى Gemini API.
-- الحفاظ على جميع ميزات الإصدارات السابقة.
+Surfcasting Analytics API – v18.0.27 (Gemini API Key in URL, Production Ready)
+- استخدام Google Gemini 2.0 Flash المجاني عبر مفتاح API في الرابط.
+- إصلاح: عدم استخدام وسيط params غير المدعوم.
+- الحفاظ على جميع تحسينات التنسيق (فترات الجريان، الحياء والمات، إصلاح الكسر، إلخ).
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.26", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.27", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -42,11 +42,11 @@ else:
     origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
-# مفتاح Gemini API
+# استخدام مفتاح Google Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY مفقود")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
@@ -74,7 +74,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.26"}
+    return {"status": "ok", "version": "18.0.27"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -1209,13 +1209,13 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 """
 
 async def call_gemini(ctx):
+    url = f"{GEMINI_URL_BASE}?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
     payload = {
         "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 12000}
     }
-    data = await post_with_retry(GEMINI_URL, payload, headers, params=params)
+    data = await post_with_retry(url, payload, headers)
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as e:
