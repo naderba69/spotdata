@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v18.0.20 (Perfect Line Separation & Icon Formatting)
-- حل جذري لتلاصق الأسطر: دالة enforce_line_breaks.
-- SYSTEM_PROMPT صارم لمنع السلاسل المتصلة.
-- تحسين add_paragraph_spacing.
-- جميع ميزات الإصدارات السابقة.
+Surfcasting Analytics API – v18.0.21 (Final Formatting Polish, Production Ready)
+- fix_broken_time_in_headers: إصلاح كسر العناوين مثل (04:00\n* 11:00).
+- replace_english_commas: استبدال الفواصل الإنجليزية بفواصل عربية.
+- enforce_line_breaks محسنة لضمان تباعد الأقسام.
+- جميع التحسينات السابقة: أيام الحياء والمات، تنسيق الأوقات، النطاقات الزمنية، إلخ.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.20", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.21", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -75,7 +75,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.20"}
+    return {"status": "ok", "version": "18.0.21"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -1066,8 +1066,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     seasonal_bait = extra.get("seasonal_bait", "غير محدد")
     slack_info = extra.get("slack_times", "غير محدد")
     hidden_factors = agg.get("hidden_factors", {})
-    sunrise = extra.get("sunrise", "06:00")
-    sunset = extra.get("sunset", "18:00")
 
     interactions.append(f"[التوقيت الأساسي] المد العالي الأول: {tidal_windows.get('HW1')} | الجزر المنخفض الأول: {tidal_windows.get('LW1')} | المد العالي الثاني: {tidal_windows.get('HW2')} | الجزر المنخفض الثاني: {tidal_windows.get('LW2')}")
     interactions.append(f"[القمر والمد] القمر: {tide_analysis.get('name')}. قوة المد: {tide_analysis.get('tide_strength')}")
@@ -1234,11 +1232,18 @@ def fix_time_ranges(text: str) -> str:
         return f"{t1} - {t2}"
     return re.sub(pattern, repl, text)
 
+def fix_broken_time_in_headers(text: str) -> str:
+    """يصلح كسر الوقت في العناوين مثل: * الصباح (04:00\n* 11:00) -> * الصباح (04:00 - 11:00)"""
+    pattern = r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s*\*\s+(\d{2}:\d{2})\)'
+    text = re.sub(pattern, r'\1(\2 - \3)', text)
+    return text
+
+def replace_english_commas(text: str) -> str:
+    """استبدال الفواصل الإنجليزية (,) بفواصل عربية (،) داخل النص العربي."""
+    text = re.sub(r'(?<=[\u0600-\u06FF\s\d]),(?=[\u0600-\u06FF\s\d])', '،', text)
+    return text
+
 def enforce_line_breaks(text: str) -> str:
-    """
-    يضمن أن كل نقطة تبدأ بـ * أو - أو أيقونة تكون في سطر منفصل.
-    يفصل الجمل المتلاصقة التي تستخدم شرطات متتالية.
-    """
     lines = text.split('\n')
     new_lines = []
     for line in lines:
@@ -1246,29 +1251,16 @@ def enforce_line_breaks(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        # إذا كان السطر يحتوي على " - " متعددة، نفصلها إلى أسطر مستقلة
-        if ' - ' in stripped:
-            # نبحث عن نمط مثل: "المد العالي الأول: 10:11 - الجزر المنخفض الأول: 16:23 - ..."
+        if ' - ' in stripped and len(re.split(r'\s+-\s+', stripped)) > 2:
             parts = re.split(r'\s+-\s+', stripped)
-            # إذا كان هناك أكثر من جزأين، نفصل
-            if len(parts) > 1:
-                # الجزء الأول يبقى كما هو
-                first = parts[0].strip()
-                if first:
-                    new_lines.append(first)
-                # الأجزاء التالية تحصل على شرطة في البداية
-                for part in parts[1:]:
-                    part = part.strip()
-                    if part:
-                        new_lines.append(f"   * {part}")
-                continue
-        # إذا كان السطر يبدأ بـ * أو - أو أيقونة شائعة، نضمن أنه في سطر منفصل
-        if re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped) or re.match(r'^[*-] ', stripped):
-            if new_lines and new_lines[-1] != '':
+            new_lines.append(parts[0].strip())
+            for part in parts[1:]:
+                new_lines.append(f"   * {part.strip()}")
+            continue
+        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped):
+            if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]) and not re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', new_lines[-1]):
                 new_lines.append('')
-            new_lines.append(stripped)
-        else:
-            new_lines.append(stripped)
+        new_lines.append(stripped)
     return '\n'.join(new_lines)
 
 def add_paragraph_spacing(text: str) -> str:
@@ -1279,21 +1271,15 @@ def add_paragraph_spacing(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        # سطر فارغ قبل العناوين الرئيسية
         if re.match(r'^(🎯|⏱️|🏃‍♂️|🕒|⚖️|🏹|📊|\d\.)', stripped):
             if new_lines and new_lines[-1] != '':
                 new_lines.append('')
-        # نضمن أن النقاط تبدأ بسطر جديد
-        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴]', stripped):
-            if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]):
-                pass
         new_lines.append(stripped)
     return '\n'.join(new_lines)
 
 def clean_report_text(text: str) -> str:
     text = re.sub(r'(المد العالي|الجزر المنخفض):(\d{2}:\d{2})', r'\1: \2', text)
     text = re.sub(r'(\w)\s+:\s+', r'\1: ', text)
-    text = re.sub(r'(\d{2}:\d{2})\s+(\d{2}:\d{2})', r'\1 و \2', text)
     text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
     text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
     text = fix_time_ranges(text)
@@ -1389,10 +1375,13 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
+        # سلسلة التنظيف
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
+        report = fix_broken_time_in_headers(report)
         report = fix_time_ranges(report)
-        report = enforce_line_breaks(report)   # الجديد: يفصل النقاط المتلاصقة
+        report = replace_english_commas(report)
+        report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
