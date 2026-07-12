@@ -1,10 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.16 (Professional Formatting & Fixes)
-- إصلاح جذري لانكسار الأوقات والأرقام عبر الأسطر.
-- إزالة جميع المسافات الزائدة من الأوقات.
-- تحسين وضوح سطر "أيام الحمل".
-- منع تكرار أسماء الأسماك في التقرير.
-- تنسيق احترافي فخم بدون أي تشوهات.
+Surfcasting Analytics API – v18.0.18 (Haml/Mat Shore Indicator, Fixed Time Ranges, No Boat)
+- تحويل "أيام الحمل" إلى "أيام الحياء والمات" مع تأثير على scoring للشاطئ.
+- دالة fix_time_ranges لضمان عدم وجود نطاقات زمنية معكوسة (23:34-21:34 -> 21:34-23:34).
+- إزالة أي ذكر للمركب من system prompt والتوصيات.
+- إدراج فقرة "مؤشر الشاطئ" في التقرير بعد التنظيف.
+- جميع تحسينات الإصدارات السابقة مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.16", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.18", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -76,7 +76,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.16"}
+    return {"status": "ok", "version": "18.0.18"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -207,48 +207,60 @@ def get_moon_age_days(d: date) -> float:
     age = days_since_new % 29.53058867
     return age
 
-def get_haml_status(age_days: float) -> dict:
-    if 13 <= age_days <= 16:
-        day_in_haml = int(age_days - 13) + 1
+def get_haml_mat_status(age_days: float) -> dict:
+    """
+    تصنيف أيام الحياء (Go للشاطئ) وأيام المات (No-Go للشاطئ).
+    يعيد أيضاً قيمة التأثير على النتيجة.
+    """
+    if 13 <= age_days <= 16:  # حمل البدر = حياء
+        day_in = int(age_days - 13) + 1
         return {
-            "status": "حمل البدر",
-            "description": f"اليوم {day_in_haml} في حمل البدر (يبدأ من 13 إلى 16). البحر غالباً هائج، تيارات قوية، قد يفسد الصيد.",
-            "days_text": f"اليوم {day_in_haml} في حمل البدر"
+            "status": "أيام الحياء",
+            "phase": "حمل البدر",
+            "description": f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ.",
+            "score_delta": 15
         }
-    elif 28 <= age_days or age_days <= 1:
+    elif 28 <= age_days or age_days <= 1:  # حمل المحاق = حياء
         if age_days >= 28:
-            day_in_haml = int(age_days - 28) + 1
+            day_in = int(age_days - 28) + 1
         else:
-            day_in_haml = int(age_days + 29.53 - 28) + 1
-            day_in_haml = min(day_in_haml, 4)
+            day_in = int(age_days + 29.53 - 28) + 1
+            day_in = min(day_in, 4)
         return {
-            "status": "حمل المحاق",
-            "description": f"اليوم {day_in_haml} في حمل المحاق (يبدأ من 28 إلى 1). البحر غير مستقر، تيارات قوية، يُنصح بتجنب الصيد.",
-            "days_text": f"اليوم {day_in_haml} في حمل المحاق"
+            "status": "أيام الحياء",
+            "phase": "حمل المحاق",
+            "description": f"اليوم {day_in} في حمل المحاق. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ.",
+            "score_delta": 15
+        }
+    elif 7 <= age_days <= 9 or 21 <= age_days <= 23:  # التربيعين = مات
+        if 7 <= age_days <= 9:
+            phase_name = "التربيع الأول"
+            day_in = int(age_days - 7) + 1
+        else:
+            phase_name = "التربيع الثاني"
+            day_in = int(age_days - 21) + 1
+        return {
+            "status": "أيام المات",
+            "phase": phase_name,
+            "description": f"اليوم {day_in} في {phase_name}. البحر مْيِّت، الماء راكد، الصيد أصعب من الشاطئ.",
+            "score_delta": -15
         }
     else:
-        if age_days < 13:
-            days_until = math.ceil(13 - age_days)
-            target = "حمل البدر"
-        elif age_days < 28:
-            days_until = math.ceil(28 - age_days)
-            target = "حمل المحاق"
-        else:
-            days_until = math.ceil(28 - age_days)
-            target = "حمل المحاق"
         return {
             "status": "أيام عادية",
-            "description": f"مزال {days_until} يوم عن {target}. البحر في حالة طبيعية نسبياً.",
-            "days_text": f"مزال {days_until} يوم عن {target}"
+            "phase": "",
+            "description": "لا توجد مؤشرات حيائية أو مات قوية. الصيد من الشاطئ ممكن.",
+            "score_delta": 0
         }
 
 def get_fishing_platform_advice(haml_status: str) -> str:
-    if haml_status == "حمل البدر":
-        return "أيام حمل البدر: البحر هائج، يُنصح بالصيد من الشاطئ فقط. المركب خطير جداً. الأسماك قد تقترب من الشاطئ بسبب قوة الأمواج."
-    elif haml_status == "حمل المحاق":
-        return "أيام حمل المحاق: البحر غير مستقر، يُنصح بالصيد من الشاطئ. تجنب المركب بسبب التيارات القوية والمفاجئة."
+    """نصيحة مخصصة للشاطئ فقط، لا تذكر المركب."""
+    if "الحياء" in haml_status:
+        return "الصيد من الشاطئ ممتاز اليوم. التيارات قوية تجلب الأسماك."
+    elif "المات" in haml_status:
+        return "الصيد من الشاطئ صعب اليوم بسبب ركود الماء."
     else:
-        return "في الأيام العادية يمكن الصيد من الشاطئ أو المركب حسب التفضيل، لكن يُفضل المركب للوصول إلى الأعماق وتجنب الزحام على الشاطئ."
+        return "الصيد من الشاطئ ممكن اليوم."
 
 def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
     sr_h = safe_parse_time(sunrise_str)
@@ -571,7 +583,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان ====================
+# ==================== نظام الأوزان (معدل بالحياء/المات) ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -626,6 +638,10 @@ def apply_scoring(agg: dict) -> int:
     moon_idx = agg["tide_analysis"]["idx"]
     if moon_idx == 4 and any(b["name"] == "الليل" for b in blocks):
         score += 15
+
+    # تأثير الحياء/المات
+    haml_delta = extra.get("haml_score_delta", 0)
+    score += haml_delta
 
     score = max(0, min(100, score))
     return score
@@ -735,7 +751,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     solunar = calculate_solunar(target_date_obj, latitude)
 
     moon_age = get_moon_age_days(target_date_obj)
-    haml_info = get_haml_status(moon_age)
+    haml_info = get_haml_mat_status(moon_age)
     platform_advice = get_fishing_platform_advice(haml_info["status"])
 
     is_neap_tide = tide_analysis["idx"] in [2, 6]
@@ -965,8 +981,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "pressure_change": round(press_change, 1),
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"],
+        "haml_phase": haml_info["phase"],
         "haml_description": haml_info["description"],
-        "haml_days_text": haml_info["days_text"],
+        "haml_score_delta": haml_info["score_delta"],
         "platform_advice": platform_advice
     }
 
@@ -1016,13 +1033,6 @@ def format_tidal_flow_periods(tidal_windows: dict) -> str:
             flows.append(f"الجزر المنخفض ({time_str}): بداية الجريان من {start} إلى {end}")
     return " | ".join(flows)
 
-def clean_haml_text(haml_days_text: str, haml_status: str, moon_age_days: float) -> str:
-    """صياغة واضحة لسطر أيام الحمل."""
-    if "في" in haml_days_text:
-        return f"{haml_days_text} (عمر القمر {moon_age_days:.1f} يوم). {get_haml_status(moon_age_days)['description']}"
-    else:
-        return f"{haml_days_text} (عمر القمر {moon_age_days:.1f} يوم)."
-
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     flags = agg.get("flags", {})
@@ -1070,15 +1080,14 @@ def calculate_interactions(agg: dict) -> List[str]:
     elif not is_spring_tide:
         interactions.append(f"[تأثير المد المتوسط] المد ليس ضعيفاً ولا قوياً جداً. التيارات معتدلة، قد تكون كافية لتحريك الطعم وجلب بعض الغذاء، لكنها لا تخلق تجمعات كثيفة للأسماك.")
     
-    moon_age_days = extra.get("moon_age_days", 0)
     haml_status = extra.get("haml_status", "")
-    haml_days_text = extra.get("haml_days_text", "")
-    haml_line = clean_haml_text(haml_days_text, haml_status, moon_age_days)
-    interactions.append(f"[أيام الحمل (الفساد البحري)] {haml_line}")
+    haml_phase = extra.get("haml_phase", "")
+    haml_desc = extra.get("haml_description", "")
+    interactions.append(f"[مؤشر الشاطئ - أيام الحياء والمات] {haml_status} ({haml_phase}). {haml_desc}")
     
     platform_advice = extra.get("platform_advice", "")
     if platform_advice:
-        interactions.append(f"[نصيحة مكان الصيد] {platform_advice}")
+        interactions.append(f"[نصيحة الصيد] {platform_advice}")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
     current_sea_state = blocks[0]["sea_state"] if blocks else "غير معروف"
@@ -1153,7 +1162,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     interactions.append(f"[الضغط] {pressure_state}")
     interactions.append(f"[الطعم الموسمي] {seasonal_bait}")
 
-    # منع تكرار أسماء الأسماك
     seen_fish = set()
     bio_lines = []
     for fish, data in bio_matrix.items():
@@ -1186,8 +1194,6 @@ def build_context(req, agg, tz_name):
         f"الضغط: {agg['pressure_state']}",
         f"القمر: {agg['tide_analysis']['tide_strength']}.",
         f"حرارة الماء: {agg['avg_sst']}°م. الهواء القصوى: {extra.get('max_air_temp', 'N/A')}°م.",
-        f"أيام الحمل: {extra.get('haml_status', 'غير معروف')} - {extra.get('haml_days_text', '')}.",
-        f"نصيحة المكان: {extra.get('platform_advice', '')}",
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
     final_verdict = agg["final_verdict"]
@@ -1214,22 +1220,21 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تربط بين جميع العوامل.
+SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية تربط بين جميع العوامل.
 القرار النهائي محدد سلفاً في "الحسم النهائي" داخل التفاعلات. لا تغيره أبداً.
 نسبة النجاح موجودة في [نسبة النجاح]. اذكرها بوضوح في الملخص التنفيذي.
 
-هيكل التقرير الإجباري (نسق فخم):
+هيكل التقرير الإجباري:
 
-0. الملخص التنفيذي:
+**0. الملخص التنفيذي:**
 - اذكر النسبة المئوية والقرار النهائي وأفضل فترة والطعم المقترح.
 
-1. التوقيت المدوي:
+**1. التوقيت المدوي:**
 - أوقات المد العالي والجزر المنخفض، القمر، قوة المد، الساعة الذهبية، سولونار، فترات الجريان (حدد الأوقات بدقة)، المياه الميتة، انحدار الموج.
-- أضف أيام الحمل (الفساد القمري) مع العمر الدقيق للقمر.
-- أضف نصيحة مكان الصيد (الشاطئ أو المركب).
-- لا تستخدم أي فواصل أسطر داخل الأوقات. اكتب الوقت كاملاً في سطر واحد.
+- بعد التوقيت المدوي، أدرج فقرة "مؤشر الشاطئ - أيام الحياء والمات" مع أيقونة مناسبة.
+- لا تذكر المركب إطلاقاً. كل التوصيات للشاطئ.
 
-2. التفكيك الديناميكي الزمني (مترابط):
+**2. التفكيك الديناميكي الزمني (مترابط):**
 - لكل فترة (صباح، ظهيرة، ليل):
   - حالة البحر والثقة.
   - الرياح وتأثيرها.
@@ -1238,13 +1243,13 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
   - الأسماك النشطة/الخاملة (بدون تكرار).
   - ربط العوامل.
 
-3. العوامل الحمراء (فقط غير مناسب).
+**3. العوامل الحمراء (فقط غير مناسب).**
 
-4. العوامل الإيجابية (فقط مناسب/فرصة مع تحفظات).
+**4. العوامل الإيجابية (فقط مناسب/فرصة مع تحفظات).**
 
-5. التكتيك الميداني (فقط مناسب/فرصة مع تحفظات): الرصاص، التوقيت، المسافة، الطعم، المكان.
+**5. التكتيك الميداني (فقط مناسب/فرصة مع تحفظات): الرصاص، التوقيت، المسافة، الطعم، المكان (الشاطئ فقط).**
 
-6. السلامة.
+**6. السلامة.**
 
 قواعد صارمة لضمان تنسيق احترافي:
 - لا تكسر أي وقت أو رقم على سطرين. الوقت يكتب دفعة واحدة (مثل 10:11).
@@ -1252,6 +1257,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - لا تستخدم أي حروف لاتينية.
 - استخدم نقاطًا عادية مع مسافات بادئة.
 - اكتب بالدارجة التونسية الواضحة.
+- دائماً استخدم النطاقات الزمنية من الأصغر إلى الأكبر (21:34-23:34 وليس 23:34-21:34).
 """
 
 async def call_openrouter(ctx):
@@ -1263,6 +1269,23 @@ async def call_openrouter(ctx):
     raise Exception("OpenRouter استجابة فارغة")
 
 # ==================== دوال معالجة النص ====================
+def fix_time_ranges(text: str) -> str:
+    """
+    يصلح النطاقات الزمنية المعكوسة (23:34-21:34 -> 21:34-23:34).
+    """
+    pattern = r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})'
+    def repl(m):
+        t1 = m.group(1)
+        t2 = m.group(2)
+        def to_min(s):
+            h, m = map(int, s.split(':'))
+            return h * 60 + m
+        if to_min(t1) > to_min(t2):
+            return f"{t2} - {t1}"
+        else:
+            return f"{t1} - {t2}"
+    return re.sub(pattern, repl, text)
+
 def clean_report_text(text: str) -> str:
     text = re.sub(r'(المد العالي|الجزر المنخفض):(\d{2}:\d{2})', r'\1: \2', text)
     text = re.sub(r'(\w)\s+:\s+', r'\1: ', text)
@@ -1272,6 +1295,7 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r'(?<!\n)(\d+\.\s)', r'\n\1', text)
     text = re.sub(r'(?<!\n)(\* |- )', r'\n\1', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
+    text = fix_time_ranges(text)
     return text.strip()
 
 def fix_broken_number_lines(text: str) -> str:
@@ -1280,24 +1304,18 @@ def fix_broken_number_lines(text: str) -> str:
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        # تحسين: نبحث عن سطر ينتهي برقم متبوع بـ ":" أو مجرد ":" بعد رقم
         if re.search(r'\d+:\s*$', line) and i + 1 < len(lines):
             next_line = lines[i + 1].strip()
-            # إذا كان السطر التالي يبدأ برقم، ندمج
             if re.match(r'^\d+', next_line):
-                # نضيف السطر التالي بدون مسافة في البداية
                 merged = line.rstrip() + next_line
-                # نصلح المسافات الزائدة داخل الوقت: "10: 11" -> "10:11"
                 merged = re.sub(r'(\d+):\s+(\d+)', r'\1:\2', merged)
                 fixed_lines.append(merged)
                 i += 2
                 continue
-        # دمج الشرطات المنفردة
         if re.match(r'^-\s', line) and len(fixed_lines) > 0:
             fixed_lines[-1] = fixed_lines[-1].rstrip() + ' ' + line
             i += 1
             continue
-        # إصلاح المسافات الزائدة في أي سطر يحتوي على وقت
         line = re.sub(r'(\d+):\s+(\d+)', r'\1:\2', line)
         fixed_lines.append(line)
         i += 1
@@ -1405,9 +1423,8 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         # تطبيق التنظيف المتقدم
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
-        # إزالة أي مسافات بيضاء زائدة بعد الفواصل
+        report = fix_time_ranges(report)
         report = re.sub(r'([،,])\s+', r'\1 ', report)
-        # تأكيد إزالة أي كسر أسطر متبقي داخل الأرقام
         report = re.sub(r'(\d):\s*\n\s*(\d)', r'\1:\2', report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
