@@ -1,9 +1,8 @@
 """
-Surfcasting Analytics API – v18.0.25 (Clean Flow Lines + Haml Details + Hardcoded Flow Section)
-- إعادة تنسيق فقرة الجريان والمياه الميتة: 🟢 الجريان في سطر، 🔴 المياه الميتة في سطر.
-- استعادة تفاصيل "اليوم X في حمل المحاق" في مؤشر الشاطئ.
-- إنشاء فقرة فترات الجريان والمياه الميتة من الكود مباشرة (بدون اعتماد على النموذج).
-- إصلاح كسر عناوين الفترات، فواصل عربية، تنسيق مثالي.
+Surfcasting Analytics API – v18.0.26 (Free Gemini Flash, Production Ready)
+- استخدام Google Gemini 2.0 Flash المجاني بدلاً من OpenRouter.
+- دالة call_gemini ترسل الطلب مباشرة إلى Gemini API.
+- الحفاظ على جميع ميزات الإصدارات السابقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.25", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.26", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -43,11 +42,11 @@ else:
     origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY مفقود")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash-lite"
+# مفتاح Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY مفقود")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
@@ -75,7 +74,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.25"}
+    return {"status": "ok", "version": "18.0.26"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -1050,7 +1049,6 @@ def format_tidal_flow_periods(tidal_windows: dict) -> dict:
     return periods
 
 def build_flow_section(tidal_windows: dict) -> str:
-    """إنشاء فقرة 'فترات الحركة مقابل المياه الميتة' كاملة ومنسقة."""
     periods = format_tidal_flow_periods(tidal_windows)
     lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة"]
     for key, data in periods.items():
@@ -1210,13 +1208,19 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - كل نقطة بيانات تكون في سطر منفصل.
 """
 
-async def call_openrouter(ctx):
-    headers = {"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json"}
-    payload = {"model":MODEL_NAME,"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":ctx}],"max_tokens":12000,"temperature":0.1}
-    data = await post_with_retry(OPENROUTER_URL, payload, headers)
-    if "choices" in data and data["choices"]:
-        return data["choices"][0]["message"]["content"]
-    raise Exception("OpenRouter استجابة فارغة")
+async def call_gemini(ctx):
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 12000}
+    }
+    data = await post_with_retry(GEMINI_URL, payload, headers, params=params)
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"Unexpected Gemini response format: {data}")
+        raise Exception("تنسيق استجابة Gemini غير متوقع")
 
 # ==================== دوال معالجة النص ====================
 def fix_time_ranges(text: str) -> str:
@@ -1364,7 +1368,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
             }
 
         ctx = build_context(req, agg, tz_name)
-        report = await call_openrouter(ctx)
+        report = await call_gemini(ctx)
 
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
