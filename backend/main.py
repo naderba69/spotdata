@@ -1,10 +1,9 @@
 """
-Surfcasting Analytics API – v18.0.24 (Clean Code, No Conflicts, Production Ready)
-- إصلاح تعارض enforce_line_breaks و fix_broken_number_lines.
-- إصلاح مفتاح haml_phase في calculate_interactions.
-- إزالة استدعاء fix_time_ranges المكرر.
-- تحسين fix_broken_time_in_headers.
-- جميع ميزات الإصدارات السابقة: أيام الحياء والمات، تنسيق مثالي، فترات جريان ثلاثية.
+Surfcasting Analytics API – v18.0.25 (Clean Flow Lines + Haml Details + Hardcoded Flow Section)
+- إعادة تنسيق فقرة الجريان والمياه الميتة: 🟢 الجريان في سطر، 🔴 المياه الميتة في سطر.
+- استعادة تفاصيل "اليوم X في حمل المحاق" في مؤشر الشاطئ.
+- إنشاء فقرة فترات الجريان والمياه الميتة من الكود مباشرة (بدون اعتماد على النموذج).
+- إصلاح كسر عناوين الفترات، فواصل عربية، تنسيق مثالي.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -31,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.24", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.25", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -76,7 +75,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.24"}
+    return {"status": "ok", "version": "18.0.25"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -1045,9 +1044,21 @@ def format_tidal_flow_periods(tidal_windows: dict) -> dict:
             "early_flow": f"{early_start} - {early_end}",
             "slack": f"{slack_start} - {slack_end}",
             "late_flow": f"{late_start} - {late_end}",
-            "display": f"{name} ({time_str}): 🟢 جريان مبكر {early_start} - {early_end} | 🔴 مياه ميتة {slack_start} - {slack_end} | 🟢 جريان متأخر {late_start} - {late_end}"
+            "combined_flow": f"🟢 جريان مبكر {early_start} - {early_end}  |  🟢 جريان متأخر {late_start} - {late_end}",
+            "display_slack": f"🔴 مياه ميتة {slack_start} - {slack_end}"
         }
     return periods
+
+def build_flow_section(tidal_windows: dict) -> str:
+    """إنشاء فقرة 'فترات الحركة مقابل المياه الميتة' كاملة ومنسقة."""
+    periods = format_tidal_flow_periods(tidal_windows)
+    lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة"]
+    for key, data in periods.items():
+        lines.append(f"* {data['name']} ({data['time']}):")
+        lines.append(f"   {data['combined_flow']}")
+        lines.append(f"   {data['display_slack']}")
+    lines.append("↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
+    return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
@@ -1062,7 +1073,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     is_spring_tide = flags.get("is_spring_tide", False)
 
     golden_windows = extra.get("golden_windows", [])
-    tidal_windows = extra.get("tidal_windows", {})
     tide_analysis = agg.get("tide_analysis", {})
     bio_matrix = agg.get("bio_matrix", {})
     sea_memory = agg.get("sea_memory", "")
@@ -1074,19 +1084,14 @@ def calculate_interactions(agg: dict) -> List[str]:
     solunar = extra.get("solunar", {})
     weed_risk = extra.get("weed_risk", {})
     seasonal_bait = extra.get("seasonal_bait", "غير محدد")
-    slack_info = extra.get("slack_times", "غير محدد")
     hidden_factors = agg.get("hidden_factors", {})
 
-    flow_periods_dict = format_tidal_flow_periods(tidal_windows)
-
-    interactions.append("[فترات الجريان والمياه الميتة]")
-    for key, data in flow_periods_dict.items():
-        interactions.append(f"  • {data['display']}")
-    interactions.append("  ↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
-
+    # مؤشر الشاطئ مع التفاصيل الكاملة
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
-    interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {extra.get('platform_advice', '')}")
+    haml_desc = extra.get("haml_description", "")
+    platform_advice = extra.get("platform_advice", "")
+    interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {haml_desc} {platform_advice}")
 
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
     interactions.append(f"[فترات سولونار] رئيسي: {solunar.get('major1')} و {solunar.get('major2')} | ثانوي: {solunar.get('minor1')} و {solunar.get('minor2')}")
@@ -1186,9 +1191,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 * ⏳ فترات سولونار
 
 🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة
-* اعرض كل مد/جزر في ثلاثة أقسام: 🟢 جريان مبكر، 🔴 مياه ميتة، 🟢 جريان متأخر.
-* مثال: "المد العالي (10:11): 🟢 جريان مبكر 08:41 - 09:41 | 🔴 مياه ميتة 09:41 - 10:41 | 🟢 جريان متأخر 10:41 - 11:41"
-* نصيحة: أفضل صيد في الجريان المبكر أو المتأخر.
+(سيتم إنشاؤها تلقائياً، لا تكتب هذا القسم)
 
 🕒 3. التفكيك الديناميكي الزمني
 * لكل فترة (صباح، ظهيرة، ليل): استخدم أيقونات 🌅 ☀️ 🌙.
@@ -1369,6 +1372,11 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         report = replace_english_commas(report)
         report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
+
+        # استبدال فقرة الجريان بنسخة مثالية من الكود
+        flow_section = build_flow_section(agg["extra_info"]["tidal_windows"])
+        pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
+        report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         computed_text += f"🔹 حرارة الماء: {agg['avg_sst']}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
