@@ -1,9 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.33 (Template Perfection + Date in Summary)
-- إضافة التاريخ إلى الملخص التنفيذي (ليوم dd_mm_yy).
-- تنسيق التقرير بالكامل ليطابق القالب الاحترافي المطلوب.
-- استخدام Google Gemini 2.5 Flash المجاني.
-- جميع تحسينات التنسيق السابقة.
+Surfcasting Analytics API – v18.0.34 (Expert Recommendations Applied)
+- عرض فترات الجريان والمياه الميتة بالنموذج الثلاثي المنفصل (جريان مبكر – مياه ميتة – جريان متأخر).
+- تحسين وصف نشاط السوبيا (تنشط ليلاً بشكل أساسي).
+- حذف "6. الأرقام المرجعية" من النموذج والاعتماد على القسم الآلي فقط.
+- إضافة أوقات الشروق والغروب إلى قسم التوقيت المدوي.
+- جميع تحسينات الإصدارات السابقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.33", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.34", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -74,9 +75,9 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.33"}
+    return {"status": "ok", "version": "18.0.34"}
 
-# ==================== دوال مساعدة (كما هي) ====================
+# ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=5, is_gemini=False):
     last_exc = None
     for attempt in range(1, max_retries + 1):
@@ -216,7 +217,7 @@ def get_haml_mat_status(age_days: float) -> dict:
         return {
             "status": "أيام الحياء",
             "phase": "حمل البدر",
-            "description": f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ.",
+            "description": f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).",
             "score_delta": 15
         }
     elif 28 <= age_days or age_days <= 1:
@@ -364,7 +365,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
     }
 
-# ==================== 50+ شاطئ تونسي (كما هي) ====================
+# ==================== 50+ شاطئ تونسي ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -501,7 +502,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر (كما هي) ====================
+# ==================== جلب بيانات الطقس والبحر ====================
 async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
@@ -533,7 +534,7 @@ async def fetch_weather_data_from_openmeteo(lat: float, lon: float):
         logger.error(f"Open-Meteo weather fetch failed: {e}")
         return None
 
-# ==================== التحليلات الإضافية (كما هي) ====================
+# ==================== التحليلات الإضافية ====================
 def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
     risk = "منخفض"; advice = ""
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
@@ -594,7 +595,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان (كما هو) ====================
+# ==================== نظام الأوزان ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -656,7 +657,7 @@ def apply_scoring(agg: dict) -> int:
     score = max(0, min(100, score))
     return score
 
-# ==================== محرك التجميع الفيزيائي (كما هو) ====================
+# ==================== محرك التجميع الفيزيائي ====================
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -837,8 +838,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "preferences": "19-27°م | متوسط الهيجان | تيار معتدل | عكارة | الليل | السردين، القمبري"
         },
         "سوبيا": {
-            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
-            "reason": "يظهر ليلاً مع المد العالي، يحب الأضواء والقاع الرملي.",
+            "status": "نشط (ليلاً بشكل رئيسي)" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
+            "reason": "يظهر ليلاً مع المد العالي، يحب الأضواء والقاع الرملي. قد يكون نشاطه محدوداً نهاراً.",
             "preferences": "18-24°م | هادئ-متوسط | تيار قوي | ماء نظيف | الليل مع المد العالي | السردين، الحبار"
         }
     }
@@ -1030,23 +1031,24 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     agg_result["score"] = score
     return agg_result
 
-# ==================== التفكيك الديناميكي (تعديل build_context للتاريخ) ====================
+# ==================== التفكيك الديناميكي ====================
 def format_tidal_flow_periods(tidal_windows: dict) -> dict:
     periods = {}
     for key, time_str in tidal_windows.items():
         h = safe_parse_time(time_str)
-        flow_start = format_time((h - 1.5) % 24)
-        flow_end = format_time((h + 1.5) % 24)
         slack_start = format_time((h - 0.5) % 24)
         slack_end = format_time((h + 0.5) % 24)
+        early_start = format_time((h - 1.5) % 24)
+        early_end = slack_start
+        late_start = slack_end
+        late_end = format_time((h + 1.5) % 24)
         name = "المد العالي" if key.startswith("HW") else "الجزر المنخفض"
         periods[key] = {
             "name": name,
             "time": time_str,
-            "flow": f"{flow_start} - {flow_end}",
+            "early_flow": f"{early_start} - {early_end}",
             "slack": f"{slack_start} - {slack_end}",
-            "display_flow": f"🟢 فترة الجريان: {flow_start} - {flow_end}",
-            "display_slack": f"🔴 المياه الميتة: {slack_start} - {slack_end}"
+            "late_flow": f"{late_start} - {late_end}",
         }
     return periods
 
@@ -1055,8 +1057,10 @@ def build_flow_section(tidal_windows: dict) -> str:
     lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة"]
     for key, data in periods.items():
         lines.append(f" * 🌊 {data['name']} ({data['time']}):")
-        lines.append(f"   * {data['display_flow']}")
-        lines.append(f"   * {data['display_slack']}")
+        lines.append(f"   * 🟢 جريان مبكر: {data['early_flow']}")
+        lines.append(f"   * 🔴 مياه ميتة: {data['slack']}")
+        lines.append(f"   * 🟢 جريان متأخر: {data['late_flow']}")
+    lines.append("↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
     return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
@@ -1070,6 +1074,11 @@ def calculate_interactions(agg: dict) -> List[str]:
     warnings = agg.get("warnings", [])
     nogo_reasons = agg.get("nogo_reasons", [])
     final_verdict = agg.get("final_verdict", "غير مناسب")
+
+    # إضافة الشروق والغروب
+    sunrise = extra.get("sunrise", "غير متوفر")
+    sunset = extra.get("sunset", "غير متوفر")
+    interactions.append(f"[الشروق والغروب] 🌅 الشروق: {sunrise} | 🌇 الغروب: {sunset}")
 
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
@@ -1118,6 +1127,8 @@ def build_context(req, agg, tz_name):
     for k, v in extra.get("tidal_windows", {}).items():
         name = "المد العالي" if k.startswith("HW") else "الجزر المنخفض"
         facts.append(f" * 🔹 {name}: الساعة {v}")
+    # إضافة الشروق والغروب
+    facts.append(f" * 🌅 الشروق: {extra.get('sunrise', '')} | 🌇 الغروب: {extra.get('sunset', '')}")
     facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
     facts.append(f" * 🌊 الوضعية: {extra.get('haml_status', '')} ({extra.get('haml_phase', '')}).")
     facts.append(f" * 📌 حالة البحر: {extra.get('haml_description', '')}")
@@ -1129,7 +1140,6 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
-# SYSTEM_PROMPT معدل ليطابق القالب الجديد
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
 القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
 نسبة النجاح في [نسبة النجاح].
@@ -1145,11 +1155,13 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 🌊 مواقيت المد والجزر
  * 🔹 المد العالي الأول: الساعة (الوقت)
  * 🔹 الجزر المنخفض الأول: الساعة (الوقت)
-...
+ ...
+🌅 الشروق والغروب
+ * 🌅 الشروق: (الوقت) | 🌇 الغروب: (الوقت)
 🏖️ مؤشر الشاطئ (أيام الحياء والمات)
  * 🌊 الوضعية: (أدخل الحالة)
  * 📌 حالة البحر: (أدخل الوصف)
-⏳ فترات سولونار (Solunar Periods)
+⏳ فترات سولونار
  * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
  * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
 
@@ -1183,22 +1195,12 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 > ⚠️ إرشادات السلامة الحتمية:
 > ...
 
-📊 6. الأرقام المرجعية (للمراجعة والتحقق)
-🌡️ القياسات العامة
- * حرارة الماء: ...
- * حرارة الهواء القصوى: ...
- * الضغط الجوي المتوسط: ...
- * أقصى هبات رياح مسجلة: ...
-📐 فترات الرمي والموج
- * الصباح: ...
- * الظهيرة: ...
- * الليل: ...
-
 قواعد:
 - لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
 - استخدم المسافات البادئة الموضحة ( ` * ` قبل كل نقطة).
 - لا تذكر المركب. لا تستخدم حروفًا لاتينية.
 - اكتب بالدارجة التونسية.
+- لا تكتب القسم 6 (الأرقام المرجعية) فأي نص خاص به سيتم تجاهله.
 """
 
 async def call_gemini(ctx):
@@ -1215,7 +1217,7 @@ async def call_gemini(ctx):
         logger.error(f"Unexpected Gemini response format: {data}")
         raise Exception("تنسيق استجابة Gemini غير متوقع")
 
-# ==================== دوال معالجة النص (كما هي) ====================
+# ==================== دوال معالجة النص ====================
 def fix_time_ranges(text: str) -> str:
     pattern = r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})'
     def repl(m):
@@ -1368,6 +1370,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
         report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
 
+        # القسم الآلي للأرقام المرجعية
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         computed_text += f"🔹 حرارة الماء: {agg['avg_sst']}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
         computed_text += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
@@ -1378,6 +1381,8 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         computed_text += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
         report += computed_text
+
+        # تجاهل أي قسم كتبه النموذج عن الأرقام المرجعية (لن يظهر لأنه طُلب منه عدم كتابته)
 
         allowed = get_allowed_numbers(agg)
         found_nums = extract_numbers_from_text(report)
