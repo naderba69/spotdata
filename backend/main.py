@@ -1,9 +1,9 @@
 """
-Surfcasting Analytics API – v18.0.25 (Clean Flow Lines + Haml Details + Hardcoded Flow Section)
-- إعادة تنسيق فقرة الجريان والمياه الميتة: 🟢 الجريان في سطر، 🔴 المياه الميتة في سطر.
-- استعادة تفاصيل "اليوم X في حمل المحاق" في مؤشر الشاطئ.
-- إنشاء فقرة فترات الجريان والمياه الميتة من الكود مباشرة (بدون اعتماد على النموذج).
-- إصلاح كسر عناوين الفترات، فواصل عربية، تنسيق مثالي.
+Surfcasting Analytics API – v18.0.29 (Free Llama 3.1 8B via OpenRouter, Production Ready)
+- استخدام نموذج meta-llama/llama-3.1-8b-instruct:free المجاني على OpenRouter.
+- جميع تحسينات التنسيق: فترات الجريان الثلاثية، الحياء والمات، إصلاح الكسر، فواصل عربية.
+- فقرة "فترات الحركة مقابل المياه الميتة" تُنشأ تلقائياً من الكود.
+- جاهز للإنتاج دون أي تكلفة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.25", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.29", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -47,7 +47,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY مفقود")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash-lite"
+MODEL_NAME = "meta-llama/llama-3.1-8b-instruct:free"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
@@ -75,7 +75,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.25"}
+    return {"status": "ok", "version": "18.0.29"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
