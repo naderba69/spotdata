@@ -1,11 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.12 (Arabic Terminology, Precise Tidal Flows, No False Alarms)
-- تعريب جميع الاختصارات (HW, LW, Slack, Major, Minor) في المخرجات.
-- حساب فترات الجريان بدقة (بداية الجريان قبل/بعد كل مد وجزر) وعرضها.
-- إلغاء إظهار تحذير "أرقام غير دقيقة" للمستخدم (تسجيل فقط).
-- تحسين clean_report_text لإزالة أي تشوهات متبقية.
-- إضافة حساب "أيام الحمل" (الفساد البحري) بناءً على عمر القمر.
-- جميع تحسينات الإصدارات السابقة مدمجة.
+Surfcasting Analytics API – v18.0.13 (Precise Haml Days & Full Arabic Report)
+- إضافة حساب دقيق لعدد الأيام في الحمل أو الأيام المتبقية عليه.
+- عرض عبارات مثل "اليوم 2 في حمل المحاق" أو "مزال 5 أيام عن حمل البدر".
+- تعريب كامل للمصطلحات (المد العالي، الجزر المنخفض، إلخ).
+- إصلاح خطأ `windows` غير المعرف في slack_info.
+- تحسين تنسيق التقرير النهائي.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -32,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.12", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.13", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -77,7 +76,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.12"}
+    return {"status": "ok", "version": "18.0.13"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -209,12 +208,54 @@ def get_moon_age_days(d: date) -> float:
     return age
 
 def get_haml_status(age_days: float) -> dict:
+    """
+    حساب حالة الحمل (الفساد البحري) مع عدد الأيام في الحمل أو المتبقية عليه.
+    الدورة القمرية: 29.53 يوم.
+    حمل البدر: من يوم 13 إلى 16.
+    حمل المحاق: من يوم 28 إلى 1 (يعني age >= 28 أو age <= 1).
+    """
     if 13 <= age_days <= 16:
-        return {"status": "حمل البدر", "description": "أيام الحمل القمري (قرب البدر): البحر غالباً هائج، تيارات قوية، قد يفسد الصيد."}
+        day_in_haml = int(age_days - 13) + 1  # 13 -> 1, 14 -> 2, ...
+        return {
+            "status": "حمل البدر",
+            "description": f"اليوم {day_in_haml} في حمل البدر (يبدأ من 13 إلى 16). البحر غالباً هائج، تيارات قوية، قد يفسد الصيد.",
+            "days_text": f"اليوم {day_in_haml} في حمل البدر"
+        }
     elif 28 <= age_days or age_days <= 1:
-        return {"status": "حمل المحاق", "description": "أيام الحمل القمري (قرب المحاق): البحر غير مستقر، تيارات قوية، يُنصح بتجنب الصيد."}
+        if age_days >= 28:
+            day_in_haml = int(age_days - 28) + 1
+        else:
+            # age <= 1 يعني الأيام 29، 30، 1 من الدورة
+            # بعد 28 يوم، اليوم 29 يعتبر 2، 30 يعتبر 3، 1 يعتبر 4
+            day_in_haml = int(age_days) + 3 if age_days <= 1 else int(age_days - 28) + 1
+        # تبسيط: نحسب كم يوم داخل المحاق (الذي يمتد من 28 إلى 1 أي حوالي 3-4 أيام)
+        if age_days >= 28:
+            day_in_haml = int(age_days - 28) + 1
+        else:
+            day_in_haml = int(age_days + 29.53 - 28) + 1  # تقريب
+            day_in_haml = min(day_in_haml, 4)  # أقصى 4 أيام
+        return {
+            "status": "حمل المحاق",
+            "description": f"اليوم {day_in_haml} في حمل المحاق (يبدأ من 28 إلى 1). البحر غير مستقر، تيارات قوية، يُنصح بتجنب الصيد.",
+            "days_text": f"اليوم {day_in_haml} في حمل المحاق"
+        }
     else:
-        return {"status": "أيام عادية", "description": "لا توجد مؤشرات حمل قمري قوي، البحر في حالة طبيعية نسبياً."}
+        # حساب الأيام المتبقية لأقرب حمل
+        if age_days < 13:
+            days_until = math.ceil(13 - age_days)
+            target = "حمل البدر"
+        elif age_days < 28:
+            days_until = math.ceil(28 - age_days)
+            target = "حمل المحاق"
+        else:  # age_days > 16 and age_days < 28 نظرياً، لكن بعد حمل البدر حتى المحاق
+            days_until = math.ceil(28 - age_days)
+            target = "حمل المحاق"
+        # إذا كان بعد المحاق (age <= 1) لا ندخل هنا لأننا في حالة المحاق أعلاه
+        return {
+            "status": "أيام عادية",
+            "description": f"مزال {days_until} يوم عن {target}. البحر في حالة طبيعية نسبياً.",
+            "days_text": f"مزال {days_until} يوم عن {target}"
+        }
 
 def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
     sr_h = safe_parse_time(sunrise_str)
@@ -444,7 +485,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     except Exception: pass
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر من Open‑Meteo ====================
+# ==================== جلب بيانات الطقس والبحر ====================
 async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
@@ -537,7 +578,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان (33 عامل) ====================
+# ==================== نظام الأوزان ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -797,11 +838,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     def parse_tidal_time(t_str):
         parts = t_str.split(":")
         return int(parts[0]) + int(parts[1])/60
+
     slack_info = ""
     for hw_key, lw_key in [("HW1","LW1"), ("HW2","LW2")]:
         hw_t = parse_tidal_time(tidal_windows[hw_key])
         lw_t = parse_tidal_time(tidal_windows[lw_key])
-        slack_info += f"المد العالي {windows[hw_key]} مياه ميتة: {format_time(hw_t-0.75)}-{format_time(hw_t+0.75)}; الجزر المنخفض {windows[lw_key]} مياه ميتة: {format_time(lw_t-0.75)}-{format_time(lw_t+0.75)}; "
+        slack_info += f"المد العالي {tidal_windows[hw_key]} مياه ميتة: {format_time(hw_t-0.75)}-{format_time(hw_t+0.75)}; الجزر المنخفض {tidal_windows[lw_key]} مياه ميتة: {format_time(lw_t-0.75)}-{format_time(lw_t+0.75)}; "
     slack_info = slack_info.rstrip("; ")
 
     blocks = []
@@ -929,7 +971,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "pressure_change": round(press_change, 1),
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"],
-        "haml_description": haml_info["description"]
+        "haml_description": haml_info["description"],
+        "haml_days_text": haml_info["days_text"]
     }
 
     flags = {
@@ -1016,7 +1059,6 @@ def calculate_interactions(agg: dict) -> List[str]:
         interactions.append(f"[ساعات ذهبية] {golden_windows[0] if golden_windows else 'لا توجد معلومات.'}")
     interactions.append(f"[فترات سولونار] رئيسي: {solunar.get('major1')} و {solunar.get('major2')} | ثانوي: {solunar.get('minor1')} و {solunar.get('minor2')}.")
     
-    # إضافة فترات الجريان المفصلة
     flow_periods = format_tidal_flow_periods(tidal_windows)
     interactions.append(f"[فترات الجريان] {flow_periods}")
     interactions.append(f"[المياه الميتة] {slack_info}. نصيحة: تجنب هذه الفترات وركز على فترات الجريان المذكورة أعلاه.")
@@ -1029,7 +1071,8 @@ def calculate_interactions(agg: dict) -> List[str]:
     moon_age_days = extra.get("moon_age_days", 0)
     haml_status = extra.get("haml_status", "")
     haml_desc = extra.get("haml_description", "")
-    interactions.append(f"[أيام الحمل (الفساد البحري)] عمر القمر: {moon_age_days} يوم. الحالة: {haml_status}. {haml_desc}")
+    haml_days_text = extra.get("haml_days_text", "")
+    interactions.append(f"[أيام الحمل (الفساد البحري)] عمر القمر: {moon_age_days} يوم. الحالة: {haml_status}. {haml_days_text}. {haml_desc}")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
     current_sea_state = blocks[0]["sea_state"] if blocks else "غير معروف"
@@ -1133,7 +1176,7 @@ def build_context(req, agg, tz_name):
         f"الضغط: {agg['pressure_state']}",
         f"القمر: {agg['tide_analysis']['tide_strength']}.",
         f"حرارة الماء: {agg['avg_sst']}°م. الهواء القصوى: {extra.get('max_air_temp', 'N/A')}°م.",
-        f"أيام الحمل: {extra.get('haml_status', 'غير معروف')} (عمر القمر {extra.get('moon_age_days', 0)} يوم).",
+        f"أيام الحمل: {extra.get('haml_status', 'غير معروف')} - {extra.get('haml_days_text', '')}.",
     ]
     facts.append(f"خضراء: {', '.join(agg['green_flags']) if agg['green_flags'] else 'لا يوجد'} | حمراء: {', '.join(agg['red_flags']) if agg['red_flags'] else 'لا يوجد'}.")
     final_verdict = agg["final_verdict"]
@@ -1172,7 +1215,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 **1. التوقيت المدوي:**
 - أوقات المد العالي الأول والثاني، الجزر المنخفض الأول والثاني، القمر، قوة المد، الساعة الذهبية، سولونار، المياه الميتة، انحدار الموج.
 - اذكر فترات الجريان المحددة (من [فترات الجريان]) واطلب من الصياد التركيز عليها.
-- أضف معلومات "أيام الحمل" (الفساد القمري) مع تفسير مختصر.
+- أضف معلومات "أيام الحمل" (الفساد القمري) مع تفسير مختصر وعدد الأيام بالضبط (اليوم x في الحمل أو مزال y يوم).
 - استخدم الصيغة: المد العالي الأول (10:11).
 
 **2. التفكيك الديناميكي الزمني (مترابط):**
@@ -1264,22 +1307,14 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     return {x for x in allowed if x > 0.5}
 
 def clean_report_text(text: str) -> str:
-    """تنظيف النص لإصلاح تداخل الأوقات والمسافات، وضمان وضوح الفقرات."""
-    # إصلاح تداخل التوقيت: "المد العالي:10:11" -> "المد العالي: 10:11"
+    """تنظيف النص لإصلاح تداخل الأوقات والمسافات."""
     text = re.sub(r'(المد العالي|الجزر المنخفض):(\d{2}:\d{2})', r'\1: \2', text)
-    # إصلاح أي مسافات زائدة قبل النقطتين
     text = re.sub(r'(\w)\s+:\s+', r'\1: ', text)
-    # إصلاح "10:11 22:35" -> "10:11 و 22:35"
     text = re.sub(r'(\d{2}:\d{2})\s+(\d{2}:\d{2})', r'\1 و \2', text)
-    # إزالة تنسيق ** **
     text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
-    # ضبط النقاط الحرارية
     text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
-    # إضافة سطر جديد قبل كل جملة تبدأ برقم متبوع بنقطة (مثل "0. الملخص")
     text = re.sub(r'(?<!\n)(\d+\.\s)', r'\n\1', text)
-    # إضافة سطر جديد قبل كل جملة تبدأ بـ "* " أو "- "
     text = re.sub(r'(?<!\n)(\* |- )', r'\n\1', text)
-    # إزالة فراغات مفرطة
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -1327,8 +1362,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
-
-        # تنظيف النص
         report = clean_report_text(report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1362,7 +1395,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         report += computed_text
 
-        # فحص الأرقام (تسجيل فقط، بدون إظهار للمستخدم)
         allowed_numbers = get_allowed_numbers(agg)
         report_numbers = extract_numbers_from_text(report)
         suspicious = [n for n in report_numbers if n > 0.5 and n not in allowed_numbers and not (n.is_integer() and 0 <= n <= 59)]
