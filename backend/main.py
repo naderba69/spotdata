@@ -1,9 +1,10 @@
 """
-Surfcasting Analytics API – v18.0.21 (Final Formatting Polish, Production Ready)
-- fix_broken_time_in_headers: إصلاح كسر العناوين مثل (04:00\n* 11:00).
-- replace_english_commas: استبدال الفواصل الإنجليزية بفواصل عربية.
-- enforce_line_breaks محسنة لضمان تباعد الأقسام.
-- جميع التحسينات السابقة: أيام الحياء والمات، تنسيق الأوقات، النطاقات الزمنية، إلخ.
+Surfcasting Analytics API – v18.0.24 (Clean Code, No Conflicts, Production Ready)
+- إصلاح تعارض enforce_line_breaks و fix_broken_number_lines.
+- إصلاح مفتاح haml_phase في calculate_interactions.
+- إزالة استدعاء fix_time_ranges المكرر.
+- تحسين fix_broken_time_in_headers.
+- جميع ميزات الإصدارات السابقة: أيام الحياء والمات، تنسيق مثالي، فترات جريان ثلاثية.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.21", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.24", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -75,7 +76,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.21"}
+    return {"status": "ok", "version": "18.0.24"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -140,19 +141,6 @@ def format_time(h: float) -> str:
     hh = int(h)
     mm = int((h - hh) * 60)
     return f"{hh:02d}:{mm:02d}"
-
-def format_time_gap(hours_decimal: float) -> str:
-    if hours_decimal <= 0:
-        return "0 دقيقة"
-    total_minutes = round(hours_decimal * 60)
-    h = total_minutes // 60
-    m = total_minutes % 60
-    parts = []
-    if h > 0:
-        parts.append(f"{h} ساعة" if h == 1 else f"{h} ساعات")
-    if m > 0:
-        parts.append(f"{m} دقيقة" if m == 1 else f"{m} دقائق")
-    return " و ".join(parts) if parts else "0 دقيقة"
 
 def wind_class_detailed(diff):
     if diff < 30: return "بحرية مباشرة"
@@ -302,6 +290,19 @@ def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_s
         golden_windows.append(f"لا توجد ساعة ذهبية. المد العالي الأول ({windows['HW1']}) يبعد {format_time_gap(hw1_gap)} عن الفجر. المد العالي الثاني ({windows['HW2']}) يبعد {format_time_gap(hw2_gap)} عن الغروب.")
 
     return windows, golden_windows
+
+def format_time_gap(hours_decimal: float) -> str:
+    if hours_decimal <= 0:
+        return "0 دقيقة"
+    total_minutes = round(hours_decimal * 60)
+    h = total_minutes // 60
+    m = total_minutes % 60
+    parts = []
+    if h > 0:
+        parts.append(f"{h} ساعة" if h == 1 else f"{h} ساعات")
+    if m > 0:
+        parts.append(f"{m} دقيقة" if m == 1 else f"{m} دقائق")
+    return " و ".join(parts) if parts else "0 دقيقة"
 
 def calculate_solunar(d: date, lat: float):
     y, m, day = d.year, d.month, d.day
@@ -1027,17 +1028,26 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     return agg_result
 
 # ==================== التفكيك الديناميكي ====================
-def format_tidal_flow_periods(tidal_windows: dict) -> str:
-    flows = []
+def format_tidal_flow_periods(tidal_windows: dict) -> dict:
+    periods = {}
     for key, time_str in tidal_windows.items():
         h = safe_parse_time(time_str)
-        start = format_time((h - 1) % 24)
-        end = format_time((h + 1) % 24)
-        if key.startswith("HW"):
-            flows.append(f"المد العالي ({time_str}): {start} - {end}")
-        else:
-            flows.append(f"الجزر المنخفض ({time_str}): {start} - {end}")
-    return flows
+        slack_start = format_time((h - 0.5) % 24)
+        slack_end = format_time((h + 0.5) % 24)
+        early_start = format_time((h - 1.5) % 24)
+        early_end = slack_start
+        late_start = slack_end
+        late_end = format_time((h + 1.5) % 24)
+        name = "المد العالي" if key.startswith("HW") else "الجزر المنخفض"
+        periods[key] = {
+            "name": name,
+            "time": time_str,
+            "early_flow": f"{early_start} - {early_end}",
+            "slack": f"{slack_start} - {slack_end}",
+            "late_flow": f"{late_start} - {late_end}",
+            "display": f"{name} ({time_str}): 🟢 جريان مبكر {early_start} - {early_end} | 🔴 مياه ميتة {slack_start} - {slack_end} | 🟢 جريان متأخر {late_start} - {late_end}"
+        }
+    return periods
 
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
@@ -1067,25 +1077,19 @@ def calculate_interactions(agg: dict) -> List[str]:
     slack_info = extra.get("slack_times", "غير محدد")
     hidden_factors = agg.get("hidden_factors", {})
 
-    interactions.append(f"[التوقيت الأساسي] المد العالي الأول: {tidal_windows.get('HW1')} | الجزر المنخفض الأول: {tidal_windows.get('LW1')} | المد العالي الثاني: {tidal_windows.get('HW2')} | الجزر المنخفض الثاني: {tidal_windows.get('LW2')}")
-    interactions.append(f"[القمر والمد] القمر: {tide_analysis.get('name')}. قوة المد: {tide_analysis.get('tide_strength')}")
-    
+    flow_periods_dict = format_tidal_flow_periods(tidal_windows)
+
+    interactions.append("[فترات الجريان والمياه الميتة]")
+    for key, data in flow_periods_dict.items():
+        interactions.append(f"  • {data['display']}")
+    interactions.append("  ↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
+
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
-    haml_desc = extra.get("haml_description", "")
-    interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {haml_desc}")
+    interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {extra.get('platform_advice', '')}")
+
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
-
     interactions.append(f"[فترات سولونار] رئيسي: {solunar.get('major1')} و {solunar.get('major2')} | ثانوي: {solunar.get('minor1')} و {solunar.get('minor2')}")
-
-    flows = format_tidal_flow_periods(tidal_windows)
-    flow_text = " | ".join(flows)
-    interactions.append(f"[فترات الجريان] {flow_text}")
-    interactions.append(f"[المياه الميتة] {slack_info}")
-
-    platform_advice = extra.get("platform_advice", "")
-    if platform_advice:
-        interactions.append(f"[نصيحة الصيد] {platform_advice}")
 
     if is_neap_tide:
         interactions.append(f"[تأثير المد] مد محاقي ضعيف، تيارات غذائية ضعيفة.")
@@ -1177,31 +1181,22 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 > نسبة النجاح: (أدخل النسبة). القرار: (أدخل القرار). الطعم: (أدخل الطعم).
 
 ⏱️ 1. التوقيت المدوي وحركة المياه
-🌊 مواقيت المد والجزر: اذكر الأوقات (المد العالي الأول، الجزر المنخفض الأول...).
-🏖️ مؤشر الشاطئ (أيام الحياء والمات): (أدخل حالة الحياء/المات). (أدخل وصف التأثير).
-⏳ فترات سولونار: رئيسي وثانوي.
+* 🌊 مواقيت المد والجزر
+* 🏖️ مؤشر الشاطئ (أيام الحياء والمات)
+* ⏳ فترات سولونار
 
 🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة
-لكل مد/جزر: 🟢 فترة الجريان، 🔴 المياه الميتة. استخدم النطاقات الزمنية الصحيحة (من الأصغر إلى الأكبر).
+* اعرض كل مد/جزر في ثلاثة أقسام: 🟢 جريان مبكر، 🔴 مياه ميتة، 🟢 جريان متأخر.
+* مثال: "المد العالي (10:11): 🟢 جريان مبكر 08:41 - 09:41 | 🔴 مياه ميتة 09:41 - 10:41 | 🟢 جريان متأخر 10:41 - 11:41"
+* نصيحة: أفضل صيد في الجريان المبكر أو المتأخر.
 
 🕒 3. التفكيك الديناميكي الزمني
-لكل فترة (صباح، ظهيرة، ليل):
-- حالة البحر والثقة.
-- الرياح وتأثيرها على الرمي (أشر إلى + إذا كانت تزيد المسافة).
-- الموج والمسافة المقترحة.
-- الأسماك النشطة والخاملة (بدون تكرار).
-- ربط العوامل.
+* لكل فترة (صباح، ظهيرة، ليل): استخدم أيقونات 🌅 ☀️ 🌙.
+* لا تكسر الوقت في عنوان الفترة. اكتب: * 🌅 الصباح (04:00 - 11:00)
 
 ⚖️ 4. ميزان العوامل الميدانية
-🔴 العوامل الحمراء: ...
-🟢 العوامل الإيجابية: ...
-
 🏹 5. التكتيك الميداني والسلامة
-- الرصاص، التوقيت، المسافة، الطعم، المكان (الشاطئ فقط).
-- ⚠️ إرشادات السلامة.
-
 📊 6. الأرقام المرجعية
-(أدرج الأرقام المرجعية لكل فترة).
 
 قواعد:
 - لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
@@ -1209,8 +1204,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - لا تذكر المركب.
 - لا تستخدم حروفًا لاتينية.
 - اكتب بالدارجة التونسية.
-- تأكد من أن تأثير الرياح البحري يظهر بإشارة '+' لزيادة مسافة الرمي.
-- كل نقطة بيانات (مد، جزر، تيار، مؤشر...) يجب أن تكون في سطر منفصل. استخدم دائماً علامة * أو - في بداية السطر، ثم أيقونة، ثم النص. مثال صحيح: * 🔹 المد العالي الأول: الساعة 10:11. مثال خاطئ: 🌊 مواقيت المد والجزر: - المد العالي الأول: 10:11 - .... لا تكتب سلاسل متصلة بشرطات.
+- كل نقطة بيانات تكون في سطر منفصل.
 """
 
 async def call_openrouter(ctx):
@@ -1233,13 +1227,11 @@ def fix_time_ranges(text: str) -> str:
     return re.sub(pattern, repl, text)
 
 def fix_broken_time_in_headers(text: str) -> str:
-    """يصلح كسر الوقت في العناوين مثل: * الصباح (04:00\n* 11:00) -> * الصباح (04:00 - 11:00)"""
-    pattern = r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s*\*\s+(\d{2}:\d{2})\)'
-    text = re.sub(pattern, r'\1(\2 - \3)', text)
+    text = re.sub(r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s*\*\s+(\d{2}:\d{2})\)', r'\1(\2 - \3)', text)
+    text = re.sub(r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s+(\d{2}:\d{2})\)', r'\1(\2 - \3)', text)
     return text
 
 def replace_english_commas(text: str) -> str:
-    """استبدال الفواصل الإنجليزية (,) بفواصل عربية (،) داخل النص العربي."""
     text = re.sub(r'(?<=[\u0600-\u06FF\s\d]),(?=[\u0600-\u06FF\s\d])', '،', text)
     return text
 
@@ -1299,10 +1291,6 @@ def fix_broken_number_lines(text: str) -> str:
                 fixed.append(merged)
                 i += 2
                 continue
-        if re.match(r'^-\s', line) and fixed:
-            fixed[-1] = fixed[-1].rstrip() + ' ' + line
-            i += 1
-            continue
         line = re.sub(r'(\d+):\s+(\d+)', r'\1:\2', line)
         fixed.append(line)
         i += 1
@@ -1375,11 +1363,9 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
 
-        # سلسلة التنظيف
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
         report = fix_broken_time_in_headers(report)
-        report = fix_time_ranges(report)
         report = replace_english_commas(report)
         report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
