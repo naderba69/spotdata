@@ -1,11 +1,9 @@
 """
-Surfcasting Analytics API – v18.0.19 (Professional Shore-Focused Report, Bidi Fixes & Time Gap Formatting)
-- تغيير صيغة الفروقات الزمنية: "5.1 ساعة" -> "5 ساعات و11 دقيقة".
-- تنسيق جديد مطابق للنموذج الاحترافي مع أيقونات وأقسام واضحة.
-- إصلاح عرض النطاقات الزمنية: 21:34-23:34 بدلاً من المعكوس.
-- تحسين تنسيق النص (add_paragraph_spacing) لمنع كتل النص المتلاصقة.
-- مؤشر الشاطئ (أيام الحياء والمات) مع تأثير على scoring.
-- جميع التحسينات السابقة مدمجة.
+Surfcasting Analytics API – v18.0.20 (Perfect Line Separation & Icon Formatting)
+- حل جذري لتلاصق الأسطر: دالة enforce_line_breaks.
+- SYSTEM_PROMPT صارم لمنع السلاسل المتصلة.
+- تحسين add_paragraph_spacing.
+- جميع ميزات الإصدارات السابقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -32,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.19", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.20", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -77,7 +75,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.19"}
+    return {"status": "ok", "version": "18.0.20"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -144,7 +142,6 @@ def format_time(h: float) -> str:
     return f"{hh:02d}:{mm:02d}"
 
 def format_time_gap(hours_decimal: float) -> str:
-    """تحويل فرق الساعات العشري إلى نص مثل: 5 ساعات و11 دقيقة."""
     if hours_decimal <= 0:
         return "0 دقيقة"
     total_minutes = round(hours_decimal * 60)
@@ -223,7 +220,6 @@ def get_moon_age_days(d: date) -> float:
     return age
 
 def get_haml_mat_status(age_days: float) -> dict:
-    """تصنيف أيام الحياء (Go للشاطئ) وأيام المات (No-Go للشاطئ)."""
     if 13 <= age_days <= 16:
         day_in = int(age_days - 13) + 1
         return {
@@ -594,7 +590,7 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان (معدل بالحياء/المات) ====================
+# ==================== نظام الأوزان ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -1073,27 +1069,22 @@ def calculate_interactions(agg: dict) -> List[str]:
     sunrise = extra.get("sunrise", "06:00")
     sunset = extra.get("sunset", "18:00")
 
-    # أساسيات التوقيت
     interactions.append(f"[التوقيت الأساسي] المد العالي الأول: {tidal_windows.get('HW1')} | الجزر المنخفض الأول: {tidal_windows.get('LW1')} | المد العالي الثاني: {tidal_windows.get('HW2')} | الجزر المنخفض الثاني: {tidal_windows.get('LW2')}")
     interactions.append(f"[القمر والمد] القمر: {tide_analysis.get('name')}. قوة المد: {tide_analysis.get('tide_strength')}")
     
-    # مؤشر الشاطئ
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
     haml_desc = extra.get("haml_description", "")
     interactions.append(f"[مؤشر الشاطئ] {haml_status} ({haml_phase}). {haml_desc}")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
 
-    # سولونار
     interactions.append(f"[فترات سولونار] رئيسي: {solunar.get('major1')} و {solunar.get('major2')} | ثانوي: {solunar.get('minor1')} و {solunar.get('minor2')}")
 
-    # فترات الجريان والمياه الميتة
     flows = format_tidal_flow_periods(tidal_windows)
     flow_text = " | ".join(flows)
     interactions.append(f"[فترات الجريان] {flow_text}")
     interactions.append(f"[المياه الميتة] {slack_info}")
 
-    # نصيحة الصيد
     platform_advice = extra.get("platform_advice", "")
     if platform_advice:
         interactions.append(f"[نصيحة الصيد] {platform_advice}")
@@ -1120,7 +1111,6 @@ def calculate_interactions(agg: dict) -> List[str]:
         interactions.append(f"  الرياح: {wind_cls} {avg_wind:.1f} كم/س (هبات {max_gust} كم/س) | تأثير الرمي: {sign}{wind_effect:.0f}م")
         interactions.append(f"  الموج: مباشر وقصير ({wave_p} ث) | المسافة: {recommended_dist:.0f}م")
 
-        # أسماك
         active_fish = []
         inactive_fish = []
         for fish, data in bio_matrix.items():
@@ -1131,7 +1121,6 @@ def calculate_interactions(agg: dict) -> List[str]:
         interactions.append(f"  نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
         interactions.append(f"  خامل: {', '.join(inactive_fish) if inactive_fish else 'لا يوجد'}")
 
-    # حرارة وضغط وذاكرة
     interactions.append(f"[حرارة الماء] {avg_sst}°م. الاستقرار: {agg.get('sst_stability')}")
     interactions.append(f"[ذاكرة البحر] {sea_memory}")
     interactions.append(f"[الضغط] {pressure_state}")
@@ -1223,6 +1212,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - لا تستخدم حروفًا لاتينية.
 - اكتب بالدارجة التونسية.
 - تأكد من أن تأثير الرياح البحري يظهر بإشارة '+' لزيادة مسافة الرمي.
+- كل نقطة بيانات (مد، جزر، تيار، مؤشر...) يجب أن تكون في سطر منفصل. استخدم دائماً علامة * أو - في بداية السطر، ثم أيقونة، ثم النص. مثال صحيح: * 🔹 المد العالي الأول: الساعة 10:11. مثال خاطئ: 🌊 مواقيت المد والجزر: - المد العالي الأول: 10:11 - .... لا تكتب سلاسل متصلة بشرطات.
 """
 
 async def call_openrouter(ctx):
@@ -1244,6 +1234,43 @@ def fix_time_ranges(text: str) -> str:
         return f"{t1} - {t2}"
     return re.sub(pattern, repl, text)
 
+def enforce_line_breaks(text: str) -> str:
+    """
+    يضمن أن كل نقطة تبدأ بـ * أو - أو أيقونة تكون في سطر منفصل.
+    يفصل الجمل المتلاصقة التي تستخدم شرطات متتالية.
+    """
+    lines = text.split('\n')
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            new_lines.append('')
+            continue
+        # إذا كان السطر يحتوي على " - " متعددة، نفصلها إلى أسطر مستقلة
+        if ' - ' in stripped:
+            # نبحث عن نمط مثل: "المد العالي الأول: 10:11 - الجزر المنخفض الأول: 16:23 - ..."
+            parts = re.split(r'\s+-\s+', stripped)
+            # إذا كان هناك أكثر من جزأين، نفصل
+            if len(parts) > 1:
+                # الجزء الأول يبقى كما هو
+                first = parts[0].strip()
+                if first:
+                    new_lines.append(first)
+                # الأجزاء التالية تحصل على شرطة في البداية
+                for part in parts[1:]:
+                    part = part.strip()
+                    if part:
+                        new_lines.append(f"   * {part}")
+                continue
+        # إذا كان السطر يبدأ بـ * أو - أو أيقونة شائعة، نضمن أنه في سطر منفصل
+        if re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped) or re.match(r'^[*-] ', stripped):
+            if new_lines and new_lines[-1] != '':
+                new_lines.append('')
+            new_lines.append(stripped)
+        else:
+            new_lines.append(stripped)
+    return '\n'.join(new_lines)
+
 def add_paragraph_spacing(text: str) -> str:
     lines = text.split('\n')
     new_lines = []
@@ -1252,14 +1279,13 @@ def add_paragraph_spacing(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        # نضيف سطر فارغ قبل العناوين الرئيسية
+        # سطر فارغ قبل العناوين الرئيسية
         if re.match(r'^(🎯|⏱️|🏃‍♂️|🕒|⚖️|🏹|📊|\d\.)', stripped):
             if new_lines and new_lines[-1] != '':
                 new_lines.append('')
-        # نضمن أن النقاط تبدأ بسطر جديد (إذا لم تكن مسبوقة بسطر فارغ)
-        if re.match(r'^[*-] ', stripped) or re.match(r'^🟢|🔴', stripped):
+        # نضمن أن النقاط تبدأ بسطر جديد
+        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴]', stripped):
             if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]):
-                # لا نضيف سطر إذا كان السطر السابق عنواناً فرعياً
                 pass
         new_lines.append(stripped)
     return '\n'.join(new_lines)
@@ -1366,6 +1392,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
         report = fix_time_ranges(report)
+        report = enforce_line_breaks(report)   # الجديد: يفصل النقاط المتلاصقة
         report = add_paragraph_spacing(report)
 
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
