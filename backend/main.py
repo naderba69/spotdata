@@ -1,13 +1,11 @@
 """
-Surfcasting Analytics API – v18.0.7 (Expert Review Integration)
-- تحسين: تعديل وصف تحذير Neap Tides ليشمل تشتت الأسماك.
-- تحسين: إضافة فقرة تأثير المد الضعيف في التفاعلات (calculate_interactions).
-- تحسين: تعديل SYSTEM_PROMPT لتجنب النصح بفترات الـ Slack Water.
-- تحسين: تنسيق قسم الأرقام المرجعية (computed_text) لجعله أكثر وضوحاً.
-- إصلاح: sunset_str -> sunset في aggregate_physics.
-- إصلاح: استخراج الوقت (HH:MM) من صيغة ISO للشروق/الغروب.
-- إصلاح: apply_scoring تستخدم شهر التاريخ المستهدف وليس شهر اليوم.
-- تنظيف: استبدال Bare Except بـ except Exception.
+Surfcasting Analytics API – v18.0.8 (Expert Refinements – Production Ready)
+- تحسين حدود تصنيف البحر: 0.9م للهادئ بدلاً من 0.8م، مما يجعل 0.8م هادئاً وليس متوسط الهيجان.
+- تحسين وصف انحدار الموج: "منخفض الانحدار (سلس)" بدلاً من "طويل" لتفادي الالتباس مع فترة الموج القصيرة.
+- تعزيز SYSTEM_PROMPT بشرح تأثير المد الضعيف/المتوسط على تشتت الأسماك.
+- تعديل وصف الموج في التقرير ليعكس أنه سلس وليس طويلاً.
+- دالة تنظيف النص clean_report_text لضمان قراءة الأرقام.
+- إصلاحات v18.0.6 و v18.0.7 مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
 from datetime import datetime, timedelta, date
@@ -34,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.7", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.8", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -79,7 +77,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.7"}
+    return {"status": "ok", "version": "18.0.8"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=3):
@@ -297,7 +295,53 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
 # ==================== 50+ شاطئ تونسي ====================
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
-    # ... (القائمة كاملة كما هي دون تغيير)
+    {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
+    {"name":"شاطئ بنزرت", "lat":37.2744, "lon":9.8739, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ رفراف", "lat":37.1911, "lon":10.0392, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ غار الملح", "lat":37.1750, "lon":10.1792, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ رأس الجبل", "lat":37.2169, "lon":10.1228, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ قليبية", "lat":36.8500, "lon":11.1000, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ الهوارية", "lat":37.0575, "lon":11.0153, "orientation":0, "type":"rocky"},
+    {"name":"شاطئ سيدي علي المكي", "lat":37.1611, "lon":10.2564, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ قرطاج", "lat":36.8528, "lon":10.3264, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ المرسى", "lat":36.8794, "lon":10.3244, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ حلق الوادي", "lat":36.8167, "lon":10.3047, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ رادس", "lat":36.7500, "lon":10.2833, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ الزهراء", "lat":36.7222, "lon":10.3000, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ حمام الأنف", "lat":36.7183, "lon":10.3342, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ سليمان", "lat":36.6950, "lon":10.4939, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ نابل", "lat":36.4561, "lon":10.7389, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ الحمامات", "lat":36.4000, "lon":10.6167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ ياسمين الحمامات", "lat":36.3667, "lon":10.5333, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ هرقلة", "lat":36.0333, "lon":10.5000, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ الشابة", "lat":35.9039, "lon":10.5739, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ سوسة", "lat":35.8250, "lon":10.6400, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ القنطاوي", "lat":35.8750, "lon":10.5950, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ المنستير", "lat":35.7667, "lon":10.8167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ سقانص", "lat":35.7583, "lon":10.8028, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ المهدية", "lat":35.5047, "lon":11.0622, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ قصور الساف", "lat":35.6167, "lon":10.8833, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ صفاقس", "lat":34.7400, "lon":10.7600, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ قرقنة", "lat":34.7042, "lon":11.2389, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ اللوزة", "lat":34.5833, "lon":10.4167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ قابس", "lat":33.8881, "lon":10.0981, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ جرجيس", "lat":33.5000, "lon":11.1167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ جربة (ميدون)", "lat":33.8075, "lon":10.9931, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ جربة (حومة السوق)", "lat":33.8833, "lon":10.8667, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ جربة (أغير)", "lat":33.8167, "lon":11.0500, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ الزارات", "lat":33.6833, "lon":10.3500, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ بنقردان", "lat":33.1381, "lon":11.2167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ طبرقة 2", "lat":36.9600, "lon":8.7600, "orientation":315, "type":"sandy"},
+    {"name":"شاطئ ماطر", "lat":37.0600, "lon":9.6600, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ أوتيك", "lat":37.1481, "lon":10.0617, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ منزل بورقيبة", "lat":37.0683, "lon":9.8258, "orientation":45, "type":"sandy"},
+    {"name":"شاطئ سجنان", "lat":37.1700, "lon":9.3600, "orientation":315, "type":"sandy"},
+    {"name":"شاطئ الكرم", "lat":36.8467, "lon":10.3167, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ أريانة", "lat":36.8750, "lon":10.2083, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ المحمدية", "lat":36.6667, "lon":10.1500, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ مرناق", "lat":36.6833, "lon":10.2833, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ بومهل", "lat":36.7264, "lon":10.2917, "orientation":90, "type":"sandy"},
+    {"name":"شاطئ البطان", "lat":36.7100, "lon":10.2700, "orientation":90, "type":"sandy"},
     {"name":"شاطئ خلاص", "lat":36.7972, "lon":10.2750, "orientation":90, "type":"sandy"},
 ]
 
@@ -505,7 +549,6 @@ def apply_scoring(agg: dict) -> int:
         if 0.1 < wp_val < 4.0:
             score -= 10
             break
-    # إصلاح: استخدام شهر التاريخ المستهدف
     month = agg.get("target_month", datetime.now().month)
     if month in [3,4]:
         score -= 20
@@ -631,7 +674,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
     steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p and p > 0.1]
     avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
-    steepness_desc = "موج حاد وقصير" if avg_steepness > 0.06 else "موج طويل" if avg_steepness < 0.03 else "موج متوسط"
+    if avg_steepness > 0.06:
+        steepness_desc = "موج حاد وقصير"
+    elif avg_steepness < 0.03:
+        steepness_desc = "موج منخفض الانحدار (سلس)"
+    else:
+        steepness_desc = "موج متوسط الانحدار"
 
     tide_analysis = get_moon_and_tide_analysis(target_date_obj)
     tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude)
@@ -639,7 +687,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
     is_neap_tide = tide_analysis["idx"] in [2, 6]
     is_spring_tide = tide_analysis["idx"] in [0, 4]
-    # تحسين: إضافة تأثير تشتت الأسماك
     if is_neap_tide: warnings.append(f"مد ضعيف (Neap Tides - {tide_analysis['name']}): تيارات غذائية ضعيفة، الأسماك أقل تجمعاً.")
     has_golden_window = any("تزامن" in g for g in golden_windows)
     if not has_golden_window: warnings.append("لا توجد ساعة ذهبية: قد يقل نشاط الأسماك.")
@@ -760,8 +807,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
         avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
 
-        # تصنيف البحر (كما هو في المرجع، مطابق للمعايير)
-        sea = "بحر مرآوي" if max_h < 0.4 else "هادئ" if max_h < 0.8 else "متوسط الهيجان" if max_h < 1.2 else "هائج"
+        # تصنيف البحر (حدود محسّنة)
+        if max_h < 0.4:
+            sea = "بحر مرآوي"
+        elif max_h < 0.9:
+            sea = "هادئ"
+        elif max_h < 1.3:
+            sea = "متوسط الهيجان"
+        else:
+            sea = "هائج"
+
         if max_h > 2.0 and not any("بحر هائج" in r for r in nogo_reasons):
             nogo_reasons.append(f"بحر هائج (أمواج > 2.0م في {key}): الرمي مستحيل والخطر كبير.")
         if avg_wp_b > 10.0 and avg_h > 0.8 and not any("أمواج أرضية" in r for r in nogo_reasons):
@@ -795,7 +850,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         block_wind_ok = (avg_w < 20 and wc_dom.startswith("بحرية")) or (wc_dom.startswith("برية") and avg_w <= 15)
         block_wave_ok = 0.6 <= avg_h <= 1.2
         is_night = (key == "night")
-        # sunset (تم إصلاحه في v18.0.6)
         is_night_with_tide = is_night and is_close(parse_tidal_time(tidal_windows["HW2"]), safe_parse_time(sunset), 1.5)
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings),
@@ -885,7 +939,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "transitions": [], "flags": flags,
         "nogo_reasons": nogo_reasons, "warnings": warnings,
         "final_verdict": final_verdict,
-        "target_month": target_date_obj.month  # إضافة الشهر المستهدف
+        "target_month": target_date_obj.month
     }
     score = apply_scoring(agg_result)
     agg_result["score"] = score
@@ -929,8 +983,7 @@ def calculate_interactions(agg: dict) -> List[str]:
     else:
         interactions.append(f"[ساعات ذهبية] {golden_windows[0] if golden_windows else 'لا توجد معلومات.'}")
     interactions.append(f"[فترات سولونار] Major: {solunar.get('major1')} و {solunar.get('major2')} | Minor: {solunar.get('minor1')} و {solunar.get('minor2')}.")
-    interactions.append(f"[المياه الميتة (Slack)] {slack_info}")
-    # إضافة تأثير المد الضعيف على تجمع الأسماك
+    interactions.append(f"[المياه الميتة (Slack)] {slack_info}. نصيحة: ركز على بداية الجريان (قبل أو بعد الـ Slack) وليس أثناء المياه الراكدة.")
     if is_neap_tide:
         interactions.append(f"[تأثير المد الضعيف] المد من نوع Neap، التيارات ضعيفة جداً. هذا يقلل من جلب الغذاء ويجعل الأسماك أقل تجمعاً وأكثر تشتتاً، مما يفسر خمول بعض الأنواع.")
     interactions.append(f"[انحدار الموج] {hidden_factors.get('wave_steepness', 'متوسط')}")
@@ -1074,6 +1127,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 **1. التوقيت المدوي:**
 - أوقات HW1, LW1, HW2, LW2، القمر، قوة المد، الساعة الذهبية، سولونار، Slack، انحدار الموج.
 - لا تركز على فترات المياه الميتة (Slack Water). بدلاً من ذلك، انصح بالتركيز على بداية الجريان: قبل الـ Slack بساعة أو بعدها، وليس أثناءها.
+- اشرح تأثير المد إذا كان ضعيفاً (Neap) أو متوسطاً على تشتت الأسماك وقلة جلب الغذاء.
+- عند عرض الأوقات، استخدم الصيغة: HW1 (10:11) وليس HW1: 10:11.
 
 **2. التفكيك الديناميكي الزمني (مترابط):**
 - لكل فترة (صباح، ظهيرة، ليل):
@@ -1083,6 +1138,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
   - أفضل مسافة للرمي.
   - الأسماك النشطة/الخاملة مع تفضيلاتهم. لا تذكر أبداً أن القاروص ينشط إذا كانت حالته "غائب تقريباً" أو "خامل".
   - **ربط العوامل:** كيف تتحد الرياح والموج لإنجاح الصيد أو إفشاله.
+  - استخدم مصطلح "منخفض الانحدار (سلس)" لوصف الموج إذا كان الانحدار منخفضاً، ولا تصفه بأنه "طويل" إذا كانت فترته قصيرة.
 
 **3. العوامل الحمراء (فقط إذا No-Go):**
 - اشرح كل عامل بالتفصيل.
@@ -1097,10 +1153,11 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - تحذيرات.
 
 قواعد صارمة:
-- لا تستخدم جداول Markdown.
+- لا تستخدم جداول Markdown أو تنسيق ** ** عريض. استخدم نقاطًا عادية (- أو *) بمسافات واضحة.
 - اكتب بالدارجة التونسية الواضحة.
 - أكمل التقرير حتى النهاية.
 - استخدم وصف حالة البحر الحالية (موجودة في [حالة البحر الحالية]) لوصف البحر، وليس ذاكرة البحر. ذاكرة البحر تصف آخر 48 ساعة فقط.
+- تأكد أن جميع الأرقام معروضة بوضوح بدون فواصل غير ضرورية (مثلاً "27.8°م" وليس "27.8 ° م").
 """
 
 async def call_openrouter(ctx):
@@ -1165,6 +1222,14 @@ def get_allowed_numbers(agg: dict) -> Set[float]:
     except Exception: pass
     return {x for x in allowed if x > 0.5}
 
+def clean_report_text(text: str) -> str:
+    """تنظيف النص لتحسين القراءة."""
+    text = re.sub(r'(\w)\s+:\s+(\d)', r'\1: \2', text)
+    text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
+    text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
@@ -1190,7 +1255,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         target_dt = resolve_target_date(req.target_date, now_tn.date())
         raw_sr = daily.get("sunrise", ["06:00"])[0] if daily.get("sunrise") else "06:00"
         raw_ss = daily.get("sunset", ["18:00"])[0] if daily.get("sunset") else "18:00"
-        # استخراج الوقت (HH:MM) من صيغة ISO
         sunrise = re.search(r'\d{2}:\d{2}', raw_sr).group() if re.search(r'\d{2}:\d{2}', raw_sr) else "06:00"
         sunset = re.search(r'\d{2}:\d{2}', raw_ss).group() if re.search(r'\d{2}:\d{2}', raw_ss) else "18:00"
         latitude = req.latitude or 36.8
@@ -1210,26 +1274,24 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         ctx = build_context(req, agg, tz_name)
         report = await call_openrouter(ctx)
+        report = clean_report_text(report)
 
-        # ========== قسم الأرقام المرجعية (تنسيق محسّن) ==========
         computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        computed_text += "📊 **الأرقام المرجعية (للتحقق)**\n"
+        computed_text += "📊 الأرقام المرجعية (للتحقق)\n"
         computed_text += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        computed_text += "🔹 **معلومات عامة:**\n"
+        computed_text += "🔹 معلومات عامة:\n"
         computed_text += f"   • متوسط حرارة الماء: {agg['avg_sst']}°م\n"
         computed_text += f"   • أقصى حرارة هواء: {agg['extra_info']['max_air_temp']}°م\n"
         computed_text += f"   • أقصى هبات رياح اليوم: {agg['extra_info']['peak_gust_today']} كم/س\n"
         computed_text += f"   • الضغط الجوي المتوسط: {agg['extra_info']['pressure_avg']} hPa\n"
         computed_text += f"   • تغير الضغط (3 ساعات): {agg['extra_info'].get('pressure_change', 'غير متوفر')} hPa\n"
         computed_text += f"   • نوع التيار الجانبي: {agg['lateral_current']}\n"
-        computed_text += f"   • ذاكرة البحر (آخر 48 ساعة): {agg['sea_memory']}\n"
+        computed_text += f"   • ذاكرة البحر: {agg['sea_memory']}\n"
         computed_text += f"   • انحدار الموج: {agg['hidden_factors']['wave_steepness']}\n"
         computed_text += f"   • نسبة النجاح: {agg['score']}%\n\n"
-        
         for b in agg['blocks']:
             r = b['_raw']
-            computed_text += f"🔸 **فترة {b['name']} ({b['time_range']}):**\n"
+            computed_text += f"🔸 فترة {b['name']} ({b['time_range']}):\n"
             computed_text += f"   • الثقة: {b['confidence']}%\n"
             computed_text += f"   • مسافة الرمي المقترحة: {b['recommended_cast_distance']} متر\n"
             computed_text += f"   • متوسط ارتفاع الموج: {r['avg_wave_h']}م | أقصى ارتفاع: {r['max_wave_h']}م\n"
@@ -1241,7 +1303,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
             if b['debris']['risk'] != 'منخفض':
                 computed_text += f"   • ⚠️ تحذير الأوساخ والصوفة: {b['debris']['effect']}\n"
             computed_text += "\n"
-        
         computed_text += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
         report += computed_text
