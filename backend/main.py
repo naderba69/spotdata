@@ -1,6 +1,6 @@
 """
-Surfcasting Analytics API – v18.0.30 (Free Gemini 1.5 Flash, Production Ready)
-- استخدام Google Gemini 1.5 Flash المجاني مباشرة عبر Google AI Studio API.
+Surfcasting Analytics API – v18.0.31 (Free Gemini 2.5 Flash, Production Ready)
+- استخدام Google Gemini 2.5 Flash المجاني عبر Google AI Studio API.
 - معالجة تلقائية للخطأ 429 (Rate Limit) عن طريق الانتظار التدريجي.
 - جميع تحسينات التنسيق: فترات الجريان الثلاثية، الحياء والمات، إصلاح الكسر، فواصل عربية.
 - فقرة "فترات الحركة مقابل المياه الميتة" تُنشأ تلقائياً من الكود.
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Surfcasting Analytics", version="18.0.30", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="18.0.31", lifespan=lifespan)
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -46,7 +46,7 @@ else:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY مفقود")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
@@ -74,7 +74,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.30"}
+    return {"status": "ok", "version": "18.0.31"}
 
 # ==================== دوال مساعدة ====================
 async def post_with_retry(url, json_data, headers, max_retries=5, is_gemini=False):
