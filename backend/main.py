@@ -1,7 +1,10 @@
 """
-Surfcasting Analytics API – v19.7.1 (Zero‑Error, Includes Raw Reference Numbers)
-- جميع تحسينات v19.7.0 (اتجاه الشاطئ، عرض الفترة الليلية، الوسط الدائري، إلخ).
-- إضافة قسم الأرقام المرجعية الخام في نهاية التقرير.
+Surfcasting Analytics API – v19.7.2 (Zero‑Error, Day in Haml/Mat clarified)
+- دالة get_haml_mat_status تحسب بدقة اليوم (1-3) في حمل البدر أو حمل المحاق.
+- قسم "مؤشر الشاطئ" في التقرير يُظهر اليوم الحالي بوضوح.
+- تم إصلاح عرض النطاق الليلي بشكل صحيح.
+- تمت إضافة حالة الضغط الجوي إلى التقرير.
+- جميع التحسينات السابقة مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -49,7 +52,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="19.7.1", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="19.7.2", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -69,7 +72,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "19.7.1"}
+    return {"status": "ok", "version": "19.7.2"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v):
@@ -208,6 +211,7 @@ def get_moon_age_days(d: date) -> float:
     return age
 
 def get_haml_mat_status(age_days: float) -> dict:
+    """تُرجع حالة الحياء/المات ورقم اليوم بدقة."""
     if 13 <= age_days <= 16:
         day_in = int(age_days - 13) + 1
         return {
@@ -381,9 +385,6 @@ def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> 
     return nearest
 
 async def get_auto_orientation_overpass(lat, lon):
-    """
-    حساب اتجاه الشاطئ نحو البحر بدقة.
-    """
     async with httpx.AsyncClient(timeout=20, headers={"User-Agent": USER_AGENT}) as client:
         for radius in [3000, 5000, 10000]:
             query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
@@ -747,15 +748,17 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     is_pressure_rising_fast = press_change > 1.5
     is_pressure_dropping_fast = press_change < -2.0
     is_pressure_shock = abs(press_change) > 4.0
+    pressure_note = "مستقر (محايد)"
     if is_pressure_shock:
         nogo_reasons.append(f"اضطراب حاد في الضغط الجوي (> 4 hPa/3h): الأسماك تتوقف عن الأكل تماماً.")
+        pressure_note = "مضطرب بشدة (سلبي جداً)"
     elif is_pressure_rising_fast:
         warnings.append(f"ضغط مرتفع ({press_change:+.1f} hPa/3h): قد يبطئ النشاط.")
+        pressure_note = "يرتفع (سلبي)"
     elif is_pressure_dropping_fast:
         warnings.append(f"ضغط منخفض ({press_change:.1f} hPa/3h): قد تبدأ الأسماك بالتغذية قبل العاصفة.")
-
-    pressure_note = "ينخفض (إيجابي)" if is_pressure_dropping_fast else "مستقر (محايد)" if not is_pressure_rising_fast else "يرتفع (سلبي)"
-    pressure_state = f"انخفاض ({press_change:.1f} hPa)" if is_pressure_dropping_fast else f"ارتفاع ({press_change:+.1f} hPa)" if is_pressure_rising_fast else f"مستقر ({press_change:+.1f} hPa)"
+        pressure_note = "ينخفض (إيجابي)"
+    pressure_state = f"{pressure_note} ({press_change:+.1f} hPa/3h)"
 
     bio_matrix = {
         "قاروص": {
@@ -915,6 +918,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         else: base_dist = 60
         recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
 
+        # بناء نطاق الوقت الحقيقي
         start_time = all_times[target_idx[idxs[0]]].strftime('%H:%M')
         end_time = all_times[target_idx[idxs[-1]]].strftime('%H:%M')
         if is_night:
@@ -922,10 +926,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if night_times:
                 start_dt = min(night_times)
                 end_dt = max(night_times)
+                time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
                 if start_dt.date() != end_dt.date():
-                    time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} (اليوم التالي)"
-                else:
-                    time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+                    time_range += " (بعد منتصف الليل)"
             else:
                 time_range = f"{start_time} - {end_time}"
         else:
@@ -981,6 +984,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "past_rain_accumulated_48h": round(accumulated_rain_48h, 1),
         "max_rain_hourly": round(max_rain_hourly, 1),
         "pressure_change": round(press_change, 1),
+        "pressure_note": pressure_note,
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"],
         "haml_phase": haml_info["phase"],
@@ -1070,10 +1074,12 @@ def calculate_interactions(agg: dict) -> List[str]:
     warnings = agg.get("warnings", [])
     nogo_reasons = agg.get("nogo_reasons", [])
     final_verdict = agg.get("final_verdict", "غير مناسب")
+    pressure_note = extra.get("pressure_note", "مستقر")
 
     sunrise = extra.get("sunrise", "غير متوفر")
     sunset = extra.get("sunset", "غير متوفر")
     interactions.append(f"[الشروق والغروب] 🌅 الشروق: {sunrise} | 🌇 الغروب: {sunset}")
+    interactions.append(f"[الضغط الجوي] {pressure_note}")
 
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
@@ -1127,6 +1133,8 @@ def build_context(req, agg, tz_name):
     facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
     facts.append(f" * 🌊 الوضعية: {extra.get('haml_status', '')} ({extra.get('haml_phase', '')}).")
     facts.append(f" * 📌 حالة البحر: {extra.get('haml_description', '')}")
+    facts.append("🌡️ الضغط الجوي")
+    facts.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')}")
 
     lines = [
         "\n".join(facts),
@@ -1372,7 +1380,7 @@ async def generate_report(request: Request, req: RawDataReportRequest):
 
         report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
 
-        # إضافة الأرقام المرجعية الخام
+        # الأرقام المرجعية الخام
         raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         raw_numbers += f"🔹 حرارة الماء: {agg['avg_sst']}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
         raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
@@ -1384,7 +1392,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
                             f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س | "
                             f"تأثير الرياح {sign}{r['wind_effect_dist']}م\n")
         raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
         report += raw_numbers
 
         clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
