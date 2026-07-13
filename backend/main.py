@@ -1,8 +1,7 @@
 """
-Surfcasting Analytics API – v19.7.0 (Zero‑Error, Seaward Direction Fixed)
-- تم إصلاح دالة get_auto_orientation_overpass لضمان حساب الاتجاه نحو البحر بدقة.
-- تم تحسين عرض نطاق الفترة الليلية ليكون دقيقاً (18:00 - 04:00).
-- جميع التحسينات السابقة مضمنة.
+Surfcasting Analytics API – v19.7.1 (Zero‑Error, Includes Raw Reference Numbers)
+- جميع تحسينات v19.7.0 (اتجاه الشاطئ، عرض الفترة الليلية، الوسط الدائري، إلخ).
+- إضافة قسم الأرقام المرجعية الخام في نهاية التقرير.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -50,7 +49,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="19.7.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="19.7.1", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -70,7 +69,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "19.7.0"}
+    return {"status": "ok", "version": "19.7.1"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v):
@@ -147,7 +146,6 @@ def deg_to_compass(deg):
     return arr[val]
 
 def circular_mean(angles_deg: list) -> float:
-    """Circular mean for directional data (angles in degrees)."""
     if not angles_deg:
         return 0.0
     valid = [a for a in angles_deg if a != 0.0]
@@ -368,7 +366,7 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
     {"name":"شاطئ بنزرت", "lat":37.2744, "lon":9.8739, "orientation":90, "type":"sandy"},
-    # ... (بقية الشواطئ) ...
+    # ... (بقية الشواطئ كاملة) ...
     {"name":"شاطئ خلاص", "lat":36.7972, "lon":10.2750, "orientation":90, "type":"sandy"},
 ]
 
@@ -385,10 +383,6 @@ def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> 
 async def get_auto_orientation_overpass(lat, lon):
     """
     حساب اتجاه الشاطئ نحو البحر بدقة.
-    - نبحث عن أقرب خط ساحلي.
-    - نحدد أقرب نقطة على الساحل للمستخدم.
-    - نحسب الاتجاه العمودي على الساحل (احتمالان: نحو البحر أو نحو البر).
-    - نختار الاتجاه الذي يشير نحو البحر بناءً على معرفتنا أن المستخدم على البر.
     """
     async with httpx.AsyncClient(timeout=20, headers={"User-Agent": USER_AGENT}) as client:
         for radius in [3000, 5000, 10000]:
@@ -412,15 +406,11 @@ async def get_auto_orientation_overpass(lat, lon):
                         if prev_i != next_i:
                             best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
                 if not best_tangent or not best_point: continue
-                # زاويتان عموديتان على الساحل
                 perp1 = (best_tangent + 90) % 360
                 perp2 = (best_tangent - 90) % 360
-                # الاتجاه من النقطة إلى المستخدم
                 to_user = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-                # الاتجاه نحو البحر هو الأبعد عن اتجاه المستخدم (لأن المستخدم على البر)
                 diff1 = angle_diff(perp1, to_user)
                 diff2 = angle_diff(perp2, to_user)
-                # البحر هو الاتجاه الأبعد (الفرق أكبر)
                 seaward = perp1 if diff1 > diff2 else perp2
                 return int(round(seaward))
             except Exception as e:
@@ -925,16 +915,13 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         else: base_dist = 60
         recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
 
-        # تحسين عرض الوقت للفترات الليلية
         start_time = all_times[target_idx[idxs[0]]].strftime('%H:%M')
         end_time = all_times[target_idx[idxs[-1]]].strftime('%H:%M')
         if is_night:
-            # إذا كانت الفترة الليلية تتجزأ (بسبب منتصف الليل)، نعرض النطاق الصحيح
             night_times = [all_times[target_idx[i]] for i in idxs]
             if night_times:
                 start_dt = min(night_times)
                 end_dt = max(night_times)
-                # إذا كان اليوم يمتد ليومين مختلفين، نعرض نطاقاً متصلاً
                 if start_dt.date() != end_dt.date():
                     time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} (اليوم التالي)"
                 else:
@@ -1384,6 +1371,21 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
 
         report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
+
+        # إضافة الأرقام المرجعية الخام
+        raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        raw_numbers += f"🔹 حرارة الماء: {agg['avg_sst']}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
+        raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
+        for b in agg['blocks']:
+            r = b['_raw']
+            sign = '+' if r['wind_effect_dist'] >= 0 else ''
+            raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
+                            f"ثقة {b['confidence']}% | مسافة {b['recommended_cast_distance']}م | "
+                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س | "
+                            f"تأثير الرياح {sign}{r['wind_effect_dist']}م\n")
+        raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        report += raw_numbers
 
         clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
         meta = {
