@@ -50,7 +50,6 @@
       <button id="tabScan" class="btn-secondary rounded-lg">🔍 مسح الشواطئ</button>
     </div>
 
-    <!-- لوحة التقرير الفردي -->
     <div id="panelSingle">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
         <div class="lg:col-span-2"><div id="map"></div></div>
@@ -94,7 +93,7 @@
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
         <p class="text-neon text-lg font-semibold">جاري جلب البيانات وتحليلها...</p>
-        <p class="text-gray-400 text-sm mt-2">يتم الاتصال بـ Open-Meteo من جهازك ثم إرسالها للخادم للتحليل</p>
+        <p class="text-gray-400 text-sm mt-2">قد يستغرق حتى 90 ثانية. لا تغلق الصفحة.</p>
       </div>
     </div>
   </div>
@@ -104,6 +103,9 @@
     const API_BASE = 'https://spotdata.onrender.com';
     const MARINE_API = 'https://marine-api.open-meteo.com/v1/marine';
     const WEATHER_API = 'https://api.open-meteo.com/v1/forecast';
+
+    // منع الضغط المتكرر
+    let isSubmitting = false;
 
     const tabSingle = document.getElementById('tabSingle');
     const tabScan = document.getElementById('tabScan');
@@ -241,6 +243,12 @@
     const reportContent=document.getElementById('reportContent');
 
     submitBtn.addEventListener('click', async () => {
+      // منع الضغط المتكرر
+      if (isSubmitting) {
+        alert('⏳ يرجى الانتظار... جاري معالجة طلب سابق.');
+        return;
+      }
+
       const lat = parseFloat(document.getElementById('latitude').value);
       const lng = parseFloat(document.getElementById('longitude').value);
       const orient = parseInt(document.getElementById('orientation').value);
@@ -250,6 +258,8 @@
         alert('تأكد من إدخال الإحداثيات والاتجاه بشكل صحيح.');
         return;
       }
+
+      isSubmitting = true;
       loadingOverlay.classList.remove('hidden');
       reportCard.classList.add('hidden');
       submitBtn.disabled = true;
@@ -270,7 +280,7 @@
         };
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 دقيقة كافية لـ retry + fallback
+        const timeoutId = setTimeout(() => controller.abort(), 120000);
         const resp = await fetch(`${API_BASE}/generate-report`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -281,7 +291,7 @@
 
         const data = await resp.json();
 
-        // عرض التقرير سواء كان آلياً أو يدوياً (الخادم يضمن وجود report دائماً)
+        // عرض التقرير سواء كان آلياً أو يدوياً
         if (data.report) {
           reportContent.textContent = data.report;
           reportCard.classList.remove('hidden');
@@ -291,14 +301,17 @@
         }
       } catch (e) {
         if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة الانتظار (دقيقتان). حاول مجدداً.');
+          alert('❌ انتهت مهلة الانتظار. حاول مجدداً.');
         } else {
           alert('❌ فشل جلب التقرير:\n' + e.message);
         }
       } finally {
-        // إخفاء شاشة التحميل في جميع الحالات
+        // إعادة تفعيل الزر بعد ثانية واحدة لمنع الضغط الفوري
+        setTimeout(() => {
+          isSubmitting = false;
+          submitBtn.disabled = false;
+        }, 1000);
         loadingOverlay.classList.add('hidden');
-        submitBtn.disabled = false;
       }
     });
 
