@@ -38,7 +38,6 @@
     .spinner { width: 60px; height: 60px; border: 6px solid rgba(0,229,255,0.2); border-top: 6px solid #00e5ff; border-radius: 50%; animation: spin 1s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .direction-display { background-color: #0f1a2e; border: 1px solid #2a3a5a; color: #00e5ff; padding: 0.25rem 0.75rem; border-radius: 0.5rem; font-weight: bold; text-align: center; min-width: 130px; }
-    .reason-text { max-width: 200px; white-space: normal; word-break: break-word; font-size: 0.8rem; color: #a0b3d9; }
   </style>
 </head>
 <body class="text-gray-200 p-4 md:p-6">
@@ -77,7 +76,7 @@
             <input type="hidden" id="targetDate" value="today">
           </div>
           <button id="submitBtn" class="btn-primary w-full mt-4">📊 توليد التقرير البحري</button>
-          <p class="text-xs text-gray-500 text-center mt-2">يتم جلب البيانات مباشرة من Open-Meteo عبر متصفحك</p>
+          <p class="text-xs text-gray-500 text-center mt-2">سيتم الانتظار حتى 3 دقائق. لا تغلق الصفحة.</p>
         </div>
       </div>
       <div id="reportCard" class="card hidden">
@@ -93,7 +92,8 @@
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
         <p class="text-neon text-lg font-semibold">جاري جلب البيانات وتحليلها...</p>
-        <p class="text-gray-400 text-sm mt-2">قد يستغرق حتى 90 ثانية. لا تغلق الصفحة.</p>
+        <p class="text-gray-400 text-sm mt-2" id="timerDisplay">الوقت المنقضي: 0 ثانية (الحد الأقصى 180)</p>
+        <p class="text-gray-500 text-xs mt-4">لا تغلق الصفحة أو تضغط على زر التحديث</p>
       </div>
     </div>
   </div>
@@ -104,8 +104,8 @@
     const MARINE_API = 'https://marine-api.open-meteo.com/v1/marine';
     const WEATHER_API = 'https://api.open-meteo.com/v1/forecast';
 
-    // منع الضغط المتكرر
     let isSubmitting = false;
+    let timerInterval = null;
 
     const tabSingle = document.getElementById('tabSingle');
     const tabScan = document.getElementById('tabScan');
@@ -241,9 +241,38 @@
     const loadingOverlay=document.getElementById('loadingOverlay');
     const reportCard=document.getElementById('reportCard');
     const reportContent=document.getElementById('reportContent');
+    const timerDisplay=document.getElementById('timerDisplay');
+
+    function startTimer() {
+      let elapsed = 0;
+      if (timerInterval) clearInterval(timerInterval);
+      timerDisplay.textContent = `الوقت المنقضي: 0 ثانية (الحد الأقصى 180)`;
+      timerInterval = setInterval(() => {
+        elapsed++;
+        timerDisplay.textContent = `الوقت المنقضي: ${elapsed} ثانية (الحد الأقصى 180)`;
+        if (elapsed >= 180) {
+          clearInterval(timerInterval);
+          timerDisplay.textContent = 'انتهت المهلة القصوى.';
+        }
+      }, 1000);
+    }
+
+    function stopTimer() {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    }
+
+    // منع التحديث غير المقصود
+    window.addEventListener('beforeunload', (e) => {
+      if (isSubmitting) {
+        e.preventDefault();
+        e.returnValue = 'أنت في انتظار التقرير. هل أنت متأكد من المغادرة؟';
+      }
+    });
 
     submitBtn.addEventListener('click', async () => {
-      // منع الضغط المتكرر
       if (isSubmitting) {
         alert('⏳ يرجى الانتظار... جاري معالجة طلب سابق.');
         return;
@@ -263,6 +292,7 @@
       loadingOverlay.classList.remove('hidden');
       reportCard.classList.add('hidden');
       submitBtn.disabled = true;
+      startTimer();
 
       try {
         const { start, end } = getDateRange(targetDate);
@@ -280,7 +310,7 @@
         };
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 120000);
+        const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 دقائق
         const resp = await fetch(`${API_BASE}/generate-report`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -291,7 +321,6 @@
 
         const data = await resp.json();
 
-        // عرض التقرير سواء كان آلياً أو يدوياً
         if (data.report) {
           reportContent.textContent = data.report;
           reportCard.classList.remove('hidden');
@@ -301,17 +330,17 @@
         }
       } catch (e) {
         if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة الانتظار. حاول مجدداً.');
+          alert('❌ انتهت مهلة الانتظار (3 دقائق). حاول مجدداً.');
         } else {
           alert('❌ فشل جلب التقرير:\n' + e.message);
         }
       } finally {
-        // إعادة تفعيل الزر بعد ثانية واحدة لمنع الضغط الفوري
+        stopTimer();
+        loadingOverlay.classList.add('hidden');
         setTimeout(() => {
           isSubmitting = false;
           submitBtn.disabled = false;
         }, 1000);
-        loadingOverlay.classList.add('hidden');
       }
     });
 
