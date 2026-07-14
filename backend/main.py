@@ -1,9 +1,20 @@
 """
-Surfcasting Analytics API – v20.3.13 (OpenRouter, Zero‑Error)
-- استخدام OpenRouter بدلاً من Gemini المباشر لحل مشكلة Rate Limit.
-- جميع تحسينات v20.3.12 مضمنة (Overpass حصري، أمان، scoring محسّن، CORS، health، ضغط، راحة).
-- يحتفظ بنفس SYSTEM_PROMPT وسياق البيانات المرسلة.
-- جاهز للإنتاج بمجرد تعيين OPENROUTER_API_KEY.
+Surfcasting Analytics API – v20.3.12 (Zero-Error, All Audits Applied)
+- Fix: orientation=0 is valid (north), failure signaled by None.
+- Fix: Overpass global timeout (25s) with per-server timeout 8s.
+- Fix: sleep(1.5) only after first attempt.
+- Fix: Gemini API key in header (x-goog-api-key), not URL.
+- Fix: Gemini retry waits 20/30/40s with jitter.
+- Fix: detect_bottom_type now tries two Overpass servers.
+- Fix: asyncio.gather exception handling and empty data separation.
+- Fix: TimeoutException caught separately in call_gemini.
+- Fix: sea_surface_temperature default=None.
+- Improved: comfort_index formula (more accurate).
+- Improved: pressure_change threshold adjusted (3-6 hPa).
+- Improved: wind_effect_dist negative penalty in scoring.
+- Added: CORS allow_credentials, health check Overpass status.
+- Added: generate_report global timeout (150s).
+- All previous features retained (Overpass exclusive, optimized context, etc.)
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
 from datetime import datetime, timedelta, date
@@ -23,18 +34,15 @@ from slowapi.errors import RateLimitExceeded
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 
-# إخفاء سجلات httpx لمنع تسرب المفتاح
+# Hide httpx logs to prevent API key leakage
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ========== مفاتيح API والروابط ==========
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY مفقود. ضعه في متغيرات البيئة.")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY مفقود")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_RETRY_WAITS = [20, 30, 40]  # seconds for 429/error retries
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.5-flash"
-
-# قائمة خوادم Overpass
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -45,7 +53,6 @@ OVERPASS_SERVERS = [
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 _TIME_RE = re.compile(r'\d{2}:\d{2}')
 
-# ========== نماذج البيانات ==========
 class AutoOrientationRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -67,7 +74,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.13", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.12", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -96,13 +103,13 @@ async def health():
         pass
     return {
         "status": "ok",
-        "version": "20.3.13",
-        "openrouter_configured": bool(OPENROUTER_API_KEY),
+        "version": "20.3.12",
+        "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
     }
 
-# ---------- دوال مساعدة (بدون تغيير عن v20.3.12) ----------
+# ---------- Utility Helpers ----------
 def safe_float(v) -> float:
     try:
         result = float(v)
@@ -369,7 +376,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": extract("weather_code", weather_hourly, w_map, 0.0)
     }
 
-# ---------- قاعدة الشواطئ ----------
+# ---------- Beaches ----------
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -432,7 +439,7 @@ def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> 
             nearest = {"orientation": b["orientation"], "type": b["type"], "distance": round(dist, 0)}
     return nearest
 
-# ---------- Overpass orientation (حصراً) ----------
+# ---------- Overpass orientation (exclusive) ----------
 async def _overpass_orientation_inner(lat, lon):
     async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": USER_AGENT}) as client:
         for radius in [3000, 5000, 10000]:
@@ -515,7 +522,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
                 continue
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ---------- جلب البيانات ----------
+# ---------- Fetch weather & marine ----------
 async def fetch_marine_data_from_openmeteo(client: httpx.AsyncClient, lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {"latitude": lat, "longitude": lon, "hourly": "wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature", "timezone": "Africa/Tunis", "forecast_days": 3}
@@ -538,7 +545,7 @@ async def fetch_weather_data_from_openmeteo(client: httpx.AsyncClient, lat: floa
         logger.error(f"Open-Meteo weather fetch failed: {e}")
         return None
 
-# ---------- أدوات التحليل التكتيكي ----------
+# ---------- Tactical Helpers ----------
 def get_water_clarity(wind_speed, wave_height, is_murky, is_weedy, haml_status, avg_vis_b=10000):
     if avg_vis_b < 200: return "ضباب كثيف (رؤية معدومة)"
     if is_weedy: return "عكر جداً (أعشاب وصوفة)"
@@ -584,7 +591,7 @@ def get_confidence_label(confidence):
     if confidence >= 50: return "مقبولة"
     return "ضعيفة"
 
-# ---------- تحليلات إضافية ----------
+# ---------- Analysis Helpers ----------
 def analyze_weed_risk(sea_memory):
     risk = "منخفض"; advice = ""
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
@@ -696,7 +703,7 @@ def apply_scoring(agg: dict) -> int:
         elif agg.get("warnings"): score = min(score, 95)
     return score
 
-# ---------- التجميع الفيزيائي ----------
+# ---------- Physical Aggregation ----------
 def get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea, lateral_force_ratio, water_clarity, seabass_sst_limit):
     if avg_sst is None: avg_sst = 20.0
     active, inactive = [], []
@@ -1072,7 +1079,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     agg_result["score"] = score
     return agg_result
 
-# ---------- بناء التقرير ----------
+# ---------- Dynamic decomposition ----------
 def format_tidal_flow_periods(tidal_windows: dict) -> dict:
     periods = {}
     for key, time_str in tidal_windows.items():
@@ -1168,84 +1175,125 @@ def build_context(req, agg, tz_name):
     lines = ["\n".join(facts), "", "=== التفاعلات ===", *chain_interactions]
     return "\n".join(lines)
 
-# ---------- SYSTEM PROMPT (مختصر) ----------
-SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب تقريرًا بالدارجة التونسية باستخدام البيانات التالية.
-القرار النهائي ونسبة النجاح موجودان في [الحسم النهائي] و[نسبة النجاح]. لا تغيرهما.
+SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
+القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
+نسبة النجاح في [نسبة النجاح].
 
-استخدم التنسيق التالي بالضبط:
-🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم.
-⏱️ 1. التوقيت المدوي وحركة المياه – المد والجزر، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
-🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة (مضمّن تلقائياً).
-🕒 3. التفكيك الديناميكي الزمني – لكل فترة: الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
-⚖️ 4. ميزان العوامل – العوامل الحمراء (المعوقات) والخضراء (الإيجابيات).
-🏹 5. التكتيك الميداني والسلامة – الرصاص، التوقيت، المسافة.
+استخدم الهيكل التالي مع الأيقونات والمسافات البادئة المحددة:
 
-قواعد مهمة:
-- اكتب بالدارجة التونسية فقط.
-- لا تخترع موانع غير موجودة في البيانات.
-- استخدم الأوقات والنطاقات كما هي في البيانات.
-- لا تذكر المركب ولا تستخدم حروفًا لاتينية.
+🎯 0. الملخص التنفيذي ليوم (التاريخ)
+> نسبة النجاح العامة: (أدخل النسبة)%
+>  * القرار النهائي: (أدخل القرار)
+>  * السبب الرئيسي: (أدخل السبب)
+>  * الطعم المستهدف: (أدخل الطعم)
+> 
+⏱️ 1. التوقيت المدوي وحركة المياه
+🌊 مواقيت المد والجزر
+ * 🔹 المد العالي الأول: الساعة (الوقت)
+ * 🔹 الجزر المنخفض الأول: الساعة (الوقت)
+ ...
+🌅 الشروق والغروب
+ * 🌅 الشروق: (الوقت) | 🌇 الغروب: (الوقت)
+🏖️ مؤشر الشاطئ (أيام الحياء والمات)
+ * 🌊 الوضعية: (أدخل الحالة)
+ * 📌 حالة البحر: (أدخل الوصف)
+🌡️ الضغط الجوي
+ * الوضع: (حالة الضغط)
+⏳ فترات سولونار
+ * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
+ * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
+
+🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة
+(سيتم إنشاؤها تلقائياً)
+
+🕒 3. التفكيك الديناميكي الزمني
+🌅 الفترة الصباحية (النطاق الزمني الصحيح)
+ * 📊 حالة البحر والثقة: ...
+ * 💨 الرياح والرمي: ...
+ * 🌊 الموج والمسافة: ...
+ * ⛔ موانع: (اكتب الموانع الموجودة في البيانات فقط، لا تضف موانع من عندك)
+ * ⚠️ تحذيرات: ...
+ * 🔄 ربط العوامل الميدانية: ...
+☀️ فترة الظهيرة (النطاق الزمني الصحيح)
+... (نفس الهيكل)
+🌆 فترة الغسق (النطاق الزمني الصحيح)
+... (نفس الهيكل)
+🌙 فترة السحر (النطاق الزمني الصحيح)
+... (نفس الهيكل)
+
+⚖️ 4. ميزان العوامل الميدانية
+🔴 العوامل الحمراء (المعوقات)
+ * ...
+🟢 العوامل الإيجابية (الفرص)
+ * ...
+
+🏹 5. التكتيك الميداني والسلامة
+ * 🛠️ ثقل الرصاص: ...
+ * ⏱️ أفضل توقيت: ...
+ * 🎯 المسافة والاتجاه: ...
+
+قواعد:
+- لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
+- استخدم المسافات البادئة الموضحة ( ` * ` قبل كل نقطة).
+- لا تذكر المركب. لا تستخدم حروفًا لاتينية.
+- اكتب بالدارجة التونسية.
+- لا تكتب القسم 6 (الأرقام المرجعية) فأي نص خاص به سيتم تجاهله.
+- استخدم النطاق الزمني الموجود في البيانات بالضبط لكل فترة، ولا تستبدله بقيم ثابتة.
+- ⛔ في قسم الموانع، لا تضف أي مانع غير موجود في البيانات. لا تخترع موانع مثل 'رياح بحرية مباشرة تؤثر على الرمي' من عندك.
 """
 
-# ---------- استدعاء OpenRouter ----------
-async def call_openrouter(ctx: str) -> str:
+async def call_gemini(ctx):
     MAX_CONTEXT_CHARS = 30000
     if len(ctx) > MAX_CONTEXT_CHARS:
         ctx = ctx[:MAX_CONTEXT_CHARS]
         logger.warning(f"Context truncated to {MAX_CONTEXT_CHARS} chars")
 
+    url = GEMINI_URL
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://spotdata.onrender.com",
-        "X-Title": "Surfcasting Analytics"
+        "x-goog-api-key": GEMINI_API_KEY
     }
     payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": ctx}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 15000
+        "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 15000}
     }
-
-    RETRY_WAITS = [20, 30, 40]
     max_retries = 3
     timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
-
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(1, max_retries + 1):
             try:
-                r = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+                r = await client.post(url, json=payload, headers=headers)
                 if r.status_code == 429:
-                    wait = RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)] + random.uniform(0, 5)
-                    logger.warning(f"OpenRouter rate limit, retrying in {wait:.1f}s...")
+                    wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)] + random.uniform(0, 5)
+                    logger.warning(f"Gemini rate limit, retrying in {wait:.1f}s...")
                     await asyncio.sleep(wait)
                     continue
                 r.raise_for_status()
                 data = r.json()
-                return data["choices"][0]["message"]["content"]
+                return data["candidates"][0]["content"]["parts"][0]["text"]
             except httpx.TimeoutException as e:
-                logger.warning(f"OpenRouter timeout (attempt {attempt}/{max_retries}): {e}")
+                logger.warning(f"Gemini timeout (attempt {attempt}/{max_retries}): {e}")
                 if attempt == max_retries:
-                    raise HTTPException(504, "انتهت مهلة الاتصال بـ OpenRouter")
-                await asyncio.sleep(RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)])
+                    raise HTTPException(504, "انتهت مهلة الاتصال بـ Gemini")
+                wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
+                await asyncio.sleep(wait)
             except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-                logger.error(f"OpenRouter call failed: {e}")
+                logger.error(f"Gemini call failed: {e}")
                 if isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in [429, 500, 502, 503]:
                     raise
                 if attempt == max_retries:
-                    raise Exception("فشل الاتصال بـ OpenRouter بعد عدة محاولات")
-                await asyncio.sleep(RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)])
+                    raise Exception("فشل الاتصال بـ Gemini بعد عدة محاولات")
+                wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
+                await asyncio.sleep(wait)
             except Exception as e:
-                logger.error(f"OpenRouter unexpected error: {e}")
+                logger.error(f"Gemini unexpected error: {e}")
                 if attempt == max_retries:
-                    raise Exception(f"خطأ غير متوقع في الاتصال بـ OpenRouter: {type(e).__name__}")
-                await asyncio.sleep(RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)])
-    raise Exception("فشل الاتصال بـ OpenRouter")
+                    raise Exception(f"خطأ غير متوقع في الاتصال بـ Gemini: {type(e).__name__}")
+                wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
+                await asyncio.sleep(wait)
+    raise Exception("فشل الاتصال بـ Gemini")
 
-# ---------- معالجة النصوص ----------
+# ---------- Text Helpers ----------
 def fix_time_ranges(text: str) -> str:
     pattern = r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})'
     def repl(m):
@@ -1322,9 +1370,9 @@ def fix_broken_number_lines(text: str) -> str:
         i += 1
     return '\n'.join(fixed)
 
-# ========== نقطة نهاية التقرير الرئيسية ==========
+# ---------- Main Report Endpoint with global timeout ----------
 @app.post("/generate-report")
-@limiter.limit("2/minute")   # يمكن خفضها إلى 1/minute حسب الحاجة
+@limiter.limit("2/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
         return await asyncio.wait_for(_generate_report_inner(req), timeout=150.0)
@@ -1395,7 +1443,7 @@ async def _generate_report_inner(req: RawDataReportRequest):
         }
 
     ctx = build_context(req, agg, tz_name)
-    report = await call_openrouter(ctx)
+    report = await call_gemini(ctx)
 
     report = clean_report_text(report)
     report = fix_broken_number_lines(report)
@@ -1410,6 +1458,7 @@ async def _generate_report_inner(req: RawDataReportRequest):
 
     report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
 
+    # الأرقام المرجعية الخام
     raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
     raw_numbers += f"🔹 حرارة الماء: {avg_sst_display}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
