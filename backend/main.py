@@ -1,12 +1,14 @@
 """
-Surfcasting Analytics API – v20.3.10 (Zero‑Error, Overpass Exclusive)
+Surfcasting Analytics API – v20.3.11 (Zero‑Error, Overpass Exclusive, Gemini Rate‑Limit Fix)
 - تحديد الاتجاه حصراً من OpenStreetMap عبر Overpass API.
 - استخدام خوادم Overpass احتياطية (primary + fallbacks) لكل نصف قطر.
 - تأخير 1.5 ثانية بين محاولات كل خادم لتجنب الإغراق.
 - إرجاع خطأ HTTP 502 مع رسالة واضحة عند فشل كل المحاولات.
-- جميع تحسينات v20.3.9 مضمنة (تحسين السياق، الضغط اليومي، إلخ).
+- تخفيض حد الطلبات على /generate-report إلى 2/دقيقة (للاستخدام الشخصي).
+- إضافة عشوائية بسيطة (jitter) في أوقات إعادة المحاولة لـ Gemini.
+- جميع تحسينات v20.3.9 مضمنة.
 """
-import os, math, asyncio, logging, traceback, zoneinfo, re
+import os, math, asyncio, logging, traceback, zoneinfo, re, random
 from datetime import datetime, timedelta, date
 from typing import Optional, List
 from collections import defaultdict
@@ -65,7 +67,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.10", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.11", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -85,7 +87,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "20.3.10"}
+    return {"status": "ok", "version": "20.3.11"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v) -> float:
@@ -1521,8 +1523,9 @@ async def call_gemini(ctx):
             try:
                 r = await client.post(url, json=payload, headers=headers)
                 if r.status_code == 429:
-                    wait = 20 * attempt
-                    logger.warning(f"Gemini rate limit, retrying in {wait}s...")
+                    # إضافة jitter لتجنب تصادم إعادة المحاولة
+                    wait = 20 * attempt + random.uniform(0, 5)
+                    logger.warning(f"Gemini rate limit, retrying in {wait:.1f}s...")
                     await asyncio.sleep(wait)
                     continue
                 r.raise_for_status()
@@ -1621,9 +1624,9 @@ def fix_broken_number_lines(text: str) -> str:
         i += 1
     return '\n'.join(fixed)
 
-# ---------- Main Report Endpoint ----------
+# ---------- Main Report Endpoint (تم تخفيض الحد ليتناسب مع الاستخدام الشخصي) ----------
 @app.post("/generate-report")
-@limiter.limit("10/minute")
+@limiter.limit("2/minute")  # <-- 2 طلبات فقط في الدقيقة للمستخدم الواحد
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
