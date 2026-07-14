@@ -1,13 +1,24 @@
 """
-Surfcasting Analytics API – v18.0.36 (Wind Effect Sign Fix & Offshore/Onshore Logic)
-- تصحيح إشارة تأثير الرياح: الرياح البحرية (المواجهة للشاطئ) تُقلل مسافة الرمي (قيمة سالبة)،
-  والرياح البرية (الخلفية) تزيدها (قيمة موجبة).
-- تعديل SYSTEM_PROMPT ليعكس هذا التصحيح.
-- جميع تحسينات الإصدار السابق (v18.0.34).
+Surfcasting Analytics API – v20.3.9 (Zero‑Error, Optimized Context)
+- SYSTEM_PROMPT: حذف أقسام "إستراتيجية الطعم" و"إرشادات السلامة" لتخفيف حجم السياق.
+- تقليل التفاصيل المرسلة إلى Gemini (التركيز على حالة البحر، الرياح، الموانع والتحذيرات).
+- جميع التحليلات المتقدمة (أسماك، مونتاج، راحة، عكارة، ضغط) محفوظة في الأرقام المرجعية الخام.
+- آلية إعادة محاولة Gemini بحد أقصى 3 محاولات (20/30/40 ثانية).
+- إخفاء مفتاح API من سجلات httpx.
+- إصلاح منطق apply_scoring للرياح البرية (any بدلاً من for/break).
+- إصلاح fix_time_ranges (abs(diff) < 720).
+- إزالة سطر Regex المكرر في fix_broken_time_in_headers.
+- دعم avg_sst = None عند غياب البيانات مع حماية scoring.
+- pressure_state اليومي يُحسب من press_change_day.
+- press_rate لكل فترة يُضاف إلى _raw.
+- period_warnings تُضاف إلى block_data.
+- شرط القاروص يشمل lateral_force_ratio وعدم المرآوي.
+- تحذيرات المرآوي تُضاف مرة واحدة بعد الحلقة.
+- جميع التحسينات السابقة مدمجة.
 """
-import os, math, asyncio, logging, traceback, zoneinfo, json, time, re
+import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List, Tuple, Set
+from typing import Optional, List
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -23,25 +34,8 @@ from slowapi.errors import RateLimitExceeded
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 
-http_client = httpx.AsyncClient(timeout=120.0)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await http_client.aclose()
-
-app = FastAPI(title="Surfcasting Analytics", version="18.0.36", lifespan=lifespan)
-
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-if ALLOWED_ORIGINS == "*":
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-else:
-    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")]
-    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
+# إخفاء مفتاح API من سجلات httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
@@ -50,13 +44,15 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
+_TIME_RE = re.compile(r'\d{2}:\d{2}')
+
 class AutoOrientationRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
 
 class RawDataReportRequest(BaseModel):
     beach_orientation: int = Field(..., ge=0, le=360)
-    beach_type: str = Field(..., pattern="^(sandy|rocky)$")
+    beach_type: Optional[str] = Field(None, pattern="^(sandy|rocky)$")
     target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
     marine_data: Optional[dict] = None
     weather_data: Optional[dict] = None
@@ -67,6 +63,23 @@ class DetectBottomRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+app = FastAPI(title="Surfcasting Analytics", version="20.3.9", lifespan=lifespan)
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+if ALLOWED_ORIGINS == "*":
+    logger.warning("CORS is open to all origins. Restrict in production.")
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+else:
+    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")]
+    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
+
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
@@ -74,54 +87,31 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "18.0.36"}
+    return {"status": "ok", "version": "20.3.9"}
 
-# ==================== دوال مساعدة (كما هي) ====================
-async def post_with_retry(url, json_data, headers, max_retries=5, is_gemini=False):
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = await http_client.post(url, json=json_data, headers=headers)
-            if r.status_code == 429 and is_gemini:
-                wait = 10 * attempt
-                logger.warning(f"Gemini rate limit hit, retrying in {wait}s...")
-                await asyncio.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except (httpx.HTTPStatusError, json.JSONDecodeError, httpx.DecodingError) as e:
-            last_exc = e
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in [429, 500, 502, 503] and attempt < max_retries:
-                wait = 5 * attempt
-                if is_gemini:
-                    wait = 10 * attempt
-                await asyncio.sleep(wait)
-                continue
-            raise
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
-            last_exc = e
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
-    raise last_exc or Exception("فشل الاتصال")
-
-def safe_float(v):
+# ---------- Utility Helpers ----------
+def safe_float(v) -> float:
     try:
-        return 0.0 if math.isnan(float(v)) else float(v)
+        result = float(v)
+        return 0.0 if (math.isnan(result) or math.isinf(result)) else result
     except (TypeError, ValueError):
         return 0.0
 
 def angle_diff(w, b):
+    if w is None or b is None:
+        return 180.0
     d = abs(w - b) % 360
     return 360 - d if d > 180 else d
 
 def signed_angle_diff(w, b):
+    if w is None or b is None:
+        return 0.0
     d = (w - b + 180) % 360 - 180
     return d
 
 def circular_diff(a: float, b: float) -> float:
-    diff = abs(a - b) % 24
+    a, b = a % 24, b % 24
+    diff = abs(a - b)
     return min(diff, 24 - diff)
 
 def is_close(t1: float, t2: float, margin: float = 1.5) -> bool:
@@ -140,10 +130,18 @@ def calc_distance(lat1, lon1, lat2, lon2):
     return math.sqrt(dlat**2 + dlon**2)
 
 def format_time(h: float) -> str:
-    h = h % 24
-    hh = int(h)
-    mm = int((h - hh) * 60)
-    return f"{hh:02d}:{mm:02d}"
+    try:
+        if math.isnan(h) or math.isinf(h):
+            return "00:00"
+        h = h % 24
+        hh = int(h)
+        mm = int(round((h - hh) * 60))
+        if mm >= 60:
+            hh = (hh + 1) % 24
+            mm = 0
+        return f"{hh % 24:02d}:{mm:02d}"
+    except (TypeError, ValueError):
+        return "00:00"
 
 def wind_class_detailed(diff):
     if diff < 30: return "بحرية مباشرة"
@@ -155,7 +153,8 @@ def wind_class_detailed(diff):
     return "برية مباشرة"
 
 def weather_desc(code):
-    if code <= 1: return "صافية"
+    if code == 0: return "صافية تماماً"
+    if code == 1: return "صافية مع غيوم خفيفة"
     if code == 2: return "غائمة جزئياً"
     if code == 3: return "غائمة"
     if code <= 48: return "ضباب"
@@ -166,22 +165,41 @@ def weather_desc(code):
     return "غير معروف"
 
 def deg_to_compass(deg):
+    if deg is None:
+        return "غير معروف"
     val = int((deg / 22.5) + 0.5) % 16
     arr = ["شمال","شمال شمال شرق","شمال شرق","شرق شمال شرق","شرق","شرق جنوب شرق","جنوب شرق","جنوب جنوب شرق",
            "جنوب","جنوب جنوب غرب","جنوب غرب","غرب جنوب غرب","غرب","غرب شمال غرب","شمال غرب","شمال شمال غرب"]
     return arr[val]
+
+def circular_mean(angles_deg: list) -> Optional[float]:
+    valid = [a for a in angles_deg if a is not None]
+    if not valid:
+        return None
+    radians_vals = [math.radians(a) for a in valid]
+    sin_sum = sum(math.sin(r) for r in radians_vals)
+    cos_sum = sum(math.cos(r) for r in radians_vals)
+    if abs(sin_sum) < 1e-10 and abs(cos_sum) < 1e-10:
+        return None
+    mean_rad = math.atan2(sin_sum, cos_sum)
+    return (math.degrees(mean_rad) + 360) % 360
 
 def resolve_target_date(txt, real_today):
     if txt == "today": return real_today
     if txt == "tomorrow": return real_today + timedelta(days=1)
     return real_today + timedelta(days=2)
 
-def get_moon_and_tide_analysis(d: date):
+def _julian_day(d: date) -> float:
     y, m, day = d.year, d.month, d.day
-    if m < 3: y -= 1; m += 12
-    a = int(y / 100)
-    b = 2 - a + int(a / 4)
-    jd = 365.25 * (y + 4716) + 30.6001 * (m + 1) + day + b - 1524.5
+    if m < 3:
+        y -= 1
+        m += 12
+    a = y // 100
+    b = 2 - a + a // 4
+    return math.floor(365.25 * (y + 4716)) + math.floor(30.6001 * (m + 1)) + day + b - 1524.5
+
+def get_moon_and_tide_analysis(d: date):
+    jd = _julian_day(d)
     days_since_new = jd - 2451550.1
     phase = (days_since_new % 29.53058867) / 29.53058867
     idx = int(phase * 8) % 8
@@ -200,15 +218,22 @@ def safe_parse_time(time_str: str) -> float:
     except (ValueError, IndexError):
         return 6.0
 
+def safe_parse_iso(ts: str, tz: zoneinfo.ZoneInfo) -> Optional[datetime]:
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Failed to parse ISO time '{ts}': {e}")
+        return None
+
 def get_moon_age_days(d: date) -> float:
-    y, m, day = d.year, d.month, d.day
-    if m < 3: y -= 1; m += 12
-    a = int(y / 100)
-    b = 2 - a + int(a / 4)
-    jd = 365.25 * (y + 4716) + 30.6001 * (m + 1) + day + b - 1524.5
+    jd = _julian_day(d)
     days_since_new = jd - 2451550.1
-    age = days_since_new % 29.53058867
-    return age
+    return days_since_new % 29.53058867
 
 def get_haml_mat_status(age_days: float) -> dict:
     if 13 <= age_days <= 16:
@@ -219,12 +244,12 @@ def get_haml_mat_status(age_days: float) -> dict:
             "description": f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).",
             "score_delta": 15
         }
-    elif 28 <= age_days or age_days <= 1:
+    elif age_days >= 28 or age_days <= 2:
         if age_days >= 28:
-            day_in = int(age_days - 28) + 1
+            raw_day = age_days - 28
         else:
-            day_in = int(age_days + 29.53 - 28) + 1
-            day_in = min(day_in, 4)
+            raw_day = age_days
+        day_in = max(1, min(3, int(raw_day) + 1))
         return {
             "status": "أيام الحياء",
             "phase": "حمل المحاق",
@@ -260,13 +285,14 @@ def get_fishing_platform_advice(haml_status: str) -> str:
     else:
         return "الصيد من الشاطئ ممكن اليوم."
 
-def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude):
+LUNAR_DAY_HOURS = 24.84101
+MEDITERRANEAN_LUNITIDAL_CORRECTION = 0.5
+
+def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_str, latitude, longitude):
     sr_h = safe_parse_time(sunrise_str)
     ss_h = safe_parse_time(sunset_str)
-    moon_age_hours = moon_analysis["phase_decimal"] * 29.53 * 24
-    lunitidal_correction = (latitude - 10) * 2.5 / 60.0
-    base_hw_hour = (moon_age_hours * 0.04) % 12 + 6 + lunitidal_correction
-    base_hw_hour = base_hw_hour % 24
+    lunar_transit_hour = (moon_analysis["phase_decimal"] * LUNAR_DAY_HOURS + longitude / 15.0) % 24
+    base_hw_hour = (lunar_transit_hour + 1.2 + MEDITERRANEAN_LUNITIDAL_CORRECTION) % 24
     hw1 = base_hw_hour
     lw1 = (hw1 + 6.2) % 24
     hw2 = (hw1 + 12.4) % 24
@@ -294,6 +320,16 @@ def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_s
 
     return windows, golden_windows
 
+def _arabic_count(n: int, singular: str, dual: str, plural: str) -> str:
+    if n == 1:
+        return f"{singular}"
+    elif n == 2:
+        return f"{dual}"
+    elif 3 <= n <= 10:
+        return f"{n} {plural}"
+    else:
+        return f"{n} {singular}"
+
 def format_time_gap(hours_decimal: float) -> str:
     if hours_decimal <= 0:
         return "0 دقيقة"
@@ -302,24 +338,21 @@ def format_time_gap(hours_decimal: float) -> str:
     m = total_minutes % 60
     parts = []
     if h > 0:
-        parts.append(f"{h} ساعة" if h == 1 else f"{h} ساعات")
+        parts.append(_arabic_count(h, "ساعة", "ساعتين", "ساعات"))
     if m > 0:
-        parts.append(f"{m} دقيقة" if m == 1 else f"{m} دقائق")
+        parts.append(_arabic_count(m, "دقيقة", "دقيقتين", "دقائق"))
     return " و ".join(parts) if parts else "0 دقيقة"
 
-def calculate_solunar(d: date, lat: float):
-    y, m, day = d.year, d.month, d.day
-    if m < 3: y -= 1; m += 12
-    a = int(y / 100)
-    b = 2 - a + int(a / 4)
-    jd = 365.25 * (y + 4716) + 30.6001 * (m + 1) + day + b - 1524.5
+def calculate_solunar(d: date, lat: float, lon: float):
+    jd = _julian_day(d)
     days_since_new = jd - 2451550.1
     moon_phase = (days_since_new % 29.53058867) / 29.53058867
-    moon_transit = (moon_phase * 24 + 12) % 24
+    lon_correction = lon / 15.0
+    moon_transit = (moon_phase * LUNAR_DAY_HOURS + lon_correction) % 24
     major1 = moon_transit
-    major2 = (moon_transit + 12) % 24
-    minor1 = (major1 + 6) % 24
-    minor2 = (major2 + 6) % 24
+    major2 = (moon_transit + 12.42) % 24
+    minor1 = (major1 + 6.21) % 24
+    minor2 = (major2 + 6.21) % 24
     return {"major1": format_time(major1), "major2": format_time(major2),
             "minor1": format_time(minor1), "minor2": format_time(minor2)}
 
@@ -331,40 +364,46 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         return [], {}
     m_map, w_map = {}, {}
     for i, t in enumerate(m_times):
-        dt = datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=tz)
-        m_map[dt.replace(minute=0, second=0, microsecond=0)] = i
+        dt = safe_parse_iso(t, tz)
+        if dt is not None:
+            m_map[dt.replace(minute=0, second=0, microsecond=0)] = i
     for i, t in enumerate(w_times):
-        dt = datetime.fromisoformat(t)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=tz)
-        w_map[dt.replace(minute=0, second=0, microsecond=0)] = i
+        dt = safe_parse_iso(t, tz)
+        if dt is not None:
+            w_map[dt.replace(minute=0, second=0, microsecond=0)] = i
     common = sorted(set(m_map) & set(w_map))
     if not common:
+        logger.warning(f"No common timestamps! Marine times: {m_times[:3]}, Weather times: {w_times[:3]}")
         return [], {}
-    def extract(key, src, idx_map):
+    def extract(key, src, idx_map, default=0.0):
         arr = src.get(key, [])
-        return [arr[idx_map[t]] if arr and idx_map[t] < len(arr) else 0.0 for t in common]
+        result = []
+        for t in common:
+            if t in idx_map and arr and idx_map[t] < len(arr):
+                result.append(arr[idx_map[t]])
+            else:
+                result.append(default)
+        return result
     return common, {
-        "wave_height": extract("wave_height", marine_hourly, m_map),
-        "wave_period": extract("wave_period", marine_hourly, m_map),
-        "wave_direction": extract("wave_direction", marine_hourly, m_map),
-        "swell_wave_height": extract("swell_wave_height", marine_hourly, m_map),
-        "swell_wave_period": extract("swell_wave_period", marine_hourly, m_map),
-        "swell_wave_direction": extract("swell_wave_direction", marine_hourly, m_map),
-        "sea_surface_temperature": extract("sea_surface_temperature", marine_hourly, m_map),
-        "wind_speed_10m": extract("wind_speed_10m", weather_hourly, w_map),
-        "wind_direction_10m": extract("wind_direction_10m", weather_hourly, w_map),
-        "wind_gusts_10m": extract("wind_gusts_10m", weather_hourly, w_map),
-        "pressure_msl": extract("pressure_msl", weather_hourly, w_map),
-        "temperature_2m": extract("temperature_2m", weather_hourly, w_map),
-        "precipitation": extract("precipitation", weather_hourly, w_map),
-        "visibility": extract("visibility", weather_hourly, w_map),
-        "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
+        "wave_height": extract("wave_height", marine_hourly, m_map, 0.0),
+        "wave_period": extract("wave_period", marine_hourly, m_map, 0.0),
+        "wave_direction": extract("wave_direction", marine_hourly, m_map, None),
+        "swell_wave_height": extract("swell_wave_height", marine_hourly, m_map, 0.0),
+        "swell_wave_period": extract("swell_wave_period", marine_hourly, m_map, 0.0),
+        "swell_wave_direction": extract("swell_wave_direction", marine_hourly, m_map, None),
+        "sea_surface_temperature": extract("sea_surface_temperature", marine_hourly, m_map, 0.0),
+        "wind_speed_10m": extract("wind_speed_10m", weather_hourly, w_map, 0.0),
+        "wind_direction_10m": extract("wind_direction_10m", weather_hourly, w_map, None),
+        "wind_gusts_10m": extract("wind_gusts_10m", weather_hourly, w_map, 0.0),
+        "pressure_msl": extract("pressure_msl", weather_hourly, w_map, 1013.0),
+        "temperature_2m": extract("temperature_2m", weather_hourly, w_map, None),
+        "relative_humidity_2m": extract("relative_humidity_2m", weather_hourly, w_map, 65.0),
+        "precipitation": extract("precipitation", weather_hourly, w_map, 0.0),
+        "visibility": extract("visibility", weather_hourly, w_map, 10000.0),
+        "weather_code": extract("weather_code", weather_hourly, w_map, 0.0)
     }
 
-# ==================== 50+ شاطئ تونسي ====================
+# ---------- Beaches (full list) ----------
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -417,32 +456,22 @@ TUNISIAN_BEACHES = [
     {"name":"شاطئ خلاص", "lat":36.7972, "lon":10.2750, "orientation":90, "type":"sandy"},
 ]
 
-def find_nearest_beach_orientation(lat: float, lon: float) -> Optional[int]:
+def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> Optional[dict]:
     min_dist = float('inf')
-    nearest_orient = None
+    nearest = None
     for b in TUNISIAN_BEACHES:
         dist = calc_distance(b["lat"], b["lon"], lat, lon)
-        if dist < min_dist and dist < 20000:
+        if dist < min_dist and dist < max_dist:
             min_dist = dist
-            nearest_orient = b["orientation"]
-    return nearest_orient
-
-def find_nearest_beach_type(lat: float, lon: float) -> Optional[str]:
-    min_dist = float('inf')
-    nearest_type = None
-    for b in TUNISIAN_BEACHES:
-        dist = calc_distance(b["lat"], b["lon"], lat, lon)
-        if dist < min_dist and dist < 20000:
-            min_dist = dist
-            nearest_type = b["type"]
-    return nearest_type
+            nearest = {"orientation": b["orientation"], "type": b["type"], "distance": round(dist, 0)}
+    return nearest
 
 async def get_auto_orientation_overpass(lat, lon):
-    for radius in [3000, 5000, 10000]:
-        query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
-        try:
-            async with httpx.AsyncClient() as c:
-                r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=20)
+    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": USER_AGENT}) as client:
+        for radius in [3000, 5000, 10000]:
+            query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
+            try:
+                r = await client.get(OVERPASS_URL, params={"data": query})
                 r.raise_for_status()
                 els = r.json().get("elements", [])
                 if not els: continue
@@ -460,12 +489,16 @@ async def get_auto_orientation_overpass(lat, lon):
                         if prev_i != next_i:
                             best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
                 if not best_tangent or not best_point: continue
-                n_a, n_b = (best_tangent + 90) % 360, (best_tangent - 90) % 360
-                c2u = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-                d_a = abs(c2u - n_a); d_a = 360 - d_a if d_a > 180 else d_a
-                d_b = abs(c2u - n_b); d_b = 360 - d_b if d_b > 180 else d_b
-                return int(round(((n_a if d_a < d_b else n_b) + 180) % 360))
-        except Exception: continue
+                perp1 = (best_tangent + 90) % 360
+                perp2 = (best_tangent - 90) % 360
+                to_user = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+                diff1 = angle_diff(perp1, to_user)
+                diff2 = angle_diff(perp2, to_user)
+                seaward = perp1 if diff1 > diff2 else perp2
+                return int(round(seaward))
+            except Exception as e:
+                logger.warning(f"Overpass orientation failed at radius {radius}: {e}")
+                continue
     return 0
 
 @app.post("/auto-orientation")
@@ -473,23 +506,23 @@ async def get_auto_orientation_overpass(lat, lon):
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
     if orientation != 0: return {"orientation": orientation, "source": "overpass"}
-    orientation = find_nearest_beach_orientation(req.latitude, req.longitude)
-    if orientation is not None: return {"orientation": orientation, "source": "nearest_beach"}
+    info = find_nearest_beach_info(req.latitude, req.longitude)
+    if info: return {"orientation": info["orientation"], "source": "nearest_beach"}
     return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
 
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: DetectBottomRequest):
-    nearest_type = find_nearest_beach_type(req.latitude, req.longitude)
-    if nearest_type: return {"bottom_type": nearest_type, "source": "nearby_beach", "confidence": "medium"}
+    info = find_nearest_beach_info(req.latitude, req.longitude)
+    if info: return {"bottom_type": info["type"], "source": "nearby_beach", "confidence": "medium"}
     query = f"""[out:json];(
         way(around:2000,{req.latitude},{req.longitude})["natural"="sand"];
         way(around:2000,{req.latitude},{req.longitude})["natural"="shingle"];
         way(around:2000,{req.latitude},{req.longitude})["natural"="bare_rock"];
     );out body;"""
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(OVERPASS_URL, params={"data": query}, headers={"User-Agent": USER_AGENT}, timeout=15)
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": USER_AGENT}) as client:
+        try:
+            r = await client.get(OVERPASS_URL, params={"data": query})
             r.raise_for_status()
             data = r.json()
             elements = data.get("elements", [])
@@ -498,11 +531,12 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
                 nat = tags.get("natural", "")
                 if nat == "sand": return {"bottom_type": "sandy", "source": "overpass", "confidence": "high"}
                 if nat in ["shingle", "bare_rock"]: return {"bottom_type": "rocky", "source": "overpass", "confidence": "high"}
-    except Exception: pass
+        except Exception as e:
+            logger.warning(f"Overpass bottom detection error: {e}")
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
-# ==================== جلب بيانات الطقس والبحر ====================
-async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
+# ---------- Fetch weather & marine ----------
+async def fetch_marine_data_from_openmeteo(client: httpx.AsyncClient, lat: float, lon: float):
     url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat, "longitude": lon,
@@ -510,31 +544,81 @@ async def fetch_marine_data_from_openmeteo(lat: float, lon: float):
         "timezone": "Africa/Tunis", "forecast_days": 3
     }
     try:
-        r = await http_client.get(url, params=params, timeout=15)
+        r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
     except Exception as e:
         logger.error(f"Open-Meteo marine fetch failed: {e}")
         return None
 
-async def fetch_weather_data_from_openmeteo(lat: float, lon: float):
+async def fetch_weather_data_from_openmeteo(client: httpx.AsyncClient, lat: float, lon: float):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat, "longitude": lon,
-        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,precipitation,visibility,weather_code",
+        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,relative_humidity_2m,precipitation,visibility,weather_code",
         "daily": "sunrise,sunset",
         "timezone": "Africa/Tunis", "forecast_days": 3
     }
     try:
-        r = await http_client.get(url, params=params, timeout=15)
+        r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
     except Exception as e:
         logger.error(f"Open-Meteo weather fetch failed: {e}")
         return None
 
-# ==================== التحليلات الإضافية ====================
-def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
+# ---------- New Tactical Helpers ----------
+def get_water_clarity(wind_speed, wave_height, is_murky, is_weedy, haml_status, avg_vis_b=10000):
+    if avg_vis_b < 200:
+        return "ضباب كثيف (رؤية معدومة)"
+    if is_weedy:
+        return "عكر جداً (أعشاب وصوفة)"
+    if is_murky:
+        return "عكر (بحر خامر)"
+    if "الحياء" in haml_status and (wind_speed > 15 or wave_height > 0.5):
+        return "عكر/مخلوط (التيارات تقلب القاع)"
+    if wind_speed > 20:
+        return "متوسط العكارة (رياح قوية)"
+    if wave_height < 0.3 and wind_speed < 10:
+        return "صافي جداً"
+    return "صافي"
+
+def suggest_rig(haml_status: str, is_lateral_strong: bool, wind_speed: float, is_mirror_sea: bool) -> str:
+    strong_current = "الحياء" in haml_status or is_lateral_strong
+    if strong_current or wind_speed > 20:
+        return "مونتاج باتير نوستر قصير (فروع 50سم، ثقيل) – يمنع التشابك في التيار"
+    if is_mirror_sea or (not is_lateral_strong and wind_speed < 10):
+        return "مونتاج بسنود طويل (فرع سفلي 150سم، خفيف) – حركة طبيعية للطعم"
+    return "مونتاج عادي (فرع 80-100سم) – مرن للظروف المتوسطة"
+
+def casting_angle_correction(wind_dir, orient):
+    if wind_dir is None or orient is None:
+        return 0
+    diff = signed_angle_diff(wind_dir, orient)
+    if abs(diff) < 30:
+        return 0
+    raw = round(-diff * 0.12)
+    return max(-15, min(15, raw))
+
+def calculate_comfort_index(temp, wind_speed, humidity=None):
+    if temp is None:
+        return 50
+    humidity = humidity if humidity is not None else 50
+    temp = max(-10, min(50, temp))
+    hi = temp + 0.5 * (humidity - 50) if humidity > 40 else temp
+    base = 100 - abs(24 - hi) * 2 - wind_speed * 0.5 - abs(humidity - 50) * 0.2
+    return max(0, min(100, int(base)))
+
+def get_confidence_label(confidence):
+    if confidence >= 90: return "ذروة ملكية"
+    if confidence >= 80: return "ممتازة"
+    if confidence >= 70: return "جيدة جداً"
+    if confidence >= 60: return "جيدة"
+    if confidence >= 50: return "مقبولة"
+    return "ضعيفة"
+
+# ---------- Analysis Helpers ----------
+def analyze_weed_risk(sea_memory):
     risk = "منخفض"; advice = ""
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     if has_weed:
@@ -542,7 +626,9 @@ def analyze_weed_risk(sea_memory, wave_height, wind_direction, orient):
         advice = "استعمل صائدات مضادة للأعشاب وارمِ بزاوية حادة نحو البحر لتجنب الالتفاف."
     return {"risk": risk, "advice": advice}
 
-def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_height: float) -> dict:
+def analyze_backwash(wind_speed: float, wind_dir, orient: float, wave_height: float) -> dict:
+    if wind_dir is None:
+        return {"severity": "منخفض", "effect": ""}
     wind_diff = angle_diff(wind_dir, orient)
     is_onshore = wind_diff < 30
     is_strong = wind_speed > 30
@@ -555,7 +641,7 @@ def analyze_backwash(wind_speed: float, wind_dir: float, orient: float, wave_hei
         effect = f"رياح بحرية ({wind_speed:.0f} كم/س) تخلق تياراً عكسياً خفيفاً. الرصاصة قد تتحرك قليلاً نحو الشاطئ لكن يمكن التحكم بها بوزن أثقل."
     return {"severity": severity, "effect": effect}
 
-def analyze_debris_risk(sea_memory: str, past_rain: float, wind_speed: float) -> dict:
+def analyze_debris_risk(sea_memory: str, wind_speed: float) -> dict:
     has_floods = "سيول" in sea_memory
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     is_windy = wind_speed > 20
@@ -580,13 +666,13 @@ def get_seasonal_bait(month: int, water_temp: float) -> str:
     if water_temp > 22: bait += " (يفضل الطعم الحي أو المتحرك)"
     return bait
 
-def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_golden: bool, nogo_count: int, warning_count: int,
-                                block_wind_ok: bool, block_wave_ok: bool, is_night_with_tide: bool) -> int:
+def calculate_confidence_index(period_flags, is_mirror_sea, has_golden, nogo_count, period_warning_count,
+                                block_wind_ok, block_wave_ok, is_night_with_tide):
     base = 70
     if is_mirror_sea: base -= 40
     if not has_golden: base -= 20
     if nogo_count > 0: base -= 30
-    if warning_count > 0: base -= 10
+    if period_warning_count > 0: base -= 10
     if block_wind_ok: base += 10
     if block_wave_ok: base += 10
     if is_night_with_tide: base += 15
@@ -594,7 +680,6 @@ def calculate_confidence_index(period_flags: dict, is_mirror_sea: bool, has_gold
     base += period_flags.get("is_pressure_dropping", 0) * 15
     return max(0, min(100, base))
 
-# ==================== نظام الأوزان (كما هو) ====================
 def apply_scoring(agg: dict) -> int:
     score = 50
     flags = agg["flags"]
@@ -603,10 +688,13 @@ def apply_scoring(agg: dict) -> int:
 
     if not flags["has_golden_window"]:
         score -= 15
-    if agg["avg_sst"] > 27.0:
-        score -= 15
-    elif agg["avg_sst"] < 13.0:
-        score -= 15
+    if agg["avg_sst"] is not None:
+        if agg["avg_sst"] > 27.0:
+            score -= 15
+        elif agg["avg_sst"] < 13.0:
+            score -= 15
+    if extra.get("sst_stability", "") == "صدمة حرارية":
+        score -= 10
     for b in blocks:
         if b.get("backwash", {}).get("severity") == "متوسط":
             score -= 10
@@ -621,43 +709,100 @@ def apply_scoring(agg: dict) -> int:
         if 0.1 < wp_val < 4.0:
             score -= 10
             break
-    month = agg.get("target_month", datetime.now().month)
-    if month in [3,4]:
-        score -= 20
 
-    for b in blocks:
-        if b["wind_dir"].startswith("برية"):
-            if b["_raw"]["avg_wind"] > 20:
-                score -= 10
-                break
-            elif b["_raw"]["avg_wind"] <= 15:
-                score += 5
-                break
+    has_strong_offshore = any(
+        b["wind_dir"].startswith("برية") and b["_raw"]["avg_wind"] > 20
+        for b in blocks
+    )
+    has_light_offshore = any(
+        b["wind_dir"].startswith("برية") and b["_raw"]["avg_wind"] <= 15
+        for b in blocks
+    )
+    if has_strong_offshore:
+        score -= 10
+    elif has_light_offshore:
+        score += 5
 
     if any(b["wind_dir"].startswith("بحرية") and b["_raw"]["avg_wind"] < 15 for b in blocks):
         score += 15
     if any(0.6 <= b["_raw"]["avg_wave_h"] <= 1.2 for b in blocks):
         score += 20
-    if any(b.get("wave_angle_diff") and b["wave_angle_diff"] < 30 and b["_raw"]["avg_wave_h"] >= 0.6 for b in blocks):
+    if any(b.get("wave_angle_diff") is not None and b["wave_angle_diff"] < 30 and b["_raw"]["avg_wave_h"] >= 0.6 for b in blocks):
         score += 15
     if flags["has_golden_window"]:
         score += 25
     if press_change < 1.0:
         score += 10
-    if any(b.get("wave_angle_diff") and b["wave_angle_diff"] < 30 for b in blocks):
-        score += 10
     moon_idx = agg["tide_analysis"]["idx"]
-    if moon_idx == 4 and any(b["name"] == "الليل" for b in blocks):
+    if moon_idx == 4 and any(b["name"] in ("الغسق","السحر") for b in blocks):
         score += 15
 
     haml_delta = extra.get("haml_score_delta", 0)
     score += haml_delta
 
     score = max(0, min(100, score))
+    
+    lethal_blocks = sum(1 for b in blocks if b.get("has_lethal_nogo", False))
+    total_blocks = len(blocks)
+    if total_blocks > 0:
+        lethal_ratio = lethal_blocks / total_blocks
+        if lethal_ratio == 1.0:
+            score = min(score, 30)
+        elif lethal_ratio >= 0.5:
+            score = min(score, 65)
+        elif lethal_ratio > 0:
+            score = min(score, 80)
+        elif agg.get("warnings"):
+            score = min(score, 95)
+    
     return score
 
-# ==================== محرك التجميع الفيزيائي (تصحيح الرياح) ====================
-def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude):
+# ---------- Physical Aggregation ----------
+def get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea, lateral_force_ratio, water_clarity, seabass_sst_limit):
+    if avg_sst is None:
+        avg_sst = 20.0
+    active = []
+    inactive = []
+    seabass_active = (is_night or is_murky or lateral_force_ratio > 0.5) and avg_sst < seabass_sst_limit and not is_mirror_sea
+    if seabass_active:
+        active.append("قاروص")
+    else:
+        inactive.append("قاروص")
+    if avg_sst > 18 and not is_mirror_sea:
+        active.append("دنيس")
+    else:
+        inactive.append("دنيس")
+    if not is_murky and not is_weedy and not is_mirror_sea:
+        active.append("بوري")
+    else:
+        inactive.append("بوري")
+    if avg_sst <= 22:
+        active.append("سارغ")
+    else:
+        inactive.append("سارغ")
+    if avg_sst > 18 and not is_mirror_sea and lateral_force_ratio > 0.2:
+        active.append("مرمار")
+    else:
+        inactive.append("مرمار")
+    if avg_sst > 17 and not is_mirror_sea:
+        active.append("شلبة")
+    else:
+        inactive.append("شلبة")
+    if avg_sst > 18 and not is_murky:
+        active.append("تريلية")
+    else:
+        inactive.append("تريلية")
+    if avg_sst > 19 and is_murky:
+        active.append("بغبغان")
+    else:
+        inactive.append("بغبغان")
+    if avg_sst > 18 and not is_mirror_sea and (is_night or "عكر" in water_clarity):
+        active.append("سوبيا")
+    else:
+        inactive.append("سوبيا")
+    return active, inactive
+
+def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude, longitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
     target_end = target_start + timedelta(days=1)
@@ -665,33 +810,37 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     past_idx = [i for i, t in enumerate(all_times) if past_start <= t < target_start]
     target_idx = [i for i, t in enumerate(all_times) if target_start <= t < target_end]
 
-    nogo_reasons = []
     warnings = []
 
     empty_res = {
-        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "غير مناسب", "score": 0
+        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","avg_sst":None,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "غير مناسب", "score": 0
     }
     if not target_idx:
         return empty_res
 
-    def pick(k): 
+    def pick(k, default=0.0): 
         arr = aligned.get(k, [])
-        return [arr[i] if i < len(arr) else 0.0 for i in target_idx]
+        return [
+            (arr[i] if arr[i] is not None else default) if i < len(arr) else default
+            for i in target_idx
+        ]
 
     wh = pick("wave_height"); wp = pick("wave_period"); swh = pick("swell_wave_height")
-    swp = pick("swell_wave_period"); swd = pick("swell_wave_direction"); wd_wave = pick("wave_direction")
-    sst = pick("sea_surface_temperature"); ws = pick("wind_speed_10m"); wd = pick("wind_direction_10m")
-    wg = pick("wind_gusts_10m"); pr = pick("pressure_msl"); ta = pick("temperature_2m"); prec = pick("precipitation")
-    vis = pick("visibility"); wcode = [int(v) if v else 0 for v in pick("weather_code")]
+    swp = pick("swell_wave_period"); swd = pick("swell_wave_direction", None); wd_wave = pick("wave_direction", None)
+    sst = pick("sea_surface_temperature"); ws = pick("wind_speed_10m"); wd = pick("wind_direction_10m", None)
+    wg = pick("wind_gusts_10m"); pr = pick("pressure_msl", 1013.0); ta = pick("temperature_2m", None)
+    rh = pick("relative_humidity_2m", 65.0); prec = pick("precipitation"); vis = pick("visibility", 10000.0)
+    wcode = [int(v) if isinstance(v, (int, float)) else 0 for v in pick("weather_code")]
 
-    wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
-    wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
+    wave_power = [0.49*(safe_float(h)**2)*safe_float(p) for h,p in zip(wh,wp)]
+    wind_cls = [wind_class_detailed(angle_diff(d, orient)) if d is not None else "غير معروف" for d in wd]
 
     has_swell_data = len(swh) > 0 and not all(v == 0.0 for v in swh)
     actual_swell_exists = has_swell_data and max(swh) > 0.05
 
     sea_memory = "بحر صافي وهادئ"
-    past_rain_total = 0.0
+    accumulated_rain_48h = 0.0
+    max_rain_hourly = 0.0
     if past_idx:
         p_wh = aligned.get("wave_height", []); p_wp = aligned.get("wave_period", [])
         p_swh = aligned.get("swell_wave_height", []); p_swp = aligned.get("swell_wave_period", [])
@@ -699,66 +848,46 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         p_prec = aligned.get("precipitation", [])
         valid_past = [i for i in past_idx if i < len(p_wh) and i < len(p_wp) and i < len(p_ws) and i < len(p_wd)]
         if valid_past:
-            weighted_past_power = 0.0; weighted_past_swh = 0.0; total_weight = 0.0; past_onshore_hours = 0.0; past_rain = 0.0
+            weighted_past_power = 0.0; weighted_past_swh = 0.0; total_weight = 0.0; past_onshore_hours = 0.0
+            total_rain_past = 0.0
+            hourly_rain_values = []
             for pos, i in enumerate(valid_past):
                 decay_weight = 0.8 ** (len(valid_past) - 1 - pos)
-                weighted_past_power += decay_weight * 0.49*(p_wh[i]**2)*p_wp[i]
-                weighted_past_swh += decay_weight * p_swh[i] if i < len(p_swh) else 0
+                weighted_past_power += decay_weight * 0.49*(safe_float(p_wh[i])**2)*safe_float(p_wp[i])
+                swh_contribution = (decay_weight * safe_float(p_swh[i])) if i < len(p_swh) else 0.0
+                weighted_past_swh += swh_contribution
                 total_weight += decay_weight
-                if wind_class_detailed(angle_diff(p_wd[i], orient)).startswith("بحرية"): past_onshore_hours += decay_weight
-                past_rain += p_prec[i] if i < len(p_prec) else 0
+                if p_wd[i] is not None and wind_class_detailed(angle_diff(p_wd[i], orient)).startswith("بحرية"):
+                    past_onshore_hours += decay_weight
+                val = safe_float(p_prec[i]) if i < len(p_prec) else 0
+                total_rain_past += val
+                hourly_rain_values.append(val)
             past_avg = weighted_past_power / total_weight if total_weight > 0 else 0
             past_sh = weighted_past_swh / total_weight if total_weight > 0 else 0
             past_onshore_ratio = past_onshore_hours / total_weight
-            past_rain_total = past_rain / len(valid_past)
+            accumulated_rain_48h = total_rain_past
+            max_rain_hourly = max(hourly_rain_values) if hourly_rain_values else 0.0
             if past_avg > 6.0 and past_onshore_ratio > 0.4: sea_memory = "بحر خامر وعكر جداً."
             elif past_avg > 4.0 and past_onshore_ratio > 0.3: sea_memory = "بحر يعكر ببطء."
             if past_sh > 0.8 and past_avg > 4.0: sea_memory += " | تحذير صوفة."
-            if past_rain_total > 10.0: sea_memory += " | سيول."
+            if accumulated_rain_48h > 45.0 or max_rain_hourly > 15.0:
+                sea_memory += " | سيول."
 
-    lateral_fx = 0.0; lateral_fy = 0.0; max_wh = max(wh) if wh else 0.0
+    day_lateral_fx = 0.0; day_lateral_fy = 0.0
     for i in range(len(wh)):
-        w_dir = wd_wave[i] if i < len(wd_wave) else 0.0
-        if w_dir != 0.0:
+        if wd_wave[i] is not None:
+            w_dir = wd_wave[i]
             signed_angle = math.radians(signed_angle_diff(w_dir, orient))
-            force = wh[i] * wh[i] 
-            lateral_fx += force * math.sin(signed_angle)
-            lateral_fy += force * math.cos(signed_angle)
-
-    total_force = math.sqrt(lateral_fx**2 + lateral_fy**2)
-    lateral_force_ratio = abs(lateral_fx) / total_force if total_force > 0 else 0
-    avg_wave_h = sum(wh) / len(wh) if wh else 0
-    is_mirror_sea = max_wh < 0.3
-    is_lateral_strong = lateral_force_ratio > 0.7 and avg_wave_h > 0.6
-
-    if is_mirror_sea: nogo_reasons.append("بحر مرآوي تام (أقل من 0.3م): لا تيارات ولا حركة سطحية، الأسماك لا تقترب.")
-
-    lateral_dir_text = "لليمين" if lateral_fx > 0 else "لليسار" if lateral_fx < 0 else ""
-    lateral_current = "تيار جانبي معدوم (بحر مرآوي)" if is_mirror_sea else f"تيار جانبي قوي {lateral_dir_text}" if is_lateral_strong else f"تيار جانبي متوسط {lateral_dir_text}" if (lateral_force_ratio > 0.4 and avg_wave_h > 0.4) else "تيار جانبي ضعيف"
-
-    cross_angles = []
-    if has_swell_data:
-        cross_angles = [angle_diff(swd[i], wd_wave[i]) for i in range(len(swd)) if swd[i] != 0.0 and i < len(wd_wave) and wd_wave[i] != 0.0]
-    is_cross_sea_dangerous = False
-    cross_sea_risk = "منخفض"
-    if cross_angles and not is_mirror_sea:
-        avg_cross, max_cross = sum(cross_angles) / len(cross_angles), max(cross_angles)
-        if max_cross > 60 and avg_cross > 40: cross_sea_risk = "بحر مختلط وخطير"; is_cross_sea_dangerous = True
-        elif max_cross > 45: cross_sea_risk = "بحر مختلط متوسط"
-    if is_cross_sea_dangerous: nogo_reasons.append("بحر مختلط خطير: السويل والموج المحلي يتقاطعان بزاوية كبيرة.")
-
-    steepness_vals = [h / (1.56 * (p**2)) for h, p in zip(wh, wp) if p and p > 0.1]
-    avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
-    if avg_steepness > 0.06:
-        steepness_desc = "موج حاد وقصير"
-    elif avg_steepness < 0.03:
-        steepness_desc = "موج منخفض الانحدار (سلس)"
-    else:
-        steepness_desc = "موج متوسط الانحدار"
+            force = safe_float(wh[i]) ** 2
+            day_lateral_fx += force * math.sin(signed_angle)
+            day_lateral_fy += force * math.cos(signed_angle)
+    day_total = math.sqrt(day_lateral_fx**2 + day_lateral_fy**2)
+    day_lateral_ratio = abs(day_lateral_fx) / day_total if day_total > 1e-9 else 0
+    avg_wave_h_day = sum(wh) / len(wh) if wh else 0
 
     tide_analysis = get_moon_and_tide_analysis(target_date_obj)
-    tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude)
-    solunar = calculate_solunar(target_date_obj, latitude)
+    tidal_windows, golden_windows = estimate_tidal_windows(target_date_obj, tide_analysis, sunrise, sunset, latitude, longitude)
+    solunar = calculate_solunar(target_date_obj, latitude, longitude)
 
     moon_age = get_moon_age_days(target_date_obj)
     haml_info = get_haml_mat_status(moon_age)
@@ -770,94 +899,53 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     has_golden_window = any("تزامن" in g for g in golden_windows)
     if not has_golden_window: warnings.append("لا توجد ساعة ذهبية: قد يقل نشاط الأسماك.")
 
-    avg_sst = sum(sst)/len(sst) if sst else 0
-    sst_diff = max(sst) - min(sst) if len(sst) > 1 else 0
+    valid_sst = [v for v in sst if v is not None and 8.0 <= v <= 35.0]
+    avg_sst = sum(valid_sst) / len(valid_sst) if valid_sst else None
+    sst_diff = max(valid_sst) - min(valid_sst) if len(valid_sst) > 1 else 0
     sst_stability = "صدمة حرارية" if sst_diff > 2.0 else "تغير بطيء" if sst_diff > 1.0 else "مستقر تماماً"
     is_murky = "عكر" in sea_memory or "خامر" in sea_memory
     is_weedy = "صوفة" in sea_memory
-    max_air_temp = max(ta) if ta else 0
+    valid_ta = [v for v in ta if v is not None]
+    max_air_temp = max(valid_ta) if valid_ta else 20.0
     month = target_date_obj.month
     seabass_sst_limit = 20.0 if month in [6,7,8,9] else 18.0
-    if avg_sst > seabass_sst_limit: warnings.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص.")
+    if avg_sst is not None and avg_sst > seabass_sst_limit:
+        warnings.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص.")
+    if is_weedy:
+        warnings.append("صوفة محتملة: استعمل مونتاجاً مضاداً للأعشاب.")
 
-    avg_press = sum(pr)/len(pr) if pr else 0
-    press_change = pr[-1] - pr[-4] if len(pr) >= 4 else (pr[-1] - pr[0] if len(pr) > 1 else 0)
-    is_pressure_rising_fast = press_change > 1.5
-    is_pressure_dropping_fast = press_change < -2.0
-    is_pressure_shock = abs(press_change) > 4.0
-    if is_pressure_shock:
-        nogo_reasons.append(f"اضطراب حاد في الضغط الجوي (> 4 hPa/3h): الأسماك تتوقف عن الأكل تماماً.")
-    elif is_pressure_rising_fast:
-        warnings.append(f"ضغط مرتفع ({press_change:+.1f} hPa/3h): قد يبطئ النشاط.")
-    elif is_pressure_dropping_fast:
-        warnings.append(f"ضغط منخفض ({press_change:.1f} hPa/3h): قد تبدأ الأسماك بالتغذية قبل العاصفة.")
+    avg_press = sum(safe_float(v) for v in pr) / len(pr) if pr else 0
+    press_change_day = safe_float(pr[-1]) - safe_float(pr[0]) if len(pr) > 1 else 0.0
+    if abs(press_change_day) > 8.0:
+        pressure_note = "مضطرب بشدة (سلبي جداً)"
+    elif press_change_day > 3.0:
+        pressure_note = "يرتفع خلال اليوم (سلبي)"
+    elif press_change_day < -3.0:
+        pressure_note = "ينخفض خلال اليوم (إيجابي)"
+    else:
+        pressure_note = "مستقر (محايد)"
+    pressure_state = f"{pressure_note} (تغير يومي: {press_change_day:+.1f} hPa)"
 
-    pressure_note = "ينخفض (إيجابي)" if is_pressure_dropping_fast else "مستقر (محايد)" if not is_pressure_rising_fast else "يرتفع (سلبي)"
-    pressure_state = f"انخفاض ({press_change:.1f} hPa)" if is_pressure_dropping_fast else f"ارتفاع ({press_change:+.1f} hPa)" if is_pressure_rising_fast else f"مستقر ({press_change:+.1f} hPa)"
-
-    bio_matrix = {
-        "قاروص": {
-            "status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
-            "reason": f"يحتاج عكراً ودرجة أقل من {seabass_sst_limit}°م. الضغط: {pressure_note}.",
-            "preferences": "14-20°م | متوسط الهيجان | تيار معتدل | عكارة خفيفة-متوسطة | الفجر، الغروب، الليل | السردين، القمبري، الحبار"
-        },
-        "دنيس": {
-            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
-            "reason": "يحب الماء الدافئ قرب الصخور، الموج والعكارة الخفيفة تخرجه للبحث عن القشريات.",
-            "preferences": "18-24°م | هادئ-متوسط | تيار ضعيف-متوسط | عكارة خفيفة | الفجر، الغروب | الحبار، الدود، القمبري"
-        },
-        "بوري": {
-            "status": "نشط" if (not is_murky and not is_weedy and not is_mirror_sea) else "خامل",
-            "reason": "يحتاج حركة سطحية. في بحر مرآوي يختفي تماماً." if is_mirror_sea else "يحتاج حركة سطحية.",
-            "preferences": "16-26°م | أي حالة | تيار سطحي للعوالق | ماء نظيف | النهار كله | عجينة، دود، خبز"
-        },
-        "سارغ": {
-            "status": "ضعيف" if avg_sst > 22 else "نشط",
-            "reason": "يتأثر بالحرارة." if avg_sst > 22 else "درجة الحرارة مناسبة.",
-            "preferences": "16-22°م | هادئ-متوسط | أي تيار | ماء نظيف | الفجر والغروب | القمبري، الحبار، الدود"
-        },
-        "مرمار": {
-            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea and lateral_force_ratio > 0.2) else "خامل",
-            "reason": "يتجمع في أسراب نهاراً، يحتاج تياراً يجلب العوالق.",
-            "preferences": "18-26°م | هادئ-متوسط | تيار معتدل | ماء نظيف-قليل العكارة | النهار | دود، قمبري صغير، عجينة"
-        },
-        "شلبة": {
-            "status": "نشط" if (avg_sst > 17 and not is_mirror_sea) else "خامل",
-            "reason": "يفضل المياه الدافئة قرب الصخور والأعشاب.",
-            "preferences": "17-25°م | هادئ-متوسط | تيار معتدل | ماء نظيف | الصباح الباكر | القمبري، الحبار"
-        },
-        "تريلية": {
-            "status": "نشط" if (avg_sst > 18 and not is_murky) else "خامل",
-            "reason": "تحب المياه الدافئة والواضحة، تتجمع في أسراب نهاراً.",
-            "preferences": "18-26°م | هادئ | أي تيار | ماء نظيف | النهار | السردين، العجينة"
-        },
-        "بغبغان": {
-            "status": "نشط" if (avg_sst > 19 and is_murky) else "خامل",
-            "reason": "يحب العكارة والمياه الدافئة، ينشط قرب القاع.",
-            "preferences": "19-27°م | متوسط الهيجان | تيار معتدل | عكارة | الليل | السردين، القمبري"
-        },
-        "سوبيا": {
-            "status": "نشط (ليلاً بشكل رئيسي)" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
-            "reason": "يظهر ليلاً مع المد العالي، يحب الأضواء والقاع الرملي. قد يكون نشاطه محدوداً نهاراً.",
-            "preferences": "18-24°م | هادئ-متوسط | تيار قوي | ماء نظيف | الليل مع المد العالي | السردين، الحبار"
-        }
-    }
-
-    peak_gust = max(wg) if wg else 0.0
-    if peak_gust > 60:
-        nogo_reasons.append(f"رياح عاتية (هبات {peak_gust:.0f} > 60 كم/س): تمنع الرمي الآمن وقد تقطع الخيط.")
-
+    peak_gust_day = max(safe_float(v) for v in wg) if wg else 0.0
     dominant = max(set(wind_cls), key=wind_cls.count) if wind_cls else "غير معروف"
     periods = defaultdict(list)
     for idx, i in enumerate(target_idx):
         h = all_times[i].hour
         if 4 <= h <= 11: periods["morning"].append(idx)
         elif 12 <= h <= 17: periods["afternoon"].append(idx)
-        else: periods["night"].append(idx)
+        else:
+            if h >= 18: periods["evening"].append(idx)
+            else: periods["late_night"].append(idx)
 
-    def parse_tidal_time(t_str):
-        parts = t_str.split(":")
-        return int(parts[0]) + int(parts[1])/60
+    def parse_tidal_time(t_str: str) -> float:
+        try:
+            parts = t_str.split(":")
+            if len(parts) < 2:
+                return 0.0
+            return int(parts[0]) + int(parts[1]) / 60.0
+        except (ValueError, IndexError, AttributeError):
+            logger.warning(f"parse_tidal_time: failed to parse '{t_str}'")
+            return 0.0
 
     slack_info = ""
     for hw_key, lw_key in [("HW1","LW1"), ("HW2","LW2")]:
@@ -866,29 +954,97 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         slack_info += f"المد العالي {tidal_windows[hw_key]} مياه ميتة: {format_time(hw_t-0.75)}-{format_time(hw_t+0.75)}; الجزر المنخفض {tidal_windows[lw_key]} مياه ميتة: {format_time(lw_t-0.75)}-{format_time(lw_t+0.75)}; "
     slack_info = slack_info.rstrip("; ")
 
-    blocks = []
-    for key in ["morning", "afternoon", "night"]:
-        idxs = periods[key]
-        if not idxs: continue
-        avg_h = sum(wh[i] for i in idxs)/len(idxs)
-        max_h = max(wh[i] for i in idxs)
-        avg_w = sum(ws[i] for i in idxs)/len(idxs)
-        max_w = max(ws[i] for i in idxs)
-        wc_dom = max(set(wind_cls[i] for i in idxs), key=wind_cls.count)
-        avg_swh_b = sum(swh[i] for i in idxs)/len(idxs)
-        avg_swp_b = sum(swp[i] for i in idxs)/len(idxs)
-        avg_swd_b = sum(swd[i] for i in idxs)/len(idxs) if swd else 0
-        avg_wave_dir = sum(wd_wave[i] for i in idxs)/len(idxs) if wd_wave else 0
-        avg_air = sum(ta[i] for i in idxs)/len(idxs) if ta else 0
-        max_gust_b = max(wg[i] for i in idxs)
-        most_code = max(set(wcode[i] for i in idxs), key=wcode.count) if idxs else 0
-        avg_press_b = sum(pr[i] for i in idxs)/len(idxs) if pr else 0
-        avg_vis_b = sum(vis[i] for i in idxs)/len(idxs) if vis else 0
-        avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
-        avg_wd_b = sum(wd[i] for i in idxs)/len(idxs) if wd else 0
+    steepness_vals = [safe_float(h) / (1.56 * safe_float(p)**2) for h, p in zip(wh, wp) if safe_float(p) > 0.1 and h is not None]
+    avg_steepness = sum(steepness_vals) / len(steepness_vals) if steepness_vals else 0
+    steepness_desc = ("موج حاد وقصير" if avg_steepness > 0.06 else
+                      "موج منخفض الانحدار (سلس)" if avg_steepness < 0.03 else
+                      "موج متوسط الانحدار")
 
-        if max_h < 0.4:
+    cross_angles = []
+    for i in range(min(len(swd), len(wd_wave))):
+        if swd[i] is not None and wd_wave[i] is not None and swd[i] != 0.0 and wd_wave[i] != 0.0:
+            cross_angles.append(angle_diff(swd[i], wd_wave[i]))
+    is_cross_sea_dangerous = bool(cross_angles and max(cross_angles) > 60 and sum(cross_angles)/len(cross_angles) > 40)
+    cross_sea_risk = "بحر مختلط وخطير" if is_cross_sea_dangerous else "منخفض"
+
+    blocks = []
+    populated_periods = 0
+    periods_with_lethal = 0
+    mirror_with_gusts = []
+    mirror_without_gusts = []
+    period_names_arabic = {"morning":"الصباح","afternoon":"الظهيرة","evening":"الغسق","late_night":"السحر"}
+
+    for key in ["morning", "afternoon", "evening", "late_night"]:
+        idxs = periods[key]
+        if not idxs:
+            continue
+        populated_periods += 1
+
+        avg_h = sum(safe_float(wh[i]) for i in idxs)/len(idxs)
+        max_h = max(safe_float(wh[i]) for i in idxs)
+        avg_w = sum(safe_float(ws[i]) for i in idxs)/len(idxs)
+        max_w = max(safe_float(ws[i]) for i in idxs)
+
+        sub_wind_cls = [wind_cls[i] for i in idxs]
+        wc_dom = max(set(sub_wind_cls), key=sub_wind_cls.count) if sub_wind_cls else "غير معروف"
+        sub_wcode = [wcode[i] for i in idxs]
+        most_code = max(set(sub_wcode), key=sub_wcode.count) if sub_wcode else 0
+
+        swh_vals = [safe_float(swh[i]) for i in idxs if safe_float(swh[i]) > 0.05]
+        avg_swh_b = sum(swh_vals) / len(swh_vals) if swh_vals else 0.0
+        swp_vals = [safe_float(swp[i]) for i in idxs if safe_float(swp[i]) > 0.1]
+        avg_swp_b = sum(swp_vals) / len(swp_vals) if swp_vals else 0.0
+
+        angles_swd = [swd[i] for i in idxs if i < len(swd)]
+        avg_swd_b = circular_mean(angles_swd)
+        angles_wave_dir = [wd_wave[i] for i in idxs if i < len(wd_wave)]
+        avg_wave_dir = circular_mean(angles_wave_dir)
+        angles_wd_b = [wd[i] for i in idxs if i < len(wd)]
+        avg_wd_b = circular_mean(angles_wd_b)
+
+        avg_air = sum(safe_float(ta[i]) for i in idxs if ta[i] is not None)
+        air_count = sum(1 for i in idxs if ta[i] is not None)
+        avg_air = avg_air / air_count if air_count > 0 else 20.0
+        rh_vals = [safe_float(rh[i]) for i in idxs if safe_float(rh[i]) > 5]
+        avg_rh = sum(rh_vals) / len(rh_vals) if rh_vals else 65.0
+        gust_vals = [safe_float(wg[i]) for i in idxs if i < len(wg)]
+        max_gust_b = max(gust_vals) if gust_vals else 0.0
+        avg_press_b = sum(safe_float(pr[i]) for i in idxs)/len(idxs) if pr else 0
+        vis_vals = [safe_float(vis[i]) for i in idxs if safe_float(vis[i]) > 0]
+        avg_vis_b = sum(vis_vals) / len(vis_vals) if vis_vals else 10000.0
+        wp_vals = [safe_float(wp[i]) for i in idxs if safe_float(wp[i]) > 0.5]
+        avg_wp_b = sum(wp_vals) / len(wp_vals) if wp_vals else 0.0
+
+        pr_period = [safe_float(pr[i]) for i in idxs]
+        press_change_3h_period = pr_period[-1] - pr_period[0] if len(pr_period) >= 2 else 0.0
+        period_hours = len(pr_period)
+        if period_hours > 0:
+            press_rate = press_change_3h_period * (3.0 / max(1, period_hours))
+        else:
+            press_rate = 0.0
+
+        period_lateral_fx = 0.0; period_lateral_fy = 0.0
+        for i in idxs:
+            if wd_wave[i] is not None:
+                w_dir = wd_wave[i]
+                signed_angle = math.radians(signed_angle_diff(w_dir, orient))
+                force = safe_float(wh[i]) ** 2
+                period_lateral_fx += force * math.sin(signed_angle)
+                period_lateral_fy += force * math.cos(signed_angle)
+        period_total_force = math.sqrt(period_lateral_fx**2 + period_lateral_fy**2)
+        period_lateral_force_ratio = 0.0
+        if period_total_force > 1e-9:
+            period_lateral_force_ratio = abs(period_lateral_fx) / period_total_force
+
+        period_is_mirror_sea = max_h < 0.3
+        period_is_lateral_strong = period_lateral_force_ratio > 0.7 and avg_h > 0.6
+
+        if period_is_mirror_sea:
             sea = "بحر مرآوي"
+            if max_gust_b >= 15:
+                mirror_with_gusts.append(key)
+            else:
+                mirror_without_gusts.append(key)
         elif max_h < 0.9:
             sea = "هادئ"
         elif max_h < 1.3:
@@ -896,62 +1052,117 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         else:
             sea = "هائج"
 
-        if max_h > 2.0 and not any("بحر هائج" in r for r in nogo_reasons):
-            nogo_reasons.append(f"بحر هائج (أمواج > 2.0م في {key}): الرمي مستحيل والخطر كبير.")
-        if avg_wp_b > 10.0 and avg_h > 0.8 and not any("أمواج أرضية" in r for r in nogo_reasons):
-            nogo_reasons.append(f"أمواج أرضية عالية الطاقة (فترة {avg_wp_b:.1f} > 10 ثوانٍ مع ارتفاع {avg_h:.2f}م): تجرف الرصاص وتدفن الخيوط.")
-        if most_code in [95, 96, 99] and not any("الصواعق" in r for r in nogo_reasons):
-            nogo_reasons.append("خطر الصواعق والبرق: قصبة الكاربون تجذب البرق، لا ترفعها.")
+        period_nogo = []
+        if period_is_mirror_sea:
+            period_nogo.append("بحر مرآوي تام (أقل من 0.3م): لا تيارات ولا حركة سطحية، الأسماك لا تقترب.")
+        if max_h > 2.0:
+            period_nogo.append(f"بحر هائج (أمواج > 2.0م): الرمي مستحيل والخطر كبير.")
+        if avg_wp_b > 10.0 and avg_h > 0.8:
+            period_nogo.append(f"أمواج أرضية عالية الطاقة (فترة {avg_wp_b:.1f} > 10 ثوانٍ مع ارتفاع {avg_h:.2f}م): تجرف الرصاص وتدفن الخيوط.")
+        if most_code in [95, 96, 99]:
+            period_nogo.append("خطر الصواعق والبرق: قصبة الكاربون تجذب البرق، لا ترفعها.")
+        if max_gust_b > 60:
+            period_nogo.append(f"رياح عاتية في هذه الفترة (هبات {max_gust_b:.0f} > 60 كم/س): تمنع الرمي الآمن وقد تقطع الخيط.")
+        if accumulated_rain_48h > 50.0 or max_rain_hourly > 20.0:
+            period_nogo.append("عكارة طينية شديدة (سيول غزيرة): انعدام الرؤية تحت الماء، الأسماك تختفي.")
+        if avg_vis_b < 200:
+            period_nogo.append("ضباب كثيف جداً (رؤية < 200م): خطر على السلامة وصيد مستحيل.")
+        if period_is_lateral_strong and avg_h > 0.8:
+            period_nogo.append("تيار جانبي عنيف: يجرف الرصاصة فوراً ولا يمكن تثبيت الطعم.")
 
         backwash = analyze_backwash(avg_w, avg_wd_b, orient, avg_h)
-        if backwash["severity"] == "مرتفع" and not any("يرجع الرصاص" in r for r in nogo_reasons):
-            nogo_reasons.append(f"تيار راجع عنيف: {backwash['effect']}")
+        if backwash["severity"] == "مرتفع":
+            period_nogo.append(f"تيار راجع عنيف: {backwash['effect']}")
 
-        debris = analyze_debris_risk(sea_memory, past_rain_total, avg_w)
-        if debris["risk"] == "مرتفع" and not any("أوساخ" in r for r in nogo_reasons):
-            nogo_reasons.append(f"أوساخ وصوفة كثيفة: {debris['effect']}")
+        debris = analyze_debris_risk(sea_memory, avg_w)
+        if debris["risk"] == "مرتفع":
+            period_nogo.append(f"أوساخ وصوفة كثيفة: {debris['effect']}")
 
-        final_swd = None if avg_swd_b == 0.0 else avg_swd_b
-        final_wd = None if avg_wave_dir == 0.0 else avg_wave_dir
-        swell_angle = angle_diff(final_swd, orient) if final_swd else None
-        wave_angle = angle_diff(final_wd, orient) if final_wd else None
+        period_warnings = []
+        if period_is_mirror_sea and max_gust_b >= 15:
+            period_warnings.append("بحر مرآوي مع تموجات سطحية خفيفة بسبب الرياح.")
+        if is_weedy:
+            period_warnings.append("صوفة محتملة في هذه الفترة.")
+        if abs(press_rate) > 4.0:
+            period_warnings.append(f"اضطراب ضغط في هذه الفترة ({press_rate:+.1f} hPa/3h)")
+        elif press_rate > 1.5:
+            period_warnings.append(f"ضغط مرتفع في هذه الفترة ({press_rate:+.1f} hPa/3h)")
+        elif press_rate < -2.0:
+            period_warnings.append(f"ضغط منخفض في هذه الفترة ({press_rate:.1f} hPa/3h)")
+
+        has_lethal_nogo = len(period_nogo) > 0
+        if has_lethal_nogo:
+            periods_with_lethal += 1
+
+        has_swell_dir = actual_swell_exists and (avg_swd_b is not None)
+        final_swd = avg_swd_b if has_swell_dir else None
+        has_wave_dir = avg_wave_dir is not None
+        final_wd = avg_wave_dir if has_wave_dir else None
+        swell_angle = angle_diff(final_swd, orient) if final_swd is not None else None
+        wave_angle = angle_diff(final_wd, orient) if final_wd is not None else None
 
         swell_wave_interaction = "متوافقان"
-        if not is_mirror_sea and swell_angle is not None and wave_angle is not None and final_swd and final_wd:
+        if not period_is_mirror_sea and swell_angle is not None and wave_angle is not None and final_swd and final_wd:
             diff_sw = angle_diff(final_swd, final_wd)
             if diff_sw > 40: swell_wave_interaction = "متقاطعان بشدة"
             elif diff_sw > 25: swell_wave_interaction = "متقاطعان بسيط"
 
-        # تعديل إشارة تأثير الرياح
-        if "بحرية" in wc_dom:
-            # رياح بحرية (مواجهة) تقلل مسافة الرمي
-            wind_effect_dist = -avg_w * 1.2
-        elif "برية" in wc_dom:
-            # رياح برية (خلفية) تزيد مسافة الرمي
-            wind_effect_dist = avg_w * 1.0
+        if avg_wd_b is not None:
+            wind_dir_rad = math.radians(avg_wd_b)
+            orient_rad = math.radians(orient)
+            frontal = math.cos(wind_dir_rad - orient_rad)
+            lateral = abs(math.sin(wind_dir_rad - orient_rad))
+            wind_effect_dist = avg_w * (-frontal) * (1 - 0.5 * lateral)
         else:
-            wind_effect_dist = 0
+            wind_effect_dist = 0.0
 
         block_wind_ok = (avg_w < 20 and wc_dom.startswith("بحرية")) or (wc_dom.startswith("برية") and avg_w <= 15)
         block_wave_ok = 0.6 <= avg_h <= 1.2
-        is_night = (key == "night")
-        is_night_with_tide = is_night and is_close(parse_tidal_time(tidal_windows["HW2"]), safe_parse_time(sunset), 1.5)
-        period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
-        confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings),
-                                                block_wind_ok, block_wave_ok, is_night_with_tide)
+        is_night = key in ("evening", "late_night")
+        hw1_t = parse_tidal_time(tidal_windows["HW1"])
+        hw2_t = parse_tidal_time(tidal_windows["HW2"])
+        sunset_t = safe_parse_time(sunset)
+        sunrise_t = safe_parse_time(sunrise)
+        if key == "late_night":
+            is_night_with_tide = is_night and (is_close(hw1_t, sunrise_t, 1.5) or is_close(hw2_t, sunrise_t, 1.5))
+        elif key == "evening":
+            is_night_with_tide = is_night and (is_close(hw1_t, sunset_t, 1.5) or is_close(hw2_t, sunset_t, 1.5))
+        else:
+            is_night_with_tide = False
 
-        base_dist = 50
-        if avg_h > 0.8: base_dist = 40
-        elif avg_h > 0.5: base_dist = 50
-        else: base_dist = 60
-        recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
+        period_flags_dict = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if press_rate < -2.0 else 0}
+        confidence = calculate_confidence_index(period_flags_dict, period_is_mirror_sea, has_golden_window,
+                                                len(period_nogo), len(period_warnings), block_wind_ok, block_wave_ok, is_night_with_tide)
+
+        if avg_h > 0.8:
+            base_dist = 40
+        elif avg_h > 0.5:
+            base_dist = 50
+        else:
+            base_dist = 60
+        recommended_dist = max(30, min(100, round(base_dist + wind_effect_dist * 1.5)))
+
+        corr_angle = 0 if avg_wd_b is None else casting_angle_correction(avg_wd_b, orient)
+        water_clarity = get_water_clarity(avg_w, avg_h, is_murky, is_weedy, haml_info["status"], avg_vis_b)
+        rig = suggest_rig(haml_info["status"], period_is_lateral_strong, avg_w, period_is_mirror_sea)
+        comfort = calculate_comfort_index(avg_air, avg_w, avg_rh)
+
+        sst_period = [sst[i] for i in idxs if i < len(sst) and sst[i] is not None and 8.0 <= sst[i] <= 35.0]
+        avg_sst_period = sum(sst_period) / len(sst_period) if sst_period else (avg_sst if avg_sst is not None else 20.0)
+
+        active_fish, inactive_fish = get_period_fish_status(avg_sst_period, is_night, is_murky, is_weedy, period_is_mirror_sea,
+                                                            period_lateral_force_ratio, water_clarity, seabass_sst_limit)
+
+        start_time = all_times[target_idx[idxs[0]]].strftime('%H:%M')
+        end_time = all_times[target_idx[idxs[-1]]].strftime('%H:%M')
+        time_range = f"{start_time} - {end_time}"
 
         block_data = {
-            "name":{"morning":"الصباح","afternoon":"الظهيرة","night":"الليل"}[key],
-            "time_range":f"{all_times[target_idx[idxs[0]]].strftime('%H:%M')}-{all_times[target_idx[idxs[-1]]].strftime('%H:%M')}",
+            "name": period_names_arabic[key],
+            "time_range": time_range,
             "sea_state":sea,"wave_height":f"أقصى {max_h:.2f}م",
-            "swell_dir": deg_to_compass(final_swd) if final_swd else ("معدوم" if not actual_swell_exists else "غير معروف"),
-            "wave_dir": deg_to_compass(final_wd) if final_wd else "غير معروف",
+            "swell_dir": deg_to_compass(final_swd) if final_swd is not None else ("معدوم" if not actual_swell_exists else "غير معروف"),
+            "wave_dir": deg_to_compass(final_wd) if final_wd is not None else "غير معروف",
             "swell_angle_diff": round(swell_angle,0) if swell_angle is not None else None,
             "wave_angle_diff": round(wave_angle,0) if wave_angle is not None else None,
             "swell_wave_interaction": swell_wave_interaction,
@@ -959,9 +1170,19 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "wind_gust_peak":round(max_gust_b,1),
             "wind_dir":wc_dom, "air_temp":round(avg_air,1), "weather":weather_desc(most_code),
             "confidence": confidence,
+            "confidence_label": get_confidence_label(confidence),
             "recommended_cast_distance": round(recommended_dist, 0),
+            "casting_angle_correction": corr_angle,
+            "water_clarity": water_clarity,
+            "suggested_rig": rig,
+            "comfort_index": comfort,
             "backwash": backwash,
             "debris": debris,
+            "active_fish": active_fish,
+            "inactive_fish": inactive_fish,
+            "period_warnings": period_warnings,
+            "nogo_reasons": period_nogo,
+            "has_lethal_nogo": has_lethal_nogo,
             "_raw": {
                 "avg_wave_h": round(avg_h, 3), "max_wave_h": round(max_h, 3),
                 "avg_wind": round(avg_w, 1), "max_wind": round(max_w, 1),
@@ -971,64 +1192,98 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 "visibility": round(avg_vis_b, 0),
                 "has_swell": actual_swell_exists,
                 "wave_period": round(avg_wp_b, 1),
+                "wind_dir_deg": round(avg_wd_b, 0) if avg_wd_b is not None else 0,
                 "wind_effect_dist": round(wind_effect_dist, 0),
-                "recommended_cast_distance": round(recommended_dist, 0)
+                "recommended_cast_distance": round(recommended_dist, 0),
+                "press_rate": round(press_rate, 2)
             }
         }
         blocks.append(block_data)
 
-    reds, greens = [], []
-    for i in range(len(wh)):
-        hh = all_times[target_idx[i]].strftime("%H:%M")
-        if wave_power[i] > 3 or wh[i] > 1.8 or wg[i] > 50 or pr[i] < 1005: reds.append(hh)
-        if 0.3 <= wh[i] <= 1 and 0.1 <= wave_power[i] <= 1.5 and ws[i] < 27.8: greens.append(hh)
+    if mirror_with_gusts:
+        names = [period_names_arabic[p] for p in mirror_with_gusts]
+        warnings.append(f"بحر مرآوي مع تموجات سطحية خفيفة بسبب الرياح في: {', '.join(names)}.")
+    if mirror_without_gusts:
+        names = [period_names_arabic[p] for p in mirror_without_gusts]
+        warnings.append(f"بحر مرآوي تام (سطح أملس) في: {', '.join(names)}.")
 
-    weed_analysis = analyze_weed_risk(sea_memory, wh, wd, orient)
-    seasonal_bait = get_seasonal_bait(month, avg_sst)
+    any_pressure_rising = any(
+        b["_raw"].get("press_rate", 0) > 1.5 for b in blocks
+    )
+    any_pressure_dropping = any(
+        b["_raw"].get("press_rate", 0) < -2.0 for b in blocks
+    )
 
-    extra = {
-        "pressure_avg":round(avg_press,1), "peak_gust_today":round(peak_gust,1),
-        "sunrise":sunrise, "sunset":sunset, "max_air_temp": round(max_air_temp, 1),
-        "is_mirror_sea": is_mirror_sea, "tidal_windows": tidal_windows, "golden_windows": golden_windows,
-        "has_swell_data": has_swell_data, "actual_swell_exists": actual_swell_exists,
-        "solunar": solunar, "slack_times": slack_info,
-        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
-        "past_rain_total": round(past_rain_total, 1),
-        "pressure_change": round(press_change, 1),
-        "moon_age_days": round(moon_age, 1),
-        "haml_status": haml_info["status"],
-        "haml_phase": haml_info["phase"],
-        "haml_description": haml_info["description"],
-        "haml_score_delta": haml_info["score_delta"],
-        "platform_advice": platform_advice
-    }
+    all_periods_have_lethal = (populated_periods > 0) and (periods_with_lethal == populated_periods)
+    any_period_has_lethal = periods_with_lethal > 0
 
-    flags = {
-        "is_mirror_sea": is_mirror_sea, "is_lateral_strong": is_lateral_strong,
-        "is_pressure_rising_fast": is_pressure_rising_fast, "is_pressure_dropping_fast": is_pressure_dropping_fast,
-        "is_cross_sea_dangerous": is_cross_sea_dangerous, "is_murky": is_murky, "is_weedy": is_weedy,
-        "has_golden_window": has_golden_window, "is_neap_tide": is_neap_tide, "is_spring_tide": is_spring_tide
-    }
-
-    critical_nogo = [r for r in nogo_reasons if any(kw in r for kw in [
-        "مرآوي", "مختلط خطير", "أوساخ", "صوفة", "يرجع الرصاص", "رياح عاتية",
-        "فترة موجة عالية", "صواعق", "برق", "اضطراب حاد في الضغط", "هائج"
-    ])]
-    if critical_nogo:
+    if all_periods_have_lethal:
         final_verdict = "غير مناسب"
+    elif any_period_has_lethal:
+        final_verdict = "فرصة مع تحفظات"
     elif warnings:
         final_verdict = "فرصة مع تحفظات"
     else:
         final_verdict = "مناسب"
 
+    all_nogo_reasons = []
+    for b in blocks:
+        all_nogo_reasons.extend(b["nogo_reasons"])
+
+    reds, greens = [], []
+    for i in range(len(wh)):
+        hh = all_times[target_idx[i]].strftime("%H:%M")
+        wg_i = safe_float(wg[i]) if i < len(wg) else 0.0
+        pr_i = safe_float(pr[i]) if i < len(pr) else 1013.0
+        ws_i = safe_float(ws[i]) if i < len(ws) else 0.0
+        if wave_power[i] > 3 or safe_float(wh[i]) > 1.8 or wg_i > 50 or pr_i < 1005:
+            reds.append(hh)
+        if 0.3 <= safe_float(wh[i]) <= 1 and 0.1 <= wave_power[i] <= 1.5 and ws_i < 27.8:
+            greens.append(hh)
+
+    weed_analysis = analyze_weed_risk(sea_memory)
+    seasonal_bait = get_seasonal_bait(month, avg_sst if avg_sst is not None else 20.0)
+
+    extra = {
+        "pressure_avg":round(avg_press,1), "peak_gust_today":round(peak_gust_day,1),
+        "sunrise":sunrise, "sunset":sunset, "max_air_temp": round(max_air_temp, 1),
+        "tidal_windows": tidal_windows, "golden_windows": golden_windows,
+        "has_swell_data": has_swell_data, "actual_swell_exists": actual_swell_exists,
+        "solunar": solunar, "slack_times": slack_info,
+        "weed_risk": weed_analysis, "seasonal_bait": seasonal_bait,
+        "past_rain_accumulated_48h": round(accumulated_rain_48h, 1),
+        "max_rain_hourly": round(max_rain_hourly, 1),
+        "pressure_change": round(press_change_day, 1),
+        "pressure_note": pressure_note,
+        "moon_age_days": round(moon_age, 1),
+        "haml_status": haml_info["status"],
+        "haml_phase": haml_info["phase"],
+        "haml_description": haml_info["description"],
+        "haml_score_delta": haml_info["score_delta"],
+        "platform_advice": platform_advice,
+        "sst_stability": sst_stability
+    }
+
+    flags = {
+        "is_mirror_sea": any(b["sea_state"] == "بحر مرآوي" for b in blocks),
+        "is_lateral_strong": day_lateral_ratio > 0.7 and avg_wave_h_day > 0.6,
+        "is_pressure_rising_fast": any_pressure_rising,
+        "is_pressure_dropping_fast": any_pressure_dropping,
+        "is_cross_sea_dangerous": is_cross_sea_dangerous,
+        "is_murky": is_murky, "is_weedy": is_weedy,
+        "has_golden_window": has_golden_window,
+        "is_neap_tide": is_neap_tide, "is_spring_tide": is_spring_tide
+    }
+
     agg_result = {
         "dominant_wind":dominant, "blocks":blocks, "red_flags":reds[:5], "green_flags":greens[:5],
-        "sea_memory":sea_memory, "lateral_current":lateral_current, "pressure_state":pressure_state,
+        "sea_memory":sea_memory, "lateral_current":"تيار جانبي متغير", "pressure_state":pressure_state,
         "tide_analysis":tide_analysis, "sst_stability":sst_stability,
-        "hidden_factors": {"cross_sea_risk": cross_sea_risk, "wave_steepness": steepness_desc, "golden_lock": "مد قوي" if is_spring_tide else "مد ضعيف" if is_neap_tide else "متوسط"},
-        "bio_matrix":bio_matrix, "avg_sst":round(avg_sst,1), "extra_info":extra,
+        "hidden_factors": {"cross_sea_risk": cross_sea_risk, "wave_steepness": steepness_desc,
+                           "golden_lock": "مد قوي" if is_spring_tide else "مد ضعيف" if is_neap_tide else "متوسط"},
+        "avg_sst": avg_sst, "extra_info":extra,
         "transitions": [], "flags": flags,
-        "nogo_reasons": nogo_reasons, "warnings": warnings,
+        "nogo_reasons": all_nogo_reasons, "warnings": warnings,
         "final_verdict": final_verdict,
         "target_month": target_date_obj.month
     }
@@ -1036,54 +1291,63 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     agg_result["score"] = score
     return agg_result
 
-# ==================== التفكيك الديناميكي ====================
+# ---------- Dynamic decomposition ----------
 def format_tidal_flow_periods(tidal_windows: dict) -> dict:
     periods = {}
     for key, time_str in tidal_windows.items():
         h = safe_parse_time(time_str)
         slack_start = format_time((h - 0.5) % 24)
         slack_end = format_time((h + 0.5) % 24)
-        early_start = format_time((h - 1.5) % 24)
+        is_high = key.startswith("HW")
         early_end = slack_start
+        if is_high:
+            early_label = "آخر مد دافع"
+        else:
+            early_label = "آخر جزر ساحب"
         late_start = slack_end
-        late_end = format_time((h + 1.5) % 24)
-        name = "المد العالي" if key.startswith("HW") else "الجزر المنخفض"
+        if is_high:
+            late_label = "بداية جزر ساحب"
+        else:
+            late_label = "بداية مد دافع"
+        name = "المد العالي" if is_high else "الجزر المنخفض"
         periods[key] = {
             "name": name,
             "time": time_str,
-            "early_flow": f"{early_start} - {early_end}",
+            "early_label": early_label,
+            "early_time": early_end,
             "slack": f"{slack_start} - {slack_end}",
-            "late_flow": f"{late_start} - {late_end}",
+            "late_label": late_label,
+            "late_time": late_start,
         }
     return periods
 
 def build_flow_section(tidal_windows: dict) -> str:
     periods = format_tidal_flow_periods(tidal_windows)
-    lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة"]
+    lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة (تقديرية)"]
+    lines.append("↳ تنويه: أوقات المد والجزر تقديرية بهامش خطأ ±30 دقيقة.")
     for key, data in periods.items():
         lines.append(f" * 🌊 {data['name']} ({data['time']}):")
-        lines.append(f"   * 🟢 جريان مبكر: {data['early_flow']}")
+        lines.append(f"   * 🔵 {data['early_label']}: حتى {data['early_time']}")
         lines.append(f"   * 🔴 مياه ميتة: {data['slack']}")
-        lines.append(f"   * 🟢 جريان متأخر: {data['late_flow']}")
-    lines.append("↳ نصيحة: أفضل صيد في الجريان المبكر أو المتأخر. تجنب مركز المياه الميتة.")
+        lines.append(f"   * 🟢 {data['late_label']}: من {data['late_time']}")
+    lines.append("↳ نصيحة: أفضل صيد في نهاية المد الدافع أو بداية الجزر الساحب (حسب الظاهرة). تجنب مركز المياه الميتة.")
     return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
     interactions = []
     extra = agg.get("extra_info", {})
     blocks = agg.get("blocks", [])
-    flags = agg.get("flags", {})
     hidden_factors = agg.get("hidden_factors", {})
     solunar = extra.get("solunar", {})
-    bio_matrix = agg.get("bio_matrix", {})
     warnings = agg.get("warnings", [])
     nogo_reasons = agg.get("nogo_reasons", [])
     final_verdict = agg.get("final_verdict", "غير مناسب")
+    pressure_note = extra.get("pressure_note", "مستقر")
 
-    # إضافة الشروق والغروب
     sunrise = extra.get("sunrise", "غير متوفر")
     sunset = extra.get("sunset", "غير متوفر")
     interactions.append(f"[الشروق والغروب] 🌅 الشروق: {sunrise} | 🌇 الغروب: {sunset}")
+    interactions.append(f"[الضغط الجوي] {pressure_note}")
 
     haml_status = extra.get("haml_status", "")
     haml_phase = extra.get("haml_phase", "")
@@ -1096,14 +1360,21 @@ def calculate_interactions(agg: dict) -> List[str]:
     for b in blocks:
         name = b['name']; time_range = b['time_range']; raw = b.get("_raw", {})
         interactions.append(f"[{name} ({time_range})]")
-        interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}%")
-        sign = '+' if raw.get('wind_effect_dist', 0) > 0 else ''
-        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (الهبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{raw.get('wind_effect_dist',0):.0f}م")
-        interactions.append(f"  🌊 الموج والمسافة: {raw.get('wave_period',0)} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م")
-        active_fish = [f for f, d in bio_matrix.items() if "نشط" in d['status']]
-        inactive_fish = [f for f, d in bio_matrix.items() if "نشط" not in d['status']]
-        interactions.append(f"  🐟 نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
-        interactions.append(f"  💤 خامل: {', '.join(inactive_fish) if inactive_fish else 'لا يوجد'}")
+        interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}% ({b.get('confidence_label','')})")
+        wind_eff = raw.get('wind_effect_dist', 0)
+        if wind_eff > 0:
+            sign = '+'
+        elif wind_eff < 0:
+            sign = ''
+        else:
+            sign = ''
+        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (هبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{wind_eff:.0f}م")
+        wp_val = raw.get('wave_period', 0)
+        interactions.append(f"  🌊 الموج والمسافة: {wp_val:.1f} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م" if wp_val > 0 else "  🌊 الموج والمسافة: غير متوفر")
+        if b.get("nogo_reasons"):
+            interactions.append(f"  ⛔ موانع: {'; '.join(b['nogo_reasons'])}")
+        if b.get("period_warnings"):
+            interactions.append(f"  ⚠️ تحذيرات: {'; '.join(b['period_warnings'])}")
 
     interactions.append(f"[نسبة النجاح] {agg.get('score', 0)}%")
     if final_verdict == "فرصة مع تحفظات":
@@ -1115,28 +1386,43 @@ def calculate_interactions(agg: dict) -> List[str]:
     return interactions
 
 def build_context(req, agg, tz_name):
-    beach = "رملي" if req.beach_type == "sandy" else "صخري"
     extra = agg["extra_info"]
     chain_interactions = calculate_interactions(agg)
     target_date = resolve_target_date(req.target_date, datetime.now(zoneinfo.ZoneInfo(tz_name)).date())
-    date_str = target_date.strftime("%d_%m_%y")
+    date_str = target_date.strftime("%d/%m/%Y")
+
+    if agg["final_verdict"] == "غير مناسب":
+        main_reason = "بحر غير مناسب للصيد في جميع الفترات"
+        if agg["nogo_reasons"]:
+            main_reason = agg["nogo_reasons"][0]
+    elif agg["final_verdict"] == "فرصة مع تحفظات":
+        good_periods = [b["name"] for b in agg["blocks"] if not b["has_lethal_nogo"]]
+        bad_periods = [b["name"] for b in agg["blocks"] if b["has_lethal_nogo"]]
+        if bad_periods:
+            main_reason = f"فترات غير مناسبة: {', '.join(bad_periods)}. فترات مناسبة: {', '.join(good_periods) if good_periods else 'لا يوجد'}"
+        else:
+            main_reason = "توجد تحفظات لكن يمكن التكيف معها"
+    else:
+        main_reason = "ظروف ممتازة للصيد"
 
     facts = [
         f"🎯 0. الملخص التنفيذي ليوم {date_str}",
         f"> نسبة النجاح: {agg['score']}%",
         f">  * القرار النهائي: {agg['final_verdict']}",
+        f">  * السبب الرئيسي: {main_reason}",
         f">  * الطعم المستهدف: {extra.get('seasonal_bait', '')}",
     ]
     facts.append("⏱️ 1. التوقيت المدوي وحركة المياه")
-    facts.append("🌊 مواقيت المد والجزر")
+    facts.append("🌊 مواقيت المد والجزر (تقديرية)")
     for k, v in extra.get("tidal_windows", {}).items():
         name = "المد العالي" if k.startswith("HW") else "الجزر المنخفض"
         facts.append(f" * 🔹 {name}: الساعة {v}")
-    # إضافة الشروق والغروب
     facts.append(f" * 🌅 الشروق: {extra.get('sunrise', '')} | 🌇 الغروب: {extra.get('sunset', '')}")
     facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
     facts.append(f" * 🌊 الوضعية: {extra.get('haml_status', '')} ({extra.get('haml_phase', '')}).")
     facts.append(f" * 📌 حالة البحر: {extra.get('haml_description', '')}")
+    facts.append("🌡️ الضغط الجوي")
+    facts.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')}")
 
     lines = [
         "\n".join(facts),
@@ -1145,6 +1431,7 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
+# ---------- SYSTEM PROMPT (مخفف) ----------
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
 القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
 نسبة النجاح في [نسبة النجاح].
@@ -1154,6 +1441,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 🎯 0. الملخص التنفيذي ليوم (التاريخ)
 > نسبة النجاح العامة: (أدخل النسبة)%
 >  * القرار النهائي: (أدخل القرار)
+>  * السبب الرئيسي: (أدخل السبب)
 >  * الطعم المستهدف: (أدخل الطعم)
 > 
 ⏱️ 1. التوقيت المدوي وحركة المياه
@@ -1166,6 +1454,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 🏖️ مؤشر الشاطئ (أيام الحياء والمات)
  * 🌊 الوضعية: (أدخل الحالة)
  * 📌 حالة البحر: (أدخل الوصف)
+🌡️ الضغط الجوي
+ * الوضع: (حالة الضغط)
 ⏳ فترات سولونار
  * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
  * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
@@ -1174,16 +1464,18 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 (سيتم إنشاؤها تلقائياً)
 
 🕒 3. التفكيك الديناميكي الزمني
-🌅 الفترة الصباحية (04:00 - 11:00)
+🌅 الفترة الصباحية (النطاق الزمني الصحيح)
  * 📊 حالة البحر والثقة: ...
  * 💨 الرياح والرمي: ...
  * 🌊 الموج والمسافة: ...
- * 🐟 الأسماك النشطة: ...
- * 💤 الأسماك الخاملة: ...
+ * ⛔ موانع: (اكتب الموانع الموجودة في البيانات فقط، لا تضف موانع من عندك)
+ * ⚠️ تحذيرات: ...
  * 🔄 ربط العوامل الميدانية: ...
-☀️ فترة الظهيرة (12:00 - 17:00)
+☀️ فترة الظهيرة (النطاق الزمني الصحيح)
 ... (نفس الهيكل)
-🌃 الفترة الليلية (00:00 - 23:00)
+🌆 فترة الغسق (النطاق الزمني الصحيح)
+... (نفس الهيكل)
+🌙 فترة السحر (النطاق الزمني الصحيح)
 ... (نفس الهيكل)
 
 ⚖️ 4. ميزان العوامل الميدانية
@@ -1196,9 +1488,6 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
  * 🛠️ ثقل الرصاص: ...
  * ⏱️ أفضل توقيت: ...
  * 🎯 المسافة والاتجاه: ...
- * 🦐 إستراتيجية الطعم: ...
-> ⚠️ إرشادات السلامة الحتمية:
-> ...
 
 قواعد:
 - لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
@@ -1206,37 +1495,68 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - لا تذكر المركب. لا تستخدم حروفًا لاتينية.
 - اكتب بالدارجة التونسية.
 - لا تكتب القسم 6 (الأرقام المرجعية) فأي نص خاص به سيتم تجاهله.
-- رياح "بحرية مباشرة" أو "بحرية" تعني رياحاً قادمة من البحر نحو الشاطئ، وهي تقلل مسافة الرمي (تأثير سلبي). أما الرياح "برية" فهي تزيد مسافة الرمي (تأثير إيجابي). اعكس ذلك في الوصف.
+- استخدم النطاق الزمني الموجود في البيانات بالضبط لكل فترة، ولا تستبدله بقيم ثابتة.
+- ⛔ في قسم الموانع، لا تضف أي مانع غير موجود في البيانات. لا تخترع موانع مثل 'رياح بحرية مباشرة تؤثر على الرمي' من عندك.
 """
 
 async def call_gemini(ctx):
+    MAX_CONTEXT_CHARS = 30000
+    if len(ctx) > MAX_CONTEXT_CHARS:
+        ctx = ctx[:MAX_CONTEXT_CHARS]
+        logger.warning(f"Context truncated to {MAX_CONTEXT_CHARS} chars")
+
     url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 15000}
     }
-    data = await post_with_retry(url, payload, headers, max_retries=5, is_gemini=True)
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"Unexpected Gemini response format: {data}")
-        raise Exception("تنسيق استجابة Gemini غير متوقع")
+    max_retries = 3
+    timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = await client.post(url, json=payload, headers=headers)
+                if r.status_code == 429:
+                    wait = 20 * attempt
+                    logger.warning(f"Gemini rate limit, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (httpx.HTTPStatusError, KeyError, IndexError) as e:
+                logger.error(f"Gemini call failed: {e}")
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in [429, 500, 502, 503]:
+                    raise
+                if attempt == max_retries:
+                    raise Exception("فشل الاتصال بـ Gemini بعد عدة محاولات")
+                wait = 20 * attempt
+                logger.info(f"Retrying in {wait}s (attempt {attempt})...")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                logger.error(f"Gemini unexpected error: {e}")
+                if attempt == max_retries:
+                    raise Exception("فشل الاتصال بـ Gemini")
+                await asyncio.sleep(20 * attempt)
+    raise Exception("فشل الاتصال بـ Gemini")
 
-# ==================== دوال معالجة النص ====================
+# ---------- Text Helpers ----------
 def fix_time_ranges(text: str) -> str:
     pattern = r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})'
     def repl(m):
         t1, t2 = m.group(1), m.group(2)
         to_min = lambda s: int(s.split(':')[0])*60 + int(s.split(':')[1])
-        if to_min(t1) > to_min(t2):
+        m1, m2 = to_min(t1), to_min(t2)
+        diff = m2 - m1
+        is_swapped_same_day = diff < 0 and abs(diff) < 720
+        if is_swapped_same_day:
             return f"{t2} - {t1}"
         return f"{t1} - {t2}"
     return re.sub(pattern, repl, text)
 
 def fix_broken_time_in_headers(text: str) -> str:
     text = re.sub(r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s*\*\s+(\d{2}:\d{2})\)', r'\1(\2 - \3)', text)
-    text = re.sub(r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s+(\d{2}:\d{2})\)', r'\1(\2 - \3)', text)
     return text
 
 def replace_english_commas(text: str) -> str:
@@ -1251,7 +1571,7 @@ def enforce_line_breaks(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped):
+        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🌆🌙🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌💧😌⛔]', stripped):
             if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]):
                 new_lines.append('')
         new_lines.append(stripped)
@@ -1285,9 +1605,9 @@ def fix_broken_number_lines(text: str) -> str:
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        if re.search(r'\d+:\s*$', line) and i+1 < len(lines):
-            next_line = lines[i+1].strip()
-            if re.match(r'^\d+', next_line):
+        if re.search(r'\b\d{2}:\s*$', line) and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if re.match(r'^\d{2}\b', next_line):
                 merged = line.rstrip() + next_line
                 merged = re.sub(r'(\d+):\s+(\d+)', r'\1:\2', merged)
                 fixed.append(merged)
@@ -1298,45 +1618,23 @@ def fix_broken_number_lines(text: str) -> str:
         i += 1
     return '\n'.join(fixed)
 
-def extract_numbers_from_text(text: str) -> List[float]:
-    return [float(m) for m in re.findall(r'-?\d+\.?\d*', text)]
-
-def get_allowed_numbers(agg: dict) -> Set[float]:
-    allowed = set()
-    for b in agg.get("blocks", []):
-        raw = b.get("_raw", {})
-        for v in raw.values():
-            if isinstance(v, (int, float)) and v > 0:
-                allowed.add(v); allowed.add(round(v,1)); allowed.add(round(v,0))
-        if "confidence" in b: allowed.add(round(b["confidence"],1)); allowed.add(round(b["confidence"],0))
-        if "recommended_cast_distance" in b: allowed.add(round(b["recommended_cast_distance"],1))
-        if "wind_gust_peak" in b: allowed.add(round(b["wind_gust_peak"],1))
-        if b.get("wave_angle_diff") is not None: allowed.add(round(b["wave_angle_diff"],1))
-        if b.get("swell_angle_diff") is not None: allowed.add(round(b["swell_angle_diff"],1))
-    extra = agg.get("extra_info", {})
-    for v in extra.values():
-        if isinstance(v, (int, float)): allowed.add(round(v,1))
-    for v in agg.get("hidden_factors", {}).values():
-        if isinstance(v, (int, float)): allowed.add(round(v,1))
-    allowed.add(round(agg.get("avg_sst",0),1))
-    allowed.add(round(extra.get("max_air_temp",0),1))
-    allowed.add(round(extra.get("peak_gust_today",0),1))
-    allowed.add(round(extra.get("pressure_avg",0),1))
-    allowed.add(float(agg.get("score",0)))
-    return {x for x in allowed if x > 0.5}
-
+# ---------- Main Report Endpoint ----------
 @app.post("/generate-report")
 @limiter.limit("10/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
-        if req.marine_data and req.weather_data:
-            marine_data, weather_data = req.marine_data, req.weather_data
-        else:
-            lat = req.latitude or 36.8; lon = req.longitude or 10.1
-            marine_data = await fetch_marine_data_from_openmeteo(lat, lon)
-            weather_data = await fetch_weather_data_from_openmeteo(lat, lon)
-            if not marine_data or not weather_data:
-                raise HTTPException(502, "تعذر جلب البيانات")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if req.marine_data and req.weather_data:
+                marine_data, weather_data = req.marine_data, req.weather_data
+            else:
+                lat = req.latitude or 36.8; lon = req.longitude or 10.1
+                marine_data, weather_data = await asyncio.gather(
+                    fetch_marine_data_from_openmeteo(client, lat, lon),
+                    fetch_weather_data_from_openmeteo(client, lat, lon),
+                    return_exceptions=True
+                )
+                if isinstance(marine_data, Exception) or isinstance(weather_data, Exception) or not marine_data or not weather_data:
+                    raise HTTPException(502, "تعذر جلب البيانات")
 
         marine_hourly = marine_data.get("hourly", marine_data)
         weather_hourly = weather_data.get("hourly", {})
@@ -1344,21 +1642,35 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         tz_name = marine_data.get("timezone", "Africa/Tunis")
         now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
         target_dt = resolve_target_date(req.target_date, now_tn.date())
-        raw_sr = daily.get("sunrise", ["06:00"])[0]
-        raw_ss = daily.get("sunset", ["18:00"])[0]
-        sunrise = re.search(r'\d{2}:\d{2}', raw_sr).group() if re.search(r'\d{2}:\d{2}', raw_sr) else "06:00"
-        sunset = re.search(r'\d{2}:\d{2}', raw_ss).group() if re.search(r'\d{2}:\d{2}', raw_ss) else "18:00"
+        date_index_map = {"today": 0, "tomorrow": 1, "day_after": 2}
+        day_idx = date_index_map.get(req.target_date, 0)
+
+        sunrise_list = daily.get("sunrise", ["06:00"] * 3)
+        sunset_list  = daily.get("sunset", ["18:00"] * 3)
+        raw_sr = sunrise_list[min(day_idx, len(sunrise_list)-1)] if sunrise_list else "06:00"
+        raw_ss = sunset_list[min(day_idx, len(sunset_list)-1)] if sunset_list else "18:00"
+        m_sr = _TIME_RE.search(raw_sr)
+        sunrise = m_sr.group() if m_sr else "06:00"
+        m_ss = _TIME_RE.search(raw_ss)
+        sunset = m_ss.group() if m_ss else "18:00"
         latitude = req.latitude or 36.8
+        longitude = req.longitude or 10.1
 
         all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
         if not all_times:
             raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
 
-        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude)
+        agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude, longitude)
 
-        if agg["final_verdict"] == "غير مناسب" and any("هائج" in r or "صواعق" in r for r in agg["nogo_reasons"]):
+        HARD_NOGO_KEYWORDS = [
+            "هائج", "صواعق", "ضباب كثيف", "عكارة طينية",
+            "رياح عاتية", "أمواج أرضية", "تيار جانبي عنيف", "تيار راجع عنيف"
+        ]
+        if (agg["final_verdict"] == "غير مناسب" and
+            all(b.get("has_lethal_nogo", False) for b in agg["blocks"]) and
+            any(any(kw in r for kw in HARD_NOGO_KEYWORDS) for r in agg["nogo_reasons"])):
             return {
-                "report": f"❌ غير مناسب ({agg['score']}%) – لا توجد فرصة.",
+                "report": f"❌ غير مناسب ({agg['score']}%) – {agg['nogo_reasons'][0]}",
                 "meta": {"score": agg['score'], "hard_nogo": True}
             }
 
@@ -1376,23 +1688,27 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
         report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
 
-        # القسم الآلي للأرقام المرجعية
-        computed_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        computed_text += f"🔹 حرارة الماء: {agg['avg_sst']}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
-        computed_text += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
+        report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
+
+        # الأرقام المرجعية الخام
+        raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
+        raw_numbers += f"🔹 حرارة الماء: {avg_sst_display}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
+        raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
         for b in agg['blocks']:
             r = b['_raw']
-            sign = '+' if r['wind_effect_dist'] > 0 else ''
-            computed_text += f"🔸 {b['name']} ({b['time_range']}): ثقة {b['confidence']}% | مسافة {b['recommended_cast_distance']}م | موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س | تأثير الرياح {sign}{r['wind_effect_dist']}م\n"
-        computed_text += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-
-        report += computed_text
-
-        allowed = get_allowed_numbers(agg)
-        found_nums = extract_numbers_from_text(report)
-        suspicious = [n for n in found_nums if n > 0.5 and n not in allowed and not (n.is_integer() and 0 <= n <= 59)]
-        if suspicious:
-            logger.warning(f"أرقام مشبوهة (تم تجاهلها): {suspicious}")
+            wind_eff = r['wind_effect_dist']
+            sign = '+' if wind_eff > 0 else ''
+            raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
+                            f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
+                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
+                            f"تأثير الرياح {sign}{wind_eff:.0f}م | "
+                            f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%")
+            if b.get("nogo_reasons"):
+                raw_numbers += f" | ⛔: {'; '.join(b['nogo_reasons'])}"
+            raw_numbers += "\n"
+        raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        report += raw_numbers
 
         clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
         meta = {
