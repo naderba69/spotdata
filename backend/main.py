@@ -1,6 +1,6 @@
 """
-Surfcasting Analytics API – v20.3.14 (Manual Fallback, Moon Age, Green Tides)
-- 1 req/min, short prompt, manual context on Gemini failure.
+Surfcasting Analytics API – v20.3.15 (Manual Fallback Visible, All Audits)
+- 1 req/min, short prompt, manual context on Gemini failure embedded in report.
 - Moon age/hayaa/mat details in report and manual context.
 - Flow section shows only green (starting) times.
 - Manual context contains all numbers for a complete offline report.
@@ -64,7 +64,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.14", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.15", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -93,7 +93,7 @@ async def health():
         pass
     return {
         "status": "ok",
-        "version": "20.3.14",
+        "version": "20.3.15",
         "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
@@ -366,7 +366,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": extract("weather_code", weather_hourly, w_map, 0.0)
     }
 
-# ---------- Beaches (full list) ----------
+# ---------- Beaches ----------
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -1405,7 +1405,7 @@ def fix_broken_number_lines(text: str) -> str:
         i += 1
     return '\n'.join(fixed)
 
-# ---------- Main Endpoint with manual fallback ----------
+# ---------- Main Endpoint with manual fallback (visible) ----------
 @app.post("/generate-report")
 @limiter.limit("1/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
@@ -1527,10 +1527,10 @@ async def _generate_report_inner(req: RawDataReportRequest):
         }
         return {"report": report, "meta": meta}
     except Exception as e:
-        logger.error(f"Gemini failed, returning manual context: {e}")
+        logger.error(f"Gemini failed, embedding manual context into report: {e}")
         manual = generate_manual_context(req, agg, tz_name)
         return {
-            "report": "❌ تعذر توليد التقرير تلقائياً بسبب ضغط API. استخدم النص التالي مع Gemini أو أي نموذج آخر.",
+            "report": "❌ تعذر توليد التقرير تلقائياً بسبب ضغط API. استخدم النص التالي مع Gemini أو أي نموذج آخر:\n\n" + manual,
             "manual_context": manual,
             "meta": {
                 "score": agg["score"],
