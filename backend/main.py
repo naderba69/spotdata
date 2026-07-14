@@ -1,23 +1,12 @@
 """
-Surfcasting Analytics API – v20.3.0 (Zero‑Error, All Audits Applied)
-- circular_mean تقبل 0° (الشمال الحقيقي) وتُرجع None للقائمة الفارغة.
-- wind_effect_dist مصحّحة (بحرية تقلّل المسافة، برية تزيد).
-- all_periods_have_lethal_nogo تُحسب بناءً على الفترات المأهولة فقط.
-- peak_gust و is_pressure_shock تُحسب لكل فترة على حدة.
-- is_weedy أصبح تحذيراً قوياً بدلاً من مانع قاتل.
-- hidden_factors و cross_sea_risk مُسترجعة من حسابات حقيقية.
-- wave_angle_diff = 0 لم يعد يُعامَل كـ Falsy.
-- has_lethal_nogo يُحسب بعد إضافة جميع الموانع.
-- comfort_index يُفعّل hi (مؤشر الحرارة).
-- casting_angle_correction لا يتجاوز ±15°.
-- calculate_solunar مُصحَّحة فلكياً.
-- moon_age_hours المُتغير الميت أُزيل.
-- avg_rh, avg_wp_b, avg_swh_b تستبعد الأصفار.
-- avg_sst يقبل القيم بين 8 و 35°م.
-- fix_time_ranges يستخدم <=720.
-- suggest_rig بدون حروف لاتينية.
-- hard_nogo يشمل الموانع الجديدة.
-- جميع تحسينات الإصدارات السابقة.
+Surfcasting Analytics API – v20.3.1 (Zero‑Error, Mirror‑Sea & Direction Fixed)
+- period_is_mirror_sea = max_h < 0.3 (بدون شرط الهبات).
+- تحذير عند مرآوي مع هبات ≥ 15 كم/س.
+- إصلاح عرض swell_dir/wave_dir عندما تكون 0° (شمال حقيقي).
+- عرض تأثير الرياح 0م بدون +-.
+- is_pressure_shock أصبح تحذيراً عاماً بدلاً من مانع لكل فترة.
+- تعليمات System Prompt لمنع إضافة موانع وهمية.
+- جميع تحسينات v20.3.0 مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -65,7 +54,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.1", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -85,7 +74,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "20.3.0"}
+    return {"status": "ok", "version": "20.3.1"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v):
@@ -643,7 +632,6 @@ def apply_scoring(agg: dict) -> int:
         score += 15
     if any(0.6 <= b["_raw"]["avg_wave_h"] <= 1.2 for b in blocks):
         score += 20
-    # إصلاح Falsy 0.0
     if any(b.get("wave_angle_diff") is not None and b["wave_angle_diff"] < 30 and b["_raw"]["avg_wave_h"] >= 0.6 for b in blocks):
         score += 15
     if flags["has_golden_window"]:
@@ -932,11 +920,14 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if period_total_force > 1e-9:
             period_lateral_force_ratio = abs(period_lateral_fx) / period_total_force
 
-        period_is_mirror_sea = max_h < 0.3 and max_gust_b < 15
+        # شرط المرآوي بدون هبات
+        period_is_mirror_sea = max_h < 0.3
         period_is_lateral_strong = period_lateral_force_ratio > 0.7 and avg_h > 0.6
 
         if period_is_mirror_sea:
             sea = "بحر مرآوي"
+            if max_gust_b >= 15:
+                warnings.append("بحر مرآوي مع تموجات سطحية خفيفة بسبب الرياح.")
         elif max_h < 0.9:
             sea = "هادئ"
         elif max_h < 1.3:
@@ -944,7 +935,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         else:
             sea = "هائج"
 
-        # --- موانع الفترة (بدون is_weedy وبدون backwash/debris بعد) ---
+        # --- موانع الفترة ---
         period_nogo = []
         if period_is_mirror_sea:
             period_nogo.append("بحر مرآوي تام (أقل من 0.3م): لا تيارات ولا حركة سطحية، الأسماك لا تقترب.")
@@ -954,9 +945,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             period_nogo.append(f"أمواج أرضية عالية الطاقة (فترة {avg_wp_b:.1f} > 10 ثوانٍ مع ارتفاع {avg_h:.2f}م): تجرف الرصاص وتدفن الخيوط.")
         if most_code in [95, 96, 99]:
             period_nogo.append("خطر الصواعق والبرق: قصبة الكاربون تجذب البرق، لا ترفعها.")
-        # الضغط: نستخدم is_pressure_shock العام (تحذير) لكنه ليس مانعاً للفترة هنا
-        if is_pressure_shock:
-            period_nogo.append(f"اضطراب حاد في الضغط الجوي (> 4 hPa/3h): الأسماك تتوقف عن الأكل تماماً.")
         if max_gust_b > 60:
             period_nogo.append(f"رياح عاتية في هذه الفترة (هبات {max_gust_b:.0f} > 60 كم/س): تمنع الرمي الآمن وقد تقطع الخيط.")
         # عكارة طينية
@@ -1035,8 +1023,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "name": {"morning":"الصباح","afternoon":"الظهيرة","evening":"الغسق","late_night":"السحر"}[key],
             "time_range": time_range,
             "sea_state":sea,"wave_height":f"أقصى {max_h:.2f}م",
-            "swell_dir": deg_to_compass(final_swd) if final_swd else ("معدوم" if not actual_swell_exists else "غير معروف"),
-            "wave_dir": deg_to_compass(final_wd) if final_wd else "غير معروف",
+            # إصلاح عرض 0° شمال
+            "swell_dir": deg_to_compass(final_swd) if final_swd is not None else ("معدوم" if not actual_swell_exists else "غير معروف"),
+            "wave_dir": deg_to_compass(final_wd) if final_wd is not None else "غير معروف",
             "swell_angle_diff": round(swell_angle,0) if swell_angle is not None else None,
             "wave_angle_diff": round(wave_angle,0) if wave_angle is not None else None,
             "swell_wave_interaction": swell_wave_interaction,
@@ -1214,8 +1203,15 @@ def calculate_interactions(agg: dict) -> List[str]:
         name = b['name']; time_range = b['time_range']; raw = b.get("_raw", {})
         interactions.append(f"[{name} ({time_range})]")
         interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}% ({b.get('confidence_label','')})")
-        sign = '+' if raw.get('wind_effect_dist', 0) >= 0 else ''
-        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (هبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{raw.get('wind_effect_dist',0):.0f}م")
+        # إصلاح عرض +-0.0م
+        wind_eff = raw.get('wind_effect_dist', 0)
+        if wind_eff > 0:
+            sign = '+'
+        elif wind_eff < 0:
+            sign = ''
+        else:
+            sign = ''
+        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (هبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{wind_eff:.0f}م")
         wp_val = raw.get('wave_period', 0)
         wp_text = f"{wp_val:.1f}" if wp_val > 0 else "غير متوفر"
         interactions.append(f"  🌊 الموج والمسافة: {wp_text} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م")
@@ -1326,7 +1322,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
  * 😌 مؤشر الراحة: ...
  * 🐟 الأسماك النشطة: ...
  * 💤 الأسماك الخاملة: ...
- * ⛔ موانع: ...
+ * ⛔ موانع: (اكتب الموانع الموجودة في البيانات فقط، لا تضف موانع من عندك)
  * 🔄 ربط العوامل الميدانية: ...
 ☀️ فترة الظهيرة (النطاق الزمني الصحيح)
 ... (نفس الهيكل)
@@ -1356,6 +1352,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 - اكتب بالدارجة التونسية.
 - لا تكتب القسم 6 (الأرقام المرجعية) فأي نص خاص به سيتم تجاهله.
 - استخدم النطاق الزمني الموجود في البيانات بالضبط لكل فترة، ولا تستبدله بقيم ثابتة.
+- ⛔ في قسم الموانع، لا تضف أي مانع غير موجود في البيانات. لا تخترع موانع مثل 'رياح بحرية مباشرة تؤثر على الرمي' من عندك.
 """
 
 async def call_gemini(ctx):
@@ -1541,11 +1538,17 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
         for b in agg['blocks']:
             r = b['_raw']
-            sign = '+' if r['wind_effect_dist'] >= 0 else ''
+            wind_eff = r['wind_effect_dist']
+            if wind_eff > 0:
+                sign = '+'
+            elif wind_eff < 0:
+                sign = ''
+            else:
+                sign = ''
             raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
                             f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
                             f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
-                            f"تأثير الرياح {sign}{r['wind_effect_dist']}م | "
+                            f"تأثير الرياح {sign}{wind_eff:.0f}م | "
                             f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%")
             if b.get("nogo_reasons"):
                 raw_numbers += f" | ⛔: {'; '.join(b['nogo_reasons'])}"
