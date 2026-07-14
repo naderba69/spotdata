@@ -1,10 +1,8 @@
 """
-Surfcasting Analytics API – v19.7.2 (Zero‑Error, Day in Haml/Mat clarified)
-- دالة get_haml_mat_status تحسب بدقة اليوم (1-3) في حمل البدر أو حمل المحاق.
-- قسم "مؤشر الشاطئ" في التقرير يُظهر اليوم الحالي بوضوح.
-- تم إصلاح عرض النطاق الليلي بشكل صحيح.
-- تمت إضافة حالة الضغط الجوي إلى التقرير.
-- جميع التحسينات السابقة مدمجة.
+Surfcasting Analytics API – v19.7.2 (Zero‑Error, Night Range & Pressure Fixed)
+- تم إصلاح عرض النطاق الليلي ليكون دقيقاً (مثلاً 18:00 - 04:00) دون تدخل Gemini.
+- تم إظهار حالة الضغط الجوي في قسم التفاعلات (مستقر، يرتفع، ينخفض).
+- جميع تحسينات v19.7.1 مضمنة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -211,7 +209,6 @@ def get_moon_age_days(d: date) -> float:
     return age
 
 def get_haml_mat_status(age_days: float) -> dict:
-    """تُرجع حالة الحياء/المات ورقم اليوم بدقة."""
     if 13 <= age_days <= 16:
         day_in = int(age_days - 13) + 1
         return {
@@ -926,6 +923,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if night_times:
                 start_dt = min(night_times)
                 end_dt = max(night_times)
+                # نضمن ظهور النطاق الحقيقي
                 time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
                 if start_dt.date() != end_dt.date():
                     time_range += " (بعد منتصف الليل)"
@@ -984,7 +982,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "past_rain_accumulated_48h": round(accumulated_rain_48h, 1),
         "max_rain_hourly": round(max_rain_hourly, 1),
         "pressure_change": round(press_change, 1),
-        "pressure_note": pressure_note,
+        "pressure_note": pressure_note,          # إضافة حالة الضغط
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"],
         "haml_phase": haml_info["phase"],
