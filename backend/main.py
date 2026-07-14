@@ -1,13 +1,10 @@
 """
-Surfcasting Analytics API – v20.0.0 (Tactical & Comfort Upgrade)
-- مؤشر شفافية المياه (Water Clarity Index) يُضاف لكل فترة.
-- اقتراح المونتاج (Rig Architecture) بناءً على قوة التيار والرياح.
-- تصحيح زاوية الرمي الديناميكية لتعويض الرياح الجانبية.
-- مؤشر الراحة الشخصية (Comfort Index) لسلامة الصياد.
-- تدريج نسب الثقة (Confidence Tiering) مع تسميات وصفية.
-- تقسيم الفترة الليلية إلى "غسق" و"سحر" بدلاً من كتلة واحدة.
-- إضافة زاوية الرياح (بالدرجات) في الأرقام المرجعية.
-- جميع تحسينات الإصدارات السابقة.
+Surfcasting Analytics API – v20.1.0 (Wind Lateral Fix, Dynamic Fish, Score Ceiling)
+- تم تصحيح معادلة تأثير الرياح الجانبية لتقليل التضخيم.
+- تم نقل تقييم نشاط الأسماك إلى داخل كل فترة زمنية (ديناميكي).
+- تم تحديد سقف 95% لنسبة النجاح عند وجود تحذيرات.
+- تم إضافة الرطوبة النسبية إلى البيانات المستخرجة.
+- جميع تحسينات v20.0.0 مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -55,7 +52,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.0.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.1.0", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -75,7 +72,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "20.0.0"}
+    return {"status": "ok", "version": "20.1.0"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v):
@@ -362,6 +359,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "wind_gusts_10m": extract("wind_gusts_10m", weather_hourly, w_map),
         "pressure_msl": extract("pressure_msl", weather_hourly, w_map),
         "temperature_2m": extract("temperature_2m", weather_hourly, w_map),
+        "relative_humidity_2m": extract("relative_humidity_2m", weather_hourly, w_map),
         "precipitation": extract("precipitation", weather_hourly, w_map),
         "visibility": extract("visibility", weather_hourly, w_map),
         "weather_code": [int(safe_float(x)) for x in extract("weather_code", weather_hourly, w_map)]
@@ -521,7 +519,7 @@ def casting_angle_correction(wind_dir, orient):
 def calculate_comfort_index(temp, wind_speed, humidity=None):
     """مؤشر الراحة (0-100)، أعلى = أفضل"""
     if humidity is None:
-        humidity = 50  # افتراضي
+        humidity = 50
     # Heat Index مبسط
     hi = temp + 0.5 * (humidity - 50) if humidity > 40 else temp
     # Wind Chill (إذا كانت الحرارة منخفضة)
@@ -657,9 +655,63 @@ def apply_scoring(agg: dict) -> int:
     score += haml_delta
 
     score = max(0, min(100, score))
+    # إذا كانت هناك تحذيرات، نحدد السقف بـ 95
+    if agg.get("warnings") and len(agg["warnings"]) > 0:
+        score = min(score, 95)
     return score
 
 # ---------- Physical Aggregation ----------
+def get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea, lateral_force_ratio, water_clarity, seabass_sst_limit):
+    """حساب الأسماك النشطة والخاملة لهذه الفترة فقط"""
+    active = []
+    inactive = []
+    # القاروص
+    if (is_night or is_murky) and avg_sst < seabass_sst_limit:
+        active.append("قاروص")
+    else:
+        inactive.append("قاروص")
+    # الدنيس
+    if avg_sst > 18 and not is_mirror_sea:
+        active.append("دنيس")
+    else:
+        inactive.append("دنيس")
+    # البوري
+    if not is_murky and not is_weedy and not is_mirror_sea:
+        active.append("بوري")
+    else:
+        inactive.append("بوري")
+    # السارغ
+    if avg_sst <= 22:
+        active.append("سارغ")
+    else:
+        inactive.append("سارغ")
+    # المرمار
+    if avg_sst > 18 and not is_mirror_sea and lateral_force_ratio > 0.2:
+        active.append("مرمار")
+    else:
+        inactive.append("مرمار")
+    # الشلبة
+    if avg_sst > 17 and not is_mirror_sea:
+        active.append("شلبة")
+    else:
+        inactive.append("شلبة")
+    # التريلية
+    if avg_sst > 18 and not is_murky:
+        active.append("تريلية")
+    else:
+        inactive.append("تريلية")
+    # البغبغان
+    if avg_sst > 19 and is_murky:
+        active.append("بغبغان")
+    else:
+        inactive.append("بغبغان")
+    # السوبيا: تنشط ليلاً أو عند العكارة
+    if avg_sst > 18 and not is_mirror_sea and (is_night or "عكر" in water_clarity):
+        active.append("سوبيا")
+    else:
+        inactive.append("سوبيا")
+    return active, inactive
+
 def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset, latitude, longitude):
     tz = all_times[0].tzinfo if all_times else zoneinfo.ZoneInfo("UTC")
     target_start = datetime.combine(target_date_obj, datetime.min.time(), tzinfo=tz)
@@ -672,7 +724,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     warnings = []
 
     empty_res = {
-        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","bio_matrix":{},"avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "غير مناسب", "score": 0
+        "sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","avg_sst":0,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{}, "transitions":[], "flags":{}, "nogo_reasons":[], "warnings":[], "final_verdict": "غير مناسب", "score": 0
     }
     if not target_idx:
         return empty_res
@@ -817,54 +869,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         pressure_note = "ينخفض (إيجابي)"
     pressure_state = f"{pressure_note} ({press_change:+.1f} hPa/3h)"
 
-    bio_matrix = {
-        "قاروص": {
-            "status": "نشط جداً" if (avg_sst < seabass_sst_limit and is_murky) else "نشط" if avg_sst < seabass_sst_limit else "غائب تقريباً",
-            "reason": f"يحتاج عكراً ودرجة أقل من {seabass_sst_limit}°م. الضغط: {pressure_note}.",
-            "preferences": "14-20°م | متوسط الهيجان | تيار معتدل | عكارة خفيفة-متوسطة | الفجر، الغروب، الليل | السردين، القمبري، الحبار"
-        },
-        "دنيس": {
-            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
-            "reason": "يحب الماء الدافئ قرب الصخور، الموج والعكارة الخفيفة تخرجه للبحث عن القشريات.",
-            "preferences": "18-24°م | هادئ-متوسط | تيار ضعيف-متوسط | عكارة خفيفة | الفجر، الغروب | الحبار، الدود، القمبري"
-        },
-        "بوري": {
-            "status": "نشط" if (not is_murky and not is_weedy and not is_mirror_sea) else "خامل",
-            "reason": "يحتاج حركة سطحية. في بحر مرآوي يختفي تماماً." if is_mirror_sea else "يحتاج حركة سطحية.",
-            "preferences": "16-26°م | أي حالة | تيار سطحي للعوالق | ماء نظيف | النهار كله | عجينة، دود، خبز"
-        },
-        "سارغ": {
-            "status": "ضعيف" if avg_sst > 22 else "نشط",
-            "reason": "يتأثر بالحرارة." if avg_sst > 22 else "درجة الحرارة مناسبة.",
-            "preferences": "16-22°م | هادئ-متوسط | أي تيار | ماء نظيف | الفجر والغروب | القمبري، الحبار، الدود"
-        },
-        "مرمار": {
-            "status": "نشط" if (avg_sst > 18 and not is_mirror_sea and lateral_force_ratio > 0.2) else "خامل",
-            "reason": "يتجمع في أسراب نهاراً، يحتاج تياراً يجلب العوالق.",
-            "preferences": "18-26°م | هادئ-متوسط | تيار معتدل | ماء نظيف-قليل العكارة | النهار | دود، قمبري صغير، عجينة"
-        },
-        "شلبة": {
-            "status": "نشط" if (avg_sst > 17 and not is_mirror_sea) else "خامل",
-            "reason": "يفضل المياه الدافئة قرب الصخور والأعشاب.",
-            "preferences": "17-25°م | هادئ-متوسط | تيار معتدل | ماء نظيف | الصباح الباكر | القمبري، الحبار"
-        },
-        "تريلية": {
-            "status": "نشط" if (avg_sst > 18 and not is_murky) else "خامل",
-            "reason": "تحب المياه الدافئة والواضحة، تتجمع في أسراب نهاراً.",
-            "preferences": "18-26°م | هادئ | أي تيار | ماء نظيف | النهار | السردين، العجينة"
-        },
-        "بغبغان": {
-            "status": "نشط" if (avg_sst > 19 and is_murky) else "خامل",
-            "reason": "يحب العكارة والمياه الدافئة، ينشط قرب القاع.",
-            "preferences": "19-27°م | متوسط الهيجان | تيار معتدل | عكارة | الليل | السردين، القمبري"
-        },
-        "سوبيا": {
-            "status": "نشط (ليلاً بشكل رئيسي)" if (avg_sst > 18 and not is_mirror_sea) else "خامل",
-            "reason": "يظهر ليلاً مع المد العالي، يحب الأضواء والقاع الرملي. قد يكون نشاطه محدوداً نهاراً.",
-            "preferences": "18-24°م | هادئ-متوسط | تيار قوي | ماء نظيف | الليل مع المد العالي | السردين، الحبار"
-        }
-    }
-
     peak_gust = max(wg) if wg else 0.0
     if peak_gust > 60:
         nogo_reasons.append(f"رياح عاتية (هبات {peak_gust:.0f} > 60 كم/س): تمنع الرمي الآمن وقد تقطع الخيط.")
@@ -876,7 +880,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if 4 <= h <= 11: periods["morning"].append(idx)
         elif 12 <= h <= 17: periods["afternoon"].append(idx)
         else:
-            # تقسيم الليل: غسق (قبل منتصف الليل) وسحر (بعد منتصف الليل)
             if h >= 18: periods["evening"].append(idx)
             else: periods["late_night"].append(idx)
 
@@ -925,7 +928,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
 
         # حالة البحر
-        if max_h < 0.3 and max_gust_b < 15:  # إضافة شرط الهبات للمرآوي
+        if max_h < 0.3 and max_gust_b < 15:
             sea = "بحر مرآوي"
         elif max_h < 0.9:
             sea = "هادئ"
@@ -962,10 +965,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if diff_sw > 40: swell_wave_interaction = "متقاطعان بشدة"
             elif diff_sw > 25: swell_wave_interaction = "متقاطعان بسيط"
 
-        # حساب تأثير الرياح (باستخدام الإسقاط)
+        # حساب تأثير الرياح (مصحح)
         wind_dir_rad = math.radians(avg_wd_b)
         orient_rad = math.radians(orient)
-        wind_effect_dist = avg_w * math.cos(wind_dir_rad - orient_rad)
+        frontal = math.cos(wind_dir_rad - orient_rad)
+        lateral = abs(math.sin(wind_dir_rad - orient_rad))
+        wind_effect_dist = avg_w * frontal * (1 - 0.6 * lateral)
 
         block_wind_ok = (avg_w < 20 and wc_dom.startswith("بحرية")) or (wc_dom.startswith("برية") and avg_w <= 15)
         block_wave_ok = 0.6 <= avg_h <= 1.2
@@ -979,7 +984,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if avg_h > 0.8: base_dist = 40
         elif avg_h > 0.5: base_dist = 50
         else: base_dist = 60
-        recommended_dist = max(20, min(100, base_dist + wind_effect_dist * 2))
+        recommended_dist = max(20, min(100, round(base_dist + wind_effect_dist * 1.5)))
 
         # زاوية التصحيح
         corr_angle = casting_angle_correction(avg_wd_b, orient)
@@ -992,6 +997,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
         # الراحة
         comfort = calculate_comfort_index(avg_air, avg_w, avg_rh)
+
+        # الأسماك النشطة والخاملة لهذه الفترة
+        active_fish, inactive_fish = get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea, lateral_force_ratio, water_clarity, seabass_sst_limit)
 
         start_time = all_times[target_idx[idxs[0]]].strftime('%H:%M')
         end_time = all_times[target_idx[idxs[-1]]].strftime('%H:%M')
@@ -1018,6 +1026,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "comfort_index": comfort,
             "backwash": backwash,
             "debris": debris,
+            "active_fish": active_fish,
+            "inactive_fish": inactive_fish,
             "_raw": {
                 "avg_wave_h": round(avg_h, 3), "max_wave_h": round(max_h, 3),
                 "avg_wind": round(avg_w, 1), "max_wind": round(max_w, 1),
@@ -1081,7 +1091,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "sea_memory":sea_memory, "lateral_current":lateral_current, "pressure_state":pressure_state,
         "tide_analysis":tide_analysis, "sst_stability":sst_stability,
         "hidden_factors": {"cross_sea_risk": cross_sea_risk, "wave_steepness": steepness_desc, "golden_lock": "مد قوي" if is_spring_tide else "مد ضعيف" if is_neap_tide else "متوسط"},
-        "bio_matrix":bio_matrix, "avg_sst":round(avg_sst,1), "extra_info":extra,
+        "avg_sst":round(avg_sst,1), "extra_info":extra,
         "transitions": [], "flags": flags,
         "nogo_reasons": nogo_reasons, "warnings": warnings,
         "final_verdict": final_verdict,
@@ -1139,7 +1149,6 @@ def calculate_interactions(agg: dict) -> List[str]:
     blocks = agg.get("blocks", [])
     hidden_factors = agg.get("hidden_factors", {})
     solunar = extra.get("solunar", {})
-    bio_matrix = agg.get("bio_matrix", {})
     warnings = agg.get("warnings", [])
     nogo_reasons = agg.get("nogo_reasons", [])
     final_verdict = agg.get("final_verdict", "غير مناسب")
@@ -1172,10 +1181,8 @@ def calculate_interactions(agg: dict) -> List[str]:
         interactions.append(f"  💧 عكارة الماء: {b.get('water_clarity','غير معروف')}")
         interactions.append(f"  🛠️ المونتاج: {b.get('suggested_rig','عادي')}")
         interactions.append(f"  😌 مؤشر الراحة: {b.get('comfort_index',50)}%")
-        active_fish = [f for f, d in bio_matrix.items() if "نشط" in d['status']]
-        inactive_fish = [f for f, d in bio_matrix.items() if "نشط" not in d['status']]
-        interactions.append(f"  🐟 نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
-        interactions.append(f"  💤 خامل: {', '.join(inactive_fish) if inactive_fish else 'لا يوجد'}")
+        interactions.append(f"  🐟 نشط: {', '.join(b.get('active_fish', [])) if b.get('active_fish') else 'لا يوجد'}")
+        interactions.append(f"  💤 خامل: {', '.join(b.get('inactive_fish', [])) if b.get('inactive_fish') else 'لا يوجد'}")
 
     interactions.append(f"[نسبة النجاح] {agg.get('score', 0)}%")
     if final_verdict == "فرصة مع تحفظات":
