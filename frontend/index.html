@@ -240,7 +240,7 @@
     const reportCard=document.getElementById('reportCard');
     const reportContent=document.getElementById('reportContent');
 
-    submitBtn.addEventListener('click',async ()=>{
+    submitBtn.addEventListener('click', async () => {
       const lat = parseFloat(document.getElementById('latitude').value);
       const lng = parseFloat(document.getElementById('longitude').value);
       const orient = parseInt(document.getElementById('orientation').value);
@@ -270,7 +270,7 @@
         };
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 90000);
+        const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 دقيقة كافية لـ retry + fallback
         const resp = await fetch(`${API_BASE}/generate-report`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -279,21 +279,24 @@
         });
         clearTimeout(timeoutId);
 
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}));
-          throw new Error(err.detail || `خطأ ${resp.status}`);
-        }
         const data = await resp.json();
-        reportContent.textContent = data.report || 'لم يصدر تقرير';
-        reportCard.classList.remove('hidden');
-        reportCard.scrollIntoView({behavior:'smooth'});
+
+        // عرض التقرير سواء كان آلياً أو يدوياً (الخادم يضمن وجود report دائماً)
+        if (data.report) {
+          reportContent.textContent = data.report;
+          reportCard.classList.remove('hidden');
+          reportCard.scrollIntoView({ behavior: 'smooth' });
+        } else {
+          alert('❌ لم يتم استلام تقرير.');
+        }
       } catch (e) {
         if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة الانتظار (90 ثانية). حاول مجدداً.');
+          alert('❌ انتهت مهلة الانتظار (دقيقتان). حاول مجدداً.');
         } else {
           alert('❌ فشل جلب التقرير:\n' + e.message);
         }
       } finally {
+        // إخفاء شاشة التحميل في جميع الحالات
         loadingOverlay.classList.add('hidden');
         submitBtn.disabled = false;
       }
