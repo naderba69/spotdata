@@ -1,20 +1,10 @@
 """
-Surfcasting Analytics API – v20.3.9 (Zero‑Error, Optimized Context)
-- SYSTEM_PROMPT: حذف أقسام "إستراتيجية الطعم" و"إرشادات السلامة" لتخفيف حجم السياق.
-- تقليل التفاصيل المرسلة إلى Gemini (التركيز على حالة البحر، الرياح، الموانع والتحذيرات).
-- جميع التحليلات المتقدمة (أسماك، مونتاج، راحة، عكارة، ضغط) محفوظة في الأرقام المرجعية الخام.
-- آلية إعادة محاولة Gemini بحد أقصى 3 محاولات (20/30/40 ثانية).
-- إخفاء مفتاح API من سجلات httpx.
-- إصلاح منطق apply_scoring للرياح البرية (any بدلاً من for/break).
-- إصلاح fix_time_ranges (abs(diff) < 720).
-- إزالة سطر Regex المكرر في fix_broken_time_in_headers.
-- دعم avg_sst = None عند غياب البيانات مع حماية scoring.
-- pressure_state اليومي يُحسب من press_change_day.
-- press_rate لكل فترة يُضاف إلى _raw.
-- period_warnings تُضاف إلى block_data.
-- شرط القاروص يشمل lateral_force_ratio وعدم المرآوي.
-- تحذيرات المرآوي تُضاف مرة واحدة بعد الحلقة.
-- جميع التحسينات السابقة مدمجة.
+Surfcasting Analytics API – v20.3.10 (Zero‑Error, Overpass Exclusive)
+- تحديد الاتجاه حصراً من OpenStreetMap عبر Overpass API.
+- استخدام خوادم Overpass احتياطية (primary + fallbacks) لكل نصف قطر.
+- تأخير 1.5 ثانية بين محاولات كل خادم لتجنب الإغراق.
+- إرجاع خطأ HTTP 502 مع رسالة واضحة عند فشل كل المحاولات.
+- جميع تحسينات v20.3.9 مضمنة (تحسين السياق، الضغط اليومي، إلخ).
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -41,7 +31,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY مفقود")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# خوادم Overpass (الرئيسي + احتياطية)
+OVERPASS_SERVERS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+]
+
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 
 _TIME_RE = re.compile(r'\d{2}:\d{2}')
@@ -67,7 +65,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.9", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.10", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -87,7 +85,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "20.3.9"}
+    return {"status": "ok", "version": "20.3.10"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v) -> float:
@@ -467,48 +465,53 @@ def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> 
     return nearest
 
 async def get_auto_orientation_overpass(lat, lon):
-    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": USER_AGENT}) as client:
+    async with httpx.AsyncClient(timeout=40, headers={"User-Agent": USER_AGENT}) as client:
         for radius in [3000, 5000, 10000]:
             query = f"""[out:json];(way(around:{radius},{lat},{lon})["natural"="coastline"];);out geom;"""
-            try:
-                r = await client.get(OVERPASS_URL, params={"data": query})
-                r.raise_for_status()
-                els = r.json().get("elements", [])
-                if not els: continue
-                best_dist, best_tangent, best_point = float('inf'), None, None
-                for el in els:
-                    geom = el.get("geometry", [])
-                    if len(geom) < 2: continue
-                    closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
-                    p = geom[closest_idx]
-                    d = calc_distance(lat, lon, p["lat"], p["lon"])
-                    if d < best_dist:
-                        best_dist, best_point = d, p
-                        prev_i = closest_idx - 1 if closest_idx > 0 else 0
-                        next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
-                        if prev_i != next_i:
-                            best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-                if not best_tangent or not best_point: continue
-                perp1 = (best_tangent + 90) % 360
-                perp2 = (best_tangent - 90) % 360
-                to_user = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
-                diff1 = angle_diff(perp1, to_user)
-                diff2 = angle_diff(perp2, to_user)
-                seaward = perp1 if diff1 > diff2 else perp2
-                return int(round(seaward))
-            except Exception as e:
-                logger.warning(f"Overpass orientation failed at radius {radius}: {e}")
-                continue
+            for server in OVERPASS_SERVERS:
+                try:
+                    await asyncio.sleep(1.5)  # تأخير لتجنب الإغراق
+                    r = await client.get(server, params={"data": query})
+                    r.raise_for_status()
+                    els = r.json().get("elements", [])
+                    if not els:
+                        continue
+                    best_dist, best_tangent, best_point = float('inf'), None, None
+                    for el in els:
+                        geom = el.get("geometry", [])
+                        if len(geom) < 2: continue
+                        closest_idx = min(range(len(geom)), key=lambda i: calc_distance(lat, lon, geom[i]["lat"], geom[i]["lon"]))
+                        p = geom[closest_idx]
+                        d = calc_distance(lat, lon, p["lat"], p["lon"])
+                        if d < best_dist:
+                            best_dist, best_point = d, p
+                            prev_i = closest_idx - 1 if closest_idx > 0 else 0
+                            next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
+                            if prev_i != next_i:
+                                best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
+                    if not best_tangent or not best_point: continue
+                    perp1 = (best_tangent + 90) % 360
+                    perp2 = (best_tangent - 90) % 360
+                    to_user = calc_bearing(best_point["lat"], best_point["lon"], lat, lon)
+                    diff1 = angle_diff(perp1, to_user)
+                    diff2 = angle_diff(perp2, to_user)
+                    seaward = perp1 if diff1 > diff2 else perp2
+                    return int(round(seaward))
+                except Exception as e:
+                    logger.warning(f"Overpass attempt failed (server: {server}, radius: {radius}): {e}")
+                    continue
     return 0
 
 @app.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
-    if orientation != 0: return {"orientation": orientation, "source": "overpass"}
-    info = find_nearest_beach_info(req.latitude, req.longitude)
-    if info: return {"orientation": info["orientation"], "source": "nearest_beach"}
-    return {"orientation": -1, "source": "none", "message": "تعذر التحديد التلقائي."}
+    if orientation == 0:
+        raise HTTPException(
+            status_code=502,
+            detail="تعذر تحديد اتجاه الشاطئ من الخريطة. يرجى المحاولة لاحقاً أو إدخال الاتجاه يدوياً."
+        )
+    return {"orientation": orientation, "source": "overpass"}
 
 @app.post("/detect-bottom-type")
 @limiter.limit("10/minute")
@@ -522,7 +525,7 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     );out body;"""
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": USER_AGENT}) as client:
         try:
-            r = await client.get(OVERPASS_URL, params={"data": query})
+            r = await client.get(OVERPASS_SERVERS[0], params={"data": query})
             r.raise_for_status()
             data = r.json()
             elements = data.get("elements", [])
