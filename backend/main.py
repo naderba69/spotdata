@@ -1,8 +1,20 @@
 """
-Surfcasting Analytics API – v20.3.7 (Zero‑Error, Final Polished Edition)
+Surfcasting Analytics API – v20.3.9 (Zero‑Error, Optimized Context)
+- SYSTEM_PROMPT: حذف أقسام "إستراتيجية الطعم" و"إرشادات السلامة" لتخفيف حجم السياق.
+- تقليل التفاصيل المرسلة إلى Gemini (التركيز على حالة البحر، الرياح، الموانع والتحذيرات).
+- جميع التحليلات المتقدمة (أسماك، مونتاج، راحة، عكارة، ضغط) محفوظة في الأرقام المرجعية الخام.
+- آلية إعادة محاولة Gemini بحد أقصى 3 محاولات (20/30/40 ثانية).
+- إخفاء مفتاح API من سجلات httpx.
 - إصلاح منطق apply_scoring للرياح البرية (any بدلاً من for/break).
+- إصلاح fix_time_ranges (abs(diff) < 720).
 - إزالة سطر Regex المكرر في fix_broken_time_in_headers.
-- جميع تحسينات الإصدارات السابقة مدمجة ومحكمة.
+- دعم avg_sst = None عند غياب البيانات مع حماية scoring.
+- pressure_state اليومي يُحسب من press_change_day.
+- press_rate لكل فترة يُضاف إلى _raw.
+- period_warnings تُضاف إلى block_data.
+- شرط القاروص يشمل lateral_force_ratio وعدم المرآوي.
+- تحذيرات المرآوي تُضاف مرة واحدة بعد الحلقة.
+- جميع التحسينات السابقة مدمجة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -21,6 +33,9 @@ from slowapi.errors import RateLimitExceeded
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
+
+# إخفاء مفتاح API من سجلات httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
@@ -52,7 +67,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.7", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.9", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -72,7 +87,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "20.3.7"}
+    return {"status": "ok", "version": "20.3.9"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v) -> float:
@@ -695,7 +710,6 @@ def apply_scoring(agg: dict) -> int:
             score -= 10
             break
 
-    # إصلاح منطق الرياح البرية: فحص جميع الفترات
     has_strong_offshore = any(
         b["wind_dir"].startswith("برية") and b["_raw"]["avg_wind"] > 20
         for b in blocks
@@ -1356,19 +1370,11 @@ def calculate_interactions(agg: dict) -> List[str]:
             sign = ''
         interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (هبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{wind_eff:.0f}م")
         wp_val = raw.get('wave_period', 0)
-        wp_text = f"{wp_val:.1f}" if wp_val > 0 else "غير متوفر"
-        interactions.append(f"  🌊 الموج والمسافة: {wp_text} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م")
-        if b.get('casting_angle_correction', 0) != 0:
-            interactions.append(f"  🎯 تصحيح الرمي: {b['casting_angle_correction']}°")
-        interactions.append(f"  💧 عكارة الماء: {b.get('water_clarity','غير معروف')}")
-        interactions.append(f"  🛠️ المونتاج: {b.get('suggested_rig','عادي')}")
-        interactions.append(f"  😌 مؤشر الراحة: {b.get('comfort_index',50)}%")
-        interactions.append(f"  🐟 نشط: {', '.join(b.get('active_fish', [])) if b.get('active_fish') else 'لا يوجد'}")
-        interactions.append(f"  💤 خامل: {', '.join(b.get('inactive_fish', [])) if b.get('inactive_fish') else 'لا يوجد'}")
-        if b.get("period_warnings"):
-            interactions.append(f"  ⚠️ تحذيرات: {'; '.join(b['period_warnings'])}")
+        interactions.append(f"  🌊 الموج والمسافة: {wp_val:.1f} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م" if wp_val > 0 else "  🌊 الموج والمسافة: غير متوفر")
         if b.get("nogo_reasons"):
             interactions.append(f"  ⛔ موانع: {'; '.join(b['nogo_reasons'])}")
+        if b.get("period_warnings"):
+            interactions.append(f"  ⚠️ تحذيرات: {'; '.join(b['period_warnings'])}")
 
     interactions.append(f"[نسبة النجاح] {agg.get('score', 0)}%")
     if final_verdict == "فرصة مع تحفظات":
@@ -1425,6 +1431,7 @@ def build_context(req, agg, tz_name):
     ]
     return "\n".join(lines)
 
+# ---------- SYSTEM PROMPT (مخفف) ----------
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
 القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
 نسبة النجاح في [نسبة النجاح].
@@ -1461,14 +1468,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
  * 📊 حالة البحر والثقة: ...
  * 💨 الرياح والرمي: ...
  * 🌊 الموج والمسافة: ...
- * 🎯 تصحيح الرمي: ...
- * 💧 عكارة الماء: ...
- * 🛠️ المونتاج: ...
- * 😌 مؤشر الراحة: ...
- * 🐟 الأسماك النشطة: ...
- * 💤 الأسماك الخاملة: ...
- * ⚠️ تحذيرات: ...
  * ⛔ موانع: (اكتب الموانع الموجودة في البيانات فقط، لا تضف موانع من عندك)
+ * ⚠️ تحذيرات: ...
  * 🔄 ربط العوامل الميدانية: ...
 ☀️ فترة الظهيرة (النطاق الزمني الصحيح)
 ... (نفس الهيكل)
@@ -1487,9 +1488,6 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
  * 🛠️ ثقل الرصاص: ...
  * ⏱️ أفضل توقيت: ...
  * 🎯 المسافة والاتجاه: ...
- * 🦐 إستراتيجية الطعم: ...
-> ⚠️ إرشادات السلامة الحتمية:
-> ...
 
 قواعد:
 - لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
@@ -1513,14 +1511,14 @@ async def call_gemini(ctx):
         "contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 15000}
     }
-    max_retries = 5
+    max_retries = 3
     timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(1, max_retries + 1):
             try:
                 r = await client.post(url, json=payload, headers=headers)
                 if r.status_code == 429:
-                    wait = 10 * attempt
+                    wait = 20 * attempt
                     logger.warning(f"Gemini rate limit, retrying in {wait}s...")
                     await asyncio.sleep(wait)
                     continue
@@ -1533,14 +1531,14 @@ async def call_gemini(ctx):
                     raise
                 if attempt == max_retries:
                     raise Exception("فشل الاتصال بـ Gemini بعد عدة محاولات")
-                wait = 10 * attempt
+                wait = 20 * attempt
                 logger.info(f"Retrying in {wait}s (attempt {attempt})...")
                 await asyncio.sleep(wait)
             except Exception as e:
                 logger.error(f"Gemini unexpected error: {e}")
                 if attempt == max_retries:
                     raise Exception("فشل الاتصال بـ Gemini")
-                await asyncio.sleep(10 * attempt)
+                await asyncio.sleep(20 * attempt)
     raise Exception("فشل الاتصال بـ Gemini")
 
 # ---------- Text Helpers ----------
