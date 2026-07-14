@@ -1,20 +1,10 @@
 """
-Surfcasting Analytics API – v20.3.12 (Zero-Error, All Audits Applied)
-- Fix: orientation=0 is valid (north), failure signaled by None.
-- Fix: Overpass global timeout (25s) with per-server timeout 8s.
-- Fix: sleep(1.5) only after first attempt.
-- Fix: Gemini API key in header (x-goog-api-key), not URL.
-- Fix: Gemini retry waits 20/30/40s with jitter.
-- Fix: detect_bottom_type now tries two Overpass servers.
-- Fix: asyncio.gather exception handling and empty data separation.
-- Fix: TimeoutException caught separately in call_gemini.
-- Fix: sea_surface_temperature default=None.
-- Improved: comfort_index formula (more accurate).
-- Improved: pressure_change threshold adjusted (3-6 hPa).
-- Improved: wind_effect_dist negative penalty in scoring.
-- Added: CORS allow_credentials, health check Overpass status.
-- Added: generate_report global timeout (150s).
-- All previous features retained (Overpass exclusive, optimized context, etc.)
+Surfcasting Analytics API – v20.3.14 (Manual Fallback, Moon Age, Green Tides)
+- 1 req/min, short prompt, manual context on Gemini failure.
+- Moon age/hayaa/mat details in report and manual context.
+- Flow section shows only green (starting) times.
+- Manual context contains all numbers for a complete offline report.
+- All previous fixes (orientation=0, Overpass timeout, API key header, etc.).
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
 from datetime import datetime, timedelta, date
@@ -41,7 +31,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY مفقود")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-GEMINI_RETRY_WAITS = [20, 30, 40]  # seconds for 429/error retries
+GEMINI_RETRY_WAITS = [20, 30, 40]  # seconds
 
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
@@ -74,7 +64,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.12", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.14", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -103,7 +93,7 @@ async def health():
         pass
     return {
         "status": "ok",
-        "version": "20.3.12",
+        "version": "20.3.14",
         "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
@@ -258,17 +248,17 @@ def get_moon_age_days(d: date) -> float:
 def get_haml_mat_status(age_days: float) -> dict:
     if 13 <= age_days <= 16:
         day_in = int(age_days - 13) + 1
-        return {"status":"أيام الحياء","phase":"حمل البدر","description":f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).","score_delta":15}
+        return {"status":"أيام الحياء","phase":"حمل البدر","days":day_in,"description":f"اليوم {day_in} في حمل البدر. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).","score_delta":15}
     elif age_days >= 28 or age_days <= 2:
         raw_day = age_days - 28 if age_days >= 28 else age_days
         day_in = max(1, min(3, int(raw_day) + 1))
-        return {"status":"أيام الحياء","phase":"حمل المحاق","description":f"اليوم {day_in} في حمل المحاق. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).","score_delta":15}
+        return {"status":"أيام الحياء","phase":"حمل المحاق","days":day_in,"description":f"اليوم {day_in} في حمل المحاق. البحر حايي، التيارات قوية، الصيد في ذروته من الشاطئ (Surfcasting).","score_delta":15}
     elif 7 <= age_days <= 9 or 21 <= age_days <= 23:
         phase_name = "التربيع الأول" if age_days <= 9 else "التربيع الثاني"
         day_in = int(age_days - 7) + 1 if age_days <= 9 else int(age_days - 21) + 1
-        return {"status":"أيام المات","phase":phase_name,"description":f"اليوم {day_in} في {phase_name}. البحر مْيِّت، الماء راكد، الصيد أصعب من الشاطئ.","score_delta":-15}
+        return {"status":"أيام المات","phase":phase_name,"days":day_in,"description":f"اليوم {day_in} في {phase_name}. البحر مْيِّت، الماء راكد، الصيد أصعب من الشاطئ.","score_delta":-15}
     else:
-        return {"status":"أيام عادية","phase":"","description":"لا توجد مؤشرات حيائية أو مات قوية. الصيد من الشاطئ ممكن.","score_delta":0}
+        return {"status":"أيام عادية","phase":"","days":0,"description":"لا توجد مؤشرات حيائية أو مات قوية. الصيد من الشاطئ ممكن.","score_delta":0}
 
 def get_fishing_platform_advice(haml_status: str) -> str:
     if "الحياء" in haml_status: return "الصيد من الشاطئ ممتاز اليوم. التيارات قوية تجلب الأسماك."
@@ -376,7 +366,7 @@ def align_hourly_data(marine_hourly, weather_hourly, tz_name):
         "weather_code": extract("weather_code", weather_hourly, w_map, 0.0)
     }
 
-# ---------- Beaches ----------
+# ---------- Beaches (full list) ----------
 TUNISIAN_BEACHES = [
     {"name":"شاطئ طبرقة", "lat":36.9544, "lon":8.7581, "orientation":315, "type":"sandy"},
     {"name":"شاطئ عين دراهم", "lat":36.9580, "lon":8.7540, "orientation":315, "type":"sandy"},
@@ -1099,14 +1089,10 @@ def format_tidal_flow_periods(tidal_windows: dict) -> dict:
 
 def build_flow_section(tidal_windows: dict) -> str:
     periods = format_tidal_flow_periods(tidal_windows)
-    lines = ["🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة (تقديرية)"]
-    lines.append("↳ تنويه: أوقات المد والجزر تقديرية بهامش خطأ ±30 دقيقة.")
+    lines = ["🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء)"]
     for key, data in periods.items():
-        lines.append(f" * 🌊 {data['name']} ({data['time']}):")
-        lines.append(f"   * 🔵 {data['early_label']}: حتى {data['early_time']}")
-        lines.append(f"   * 🔴 مياه ميتة: {data['slack']}")
-        lines.append(f"   * 🟢 {data['late_label']}: من {data['late_time']}")
-    lines.append("↳ نصيحة: أفضل صيد في نهاية المد الدافع أو بداية الجزر الساحب (حسب الظاهرة). تجنب مركز المياه الميتة.")
+        lines.append(f" * 🌊 {data['name']} ({data['time']}): 🟢 {data['late_label']} من {data['late_time']}")
+    lines.append("↳ نصيحة: أفضل صيد في بداية المد الدافع أو بداية الجزر الساحب. تجنب مركز المياه الميتة.")
     return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
@@ -1168,86 +1154,45 @@ def build_context(req, agg, tz_name):
         facts.append(f" * 🔹 {name}: الساعة {v}")
     facts.append(f" * 🌅 الشروق: {extra.get('sunrise', '')} | 🌇 الغروب: {extra.get('sunset', '')}")
     facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
-    facts.append(f" * 🌊 الوضعية: {extra.get('haml_status', '')} ({extra.get('haml_phase', '')}).")
-    facts.append(f" * 📌 حالة البحر: {extra.get('haml_description', '')}")
+    moon_age = extra.get("moon_age_days", 0)
+    haml_status = extra.get("haml_status", "")
+    haml_phase = extra.get("haml_phase", "")
+    haml_desc = extra.get("haml_description", "")
+    if haml_status != "أيام عادية" and moon_age:
+        moon_text = f" * 🌊 الوضعية: {haml_status} ({haml_phase}). {haml_desc} (عمر القمر {moon_age:.1f} يوم)"
+    else:
+        moon_text = f" * 🌊 الوضعية: {haml_status}. {haml_desc}"
+    facts.append(moon_text)
     facts.append("🌡️ الضغط الجوي")
     facts.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')}")
     lines = ["\n".join(facts), "", "=== التفاعلات ===", *chain_interactions]
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب تقارير احترافية فخمة تطابق القالب المطلوب.
-القرار النهائي موجود في [الحسم النهائي]. لا تغيره.
-نسبة النجاح في [نسبة النجاح].
+# ---------- Shortened SYSTEM PROMPT ----------
+SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب تقريرًا بالدارجة التونسية باستخدام البيانات التالية.
+القرار النهائي ونسبة النجاح موجودان في [الحسم النهائي] و[نسبة النجاح]. لا تغيرهما.
 
-استخدم الهيكل التالي مع الأيقونات والمسافات البادئة المحددة:
+استخدم التنسيق التالي بالضبط:
+🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم.
+⏱️ 1. التوقيت المدوي وحركة المياه – المد والجزر، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
+🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – بداية المد الدافع وبداية الجزر الساحب.
+🕒 3. التفكيك الديناميكي الزمني – لكل فترة: الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
+⚖️ 4. ميزان العوامل – العوامل الحمراء (المعوقات) والخضراء (الإيجابيات).
+🏹 5. التكتيك الميداني والسلامة – الرصاص، التوقيت، المسافة.
 
-🎯 0. الملخص التنفيذي ليوم (التاريخ)
-> نسبة النجاح العامة: (أدخل النسبة)%
->  * القرار النهائي: (أدخل القرار)
->  * السبب الرئيسي: (أدخل السبب)
->  * الطعم المستهدف: (أدخل الطعم)
-> 
-⏱️ 1. التوقيت المدوي وحركة المياه
-🌊 مواقيت المد والجزر
- * 🔹 المد العالي الأول: الساعة (الوقت)
- * 🔹 الجزر المنخفض الأول: الساعة (الوقت)
- ...
-🌅 الشروق والغروب
- * 🌅 الشروق: (الوقت) | 🌇 الغروب: (الوقت)
-🏖️ مؤشر الشاطئ (أيام الحياء والمات)
- * 🌊 الوضعية: (أدخل الحالة)
- * 📌 حالة البحر: (أدخل الوصف)
-🌡️ الضغط الجوي
- * الوضع: (حالة الضغط)
-⏳ فترات سولونار
- * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
- * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
-
-🏃‍♂️ 2. فترات الحركة مقابل المياه الميتة
-(سيتم إنشاؤها تلقائياً)
-
-🕒 3. التفكيك الديناميكي الزمني
-🌅 الفترة الصباحية (النطاق الزمني الصحيح)
- * 📊 حالة البحر والثقة: ...
- * 💨 الرياح والرمي: ...
- * 🌊 الموج والمسافة: ...
- * ⛔ موانع: (اكتب الموانع الموجودة في البيانات فقط، لا تضف موانع من عندك)
- * ⚠️ تحذيرات: ...
- * 🔄 ربط العوامل الميدانية: ...
-☀️ فترة الظهيرة (النطاق الزمني الصحيح)
-... (نفس الهيكل)
-🌆 فترة الغسق (النطاق الزمني الصحيح)
-... (نفس الهيكل)
-🌙 فترة السحر (النطاق الزمني الصحيح)
-... (نفس الهيكل)
-
-⚖️ 4. ميزان العوامل الميدانية
-🔴 العوامل الحمراء (المعوقات)
- * ...
-🟢 العوامل الإيجابية (الفرص)
- * ...
-
-🏹 5. التكتيك الميداني والسلامة
- * 🛠️ ثقل الرصاص: ...
- * ⏱️ أفضل توقيت: ...
- * 🎯 المسافة والاتجاه: ...
-
-قواعد:
-- لا تكسر أي وقت أو رقم. الوقت كامل في سطر واحد.
-- استخدم المسافات البادئة الموضحة ( ` * ` قبل كل نقطة).
-- لا تذكر المركب. لا تستخدم حروفًا لاتينية.
-- اكتب بالدارجة التونسية.
-- لا تكتب القسم 6 (الأرقام المرجعية) فأي نص خاص به سيتم تجاهله.
-- استخدم النطاق الزمني الموجود في البيانات بالضبط لكل فترة، ولا تستبدله بقيم ثابتة.
-- ⛔ في قسم الموانع، لا تضف أي مانع غير موجود في البيانات. لا تخترع موانع مثل 'رياح بحرية مباشرة تؤثر على الرمي' من عندك.
+قواعد مهمة:
+- اكتب بالدارجة التونسية فقط.
+- لا تخترع موانع غير موجودة في البيانات.
+- استخدم الأوقات والنطاقات كما هي في البيانات.
+- لا تذكر المركب ولا تستخدم حروفًا لاتينية.
 """
 
+# ---------- Gemini caller ----------
 async def call_gemini(ctx):
     MAX_CONTEXT_CHARS = 30000
     if len(ctx) > MAX_CONTEXT_CHARS:
         ctx = ctx[:MAX_CONTEXT_CHARS]
         logger.warning(f"Context truncated to {MAX_CONTEXT_CHARS} chars")
-
     url = GEMINI_URL
     headers = {
         "Content-Type": "application/json",
@@ -1274,7 +1219,7 @@ async def call_gemini(ctx):
             except httpx.TimeoutException as e:
                 logger.warning(f"Gemini timeout (attempt {attempt}/{max_retries}): {e}")
                 if attempt == max_retries:
-                    raise HTTPException(504, "انتهت مهلة الاتصال بـ Gemini")
+                    raise
                 wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
                 await asyncio.sleep(wait)
             except (httpx.HTTPStatusError, KeyError, IndexError) as e:
@@ -1282,16 +1227,106 @@ async def call_gemini(ctx):
                 if isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in [429, 500, 502, 503]:
                     raise
                 if attempt == max_retries:
-                    raise Exception("فشل الاتصال بـ Gemini بعد عدة محاولات")
+                    raise
                 wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
                 await asyncio.sleep(wait)
             except Exception as e:
                 logger.error(f"Gemini unexpected error: {e}")
                 if attempt == max_retries:
-                    raise Exception(f"خطأ غير متوقع في الاتصال بـ Gemini: {type(e).__name__}")
-                wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
-                await asyncio.sleep(wait)
+                    raise
+                await asyncio.sleep(GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)])
     raise Exception("فشل الاتصال بـ Gemini")
+
+# ---------- Manual context builder (all numbers for offline report) ----------
+def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) -> str:
+    extra = agg["extra_info"]
+    target_date = resolve_target_date(req.target_date, datetime.now(zoneinfo.ZoneInfo(tz_name)).date())
+    date_str = target_date.strftime("%d/%m/%Y")
+    
+    # Moon details
+    moon_age = extra.get("moon_age_days", 0)
+    haml_status = extra.get("haml_status", "")
+    haml_phase = extra.get("haml_phase", "")
+    haml_desc = extra.get("haml_description", "")
+    if haml_status != "أيام عادية":
+        moon_line = f"{haml_status} ({haml_phase}). {haml_desc} (عمر القمر {moon_age:.1f} يوم)"
+    else:
+        moon_line = f"{haml_status}. {haml_desc}"
+    
+    # Solunar
+    sol = extra.get("solunar", {})
+    sol_text = f"الرئيسية: {sol.get('major1')} و {sol.get('major2')} | الثانوية: {sol.get('minor1')} و {sol.get('minor2')}"
+    
+    # Green flow times
+    flows = []
+    for k, v in extra['tidal_windows'].items():
+        h = safe_parse_time(v)
+        if k.startswith("HW"):
+            flows.append(f"بداية جزر ساحب {format_time(h+0.5)}")
+        else:
+            flows.append(f"بداية مد دافع {format_time(h+0.5)}")
+    
+    # Main reason
+    if agg["final_verdict"] == "غير مناسب":
+        main_reason = "بحر غير مناسب للصيد في جميع الفترات"
+        if agg["nogo_reasons"]:
+            main_reason = agg["nogo_reasons"][0]
+    elif agg["final_verdict"] == "فرصة مع تحفظات":
+        good_periods = [b["name"] for b in agg["blocks"] if not b["has_lethal_nogo"]]
+        bad_periods = [b["name"] for b in agg["blocks"] if b["has_lethal_nogo"]]
+        if bad_periods:
+            main_reason = f"فترات غير مناسبة: {', '.join(bad_periods)}. فترات مناسبة: {', '.join(good_periods) if good_periods else 'لا يوجد'}"
+        else:
+            main_reason = "توجد تحفظات لكن يمكن التكيف معها"
+    else:
+        main_reason = "ظروف ممتازة للصيد"
+    
+    lines = []
+    lines.append("اكتب تقرير صيد سيرفكاستينغ تونسي بالدارجة التونسية باستخدام جميع المعطيات التالية:")
+    lines.append(f"التاريخ: {date_str}")
+    lines.append(f"اتجاه الشاطئ: {req.beach_orientation}°")
+    lines.append(f"القرار النهائي: {agg['final_verdict']} | نسبة النجاح: {agg['score']}%")
+    lines.append(f"السبب الرئيسي: {main_reason}")
+    lines.append(f"الطعم المستهدف: {extra.get('seasonal_bait', '')}")
+    lines.append(f"الشروق: {extra['sunrise']} | الغروب: {extra['sunset']}")
+    lines.append(f"الضغط الجوي: {extra['pressure_note']} (تغير يومي {extra['pressure_change']:+.1f} hPa)")
+    lines.append(f"حرارة الماء: {round(agg['avg_sst'],1) if agg['avg_sst'] is not None else 'غير متوفر'}°م | حرارة الهواء العظمى: {extra['max_air_temp']}°م")
+    lines.append(f"الرياح اليومية السائدة: {agg['dominant_wind']} | أقصى هبات: {extra['peak_gust_today']} كم/س")
+    lines.append(f"المد والجزر: HW1={extra['tidal_windows']['HW1']}, LW1={extra['tidal_windows']['LW1']}, HW2={extra['tidal_windows']['HW2']}, LW2={extra['tidal_windows']['LW2']}")
+    lines.append(f"أوقات السولونار: {sol_text}")
+    lines.append(f"مؤشر الشاطئ: {moon_line}")
+    lines.append("فترات الحركة (الخضراء): " + " | ".join(flows))
+    lines.append("")
+    lines.append("تفاصيل الفترات (لكل فترة أقصى موج، رياح، فترة الموج، المسافة المقترحة، التصحيح، العكارة، المونتاج، الراحة، الأسماك النشطة والخاملة، الموانع والتحذيرات):")
+    for b in agg['blocks']:
+        r = b["_raw"]
+        conf = b.get("confidence",0)
+        conf_label = b.get("confidence_label","")
+        nogo = f"موانع: {'; '.join(b['nogo_reasons'])}" if b.get("nogo_reasons") else "لا موانع"
+        warn = f"تحذير: {'; '.join(b['period_warnings'])}" if b.get("period_warnings") else ""
+        active = ', '.join(b.get('active_fish', [])) if b.get('active_fish') else 'لا يوجد'
+        inactive = ', '.join(b.get('inactive_fish', [])) if b.get('inactive_fish') else 'لا يوجد'
+        
+        lines.append(f"{b['name']} ({b['time_range']}):")
+        lines.append(f"  الثقة: {conf}% ({conf_label}) | البحر: {b['sea_state']} | أقصى موج: {r['max_wave_h']}م | فترة الموج: {r['wave_period']}ث")
+        lines.append(f"  الرياح: {b['wind_dir']} متوسط {r['avg_wind']} كم/س (هبات {r['max_gust']} كم/س) | تأثير الرياح على المسافة: {r['wind_effect_dist']:+.0f}م")
+        lines.append(f"  المسافة المقترحة: {r['recommended_cast_distance']}م | تصحيح زاوية الرمي: {b.get('casting_angle_correction',0)}°")
+        lines.append(f"  عكارة الماء: {b.get('water_clarity','غير معروف')} | المونتاج: {b.get('suggested_rig','عادي')} | مؤشر الراحة: {b.get('comfort_index',50)}%")
+        lines.append(f"  الأسماك النشطة: {active}")
+        lines.append(f"  الأسماك الخاملة: {inactive}")
+        if nogo != "لا موانع":
+            lines.append(f"  ⛔ {nogo}")
+        if warn:
+            lines.append(f"  ⚠️ {warn}")
+        lines.append("")
+    
+    all_active = set()
+    for b in agg['blocks']:
+        for f in b.get('active_fish', []):
+            all_active.add(f)
+    lines.append(f"قائمة الأسماك النشطة إجمالاً: {', '.join(sorted(all_active)) if all_active else 'لا يوجد'}")
+    
+    return "\n".join(lines)
 
 # ---------- Text Helpers ----------
 def fix_time_ranges(text: str) -> str:
@@ -1370,9 +1405,9 @@ def fix_broken_number_lines(text: str) -> str:
         i += 1
     return '\n'.join(fixed)
 
-# ---------- Main Report Endpoint with global timeout ----------
+# ---------- Main Endpoint with manual fallback ----------
 @app.post("/generate-report")
-@limiter.limit("2/minute")
+@limiter.limit("1/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
         return await asyncio.wait_for(_generate_report_inner(req), timeout=150.0)
@@ -1442,55 +1477,69 @@ async def _generate_report_inner(req: RawDataReportRequest):
             "meta": {"score": agg['score'], "hard_nogo": True}
         }
 
-    ctx = build_context(req, agg, tz_name)
-    report = await call_gemini(ctx)
+    try:
+        ctx = build_context(req, agg, tz_name)
+        report = await call_gemini(ctx)
 
-    report = clean_report_text(report)
-    report = fix_broken_number_lines(report)
-    report = fix_broken_time_in_headers(report)
-    report = replace_english_commas(report)
-    report = enforce_line_breaks(report)
-    report = add_paragraph_spacing(report)
+        report = clean_report_text(report)
+        report = fix_broken_number_lines(report)
+        report = fix_broken_time_in_headers(report)
+        report = replace_english_commas(report)
+        report = enforce_line_breaks(report)
+        report = add_paragraph_spacing(report)
 
-    flow_section = build_flow_section(agg["extra_info"]["tidal_windows"])
-    pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
-    report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
+        flow_section = build_flow_section(agg["extra_info"]["tidal_windows"])
+        pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
+        report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
 
-    report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
+        report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
 
-    # الأرقام المرجعية الخام
-    raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
-    raw_numbers += f"🔹 حرارة الماء: {avg_sst_display}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
-    raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
-    for b in agg['blocks']:
-        r = b['_raw']
-        wind_eff = r['wind_effect_dist']
-        sign = '+' if wind_eff > 0 else ''
-        raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
-                        f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
-                        f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
-                        f"تأثير الرياح {sign}{wind_eff:.0f}م | "
-                        f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%")
-        if b.get("nogo_reasons"):
-            raw_numbers += f" | ⛔: {'; '.join(b['nogo_reasons'])}"
-        raw_numbers += "\n"
-    raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    report += raw_numbers
+        raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
+        raw_numbers += f"🔹 حرارة الماء: {avg_sst_display}°م | حرارة الهواء: {agg['extra_info']['max_air_temp']}°م\n"
+        raw_numbers += f"🔹 الرياح: أقصى هبات {agg['extra_info']['peak_gust_today']} كم/س | الضغط: {agg['extra_info']['pressure_avg']} hPa\n"
+        for b in agg['blocks']:
+            r = b['_raw']
+            wind_eff = r['wind_effect_dist']
+            sign = '+' if wind_eff > 0 else ''
+            raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
+                            f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
+                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
+                            f"تأثير الرياح {sign}{wind_eff:.0f}م | "
+                            f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%")
+            if b.get("nogo_reasons"):
+                raw_numbers += f" | ⛔: {'; '.join(b['nogo_reasons'])}"
+            raw_numbers += "\n"
+        raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        report += raw_numbers
 
-    clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
-    meta = {
-        "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
-        "score": agg["score"],
-        "tidal_estimation": agg["extra_info"]["tidal_windows"],
-        "golden_windows": agg["extra_info"]["golden_windows"],
-        "solunar": agg["extra_info"]["solunar"],
-        "final_verdict": agg["final_verdict"],
-        "nogo_reasons": agg["nogo_reasons"],
-        "warnings": agg.get("warnings", []),
-        "blocks": clean_blocks
-    }
-    return {"report": report, "meta": meta}
+        clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
+        meta = {
+            "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
+            "score": agg["score"],
+            "tidal_estimation": agg["extra_info"]["tidal_windows"],
+            "golden_windows": agg["extra_info"]["golden_windows"],
+            "solunar": agg["extra_info"]["solunar"],
+            "final_verdict": agg["final_verdict"],
+            "nogo_reasons": agg["nogo_reasons"],
+            "warnings": agg.get("warnings", []),
+            "blocks": clean_blocks
+        }
+        return {"report": report, "meta": meta}
+    except Exception as e:
+        logger.error(f"Gemini failed, returning manual context: {e}")
+        manual = generate_manual_context(req, agg, tz_name)
+        return {
+            "report": "❌ تعذر توليد التقرير تلقائياً بسبب ضغط API. استخدم النص التالي مع Gemini أو أي نموذج آخر.",
+            "manual_context": manual,
+            "meta": {
+                "score": agg["score"],
+                "final_verdict": agg["final_verdict"],
+                "tidal_windows": agg["extra_info"]["tidal_windows"],
+                "solunar": agg["extra_info"]["solunar"],
+                "blocks": [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
+            }
+        }
 
 if __name__ == "__main__":
     import uvicorn
