@@ -1,8 +1,13 @@
 """
-Surfcasting Analytics API – v19.7.2 (Zero‑Error, Night Range & Pressure Fixed)
-- تم إصلاح عرض النطاق الليلي ليكون دقيقاً (مثلاً 18:00 - 04:00) دون تدخل Gemini.
-- تم إظهار حالة الضغط الجوي في قسم التفاعلات (مستقر، يرتفع، ينخفض).
-- جميع تحسينات v19.7.1 مضمنة.
+Surfcasting Analytics API – v20.0.0 (Tactical & Comfort Upgrade)
+- مؤشر شفافية المياه (Water Clarity Index) يُضاف لكل فترة.
+- اقتراح المونتاج (Rig Architecture) بناءً على قوة التيار والرياح.
+- تصحيح زاوية الرمي الديناميكية لتعويض الرياح الجانبية.
+- مؤشر الراحة الشخصية (Comfort Index) لسلامة الصياد.
+- تدريج نسب الثقة (Confidence Tiering) مع تسميات وصفية.
+- تقسيم الفترة الليلية إلى "غسق" و"سحر" بدلاً من كتلة واحدة.
+- إضافة زاوية الرياح (بالدرجات) في الأرقام المرجعية.
+- جميع تحسينات الإصدارات السابقة.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re
 from datetime import datetime, timedelta, date
@@ -50,7 +55,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="19.7.2", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.0.0", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -70,7 +75,7 @@ async def global_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "19.7.2"}
+    return {"status": "ok", "version": "20.0.0"}
 
 # ---------- Utility Helpers ----------
 def safe_float(v):
@@ -470,7 +475,7 @@ async def fetch_weather_data_from_openmeteo(client: httpx.AsyncClient, lat: floa
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat, "longitude": lon,
-        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,precipitation,visibility,weather_code",
+        "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,relative_humidity_2m,precipitation,visibility,weather_code",
         "daily": "sunrise,sunset",
         "timezone": "Africa/Tunis", "forecast_days": 3
     }
@@ -481,6 +486,61 @@ async def fetch_weather_data_from_openmeteo(client: httpx.AsyncClient, lat: floa
     except Exception as e:
         logger.error(f"Open-Meteo weather fetch failed: {e}")
         return None
+
+# ---------- New Tactical Helpers ----------
+def get_water_clarity(wind_speed, wave_height, is_murky, is_weedy, haml_status):
+    """مؤشر شفافية المياه"""
+    if is_weedy:
+        return "عكر جداً (أعشاب وصوفة)"
+    if is_murky:
+        return "عكر (بحر خامر)"
+    if "الحياء" in haml_status and (wind_speed > 15 or wave_height > 0.5):
+        return "عكر/مخلوط (التيارات تقلب القاع)"
+    if wind_speed > 20:
+        return "متوسط العكارة (رياح قوية)"
+    if wave_height < 0.3 and wind_speed < 10:
+        return "صافي جداً"
+    return "صافي"
+
+def suggest_rig(haml_status, lateral_current, wind_speed, is_mirror_sea):
+    """اقتراح المونتاج المناسب"""
+    strong_current = "الحياء" in haml_status or "قوي" in lateral_current
+    if strong_current or wind_speed > 20:
+        return "Pater Noster قصير (فروع 50 سم، ثقيل) – يمنع التشابك في التيار"
+    if is_mirror_sea or ("معدوم" in lateral_current):
+        return "Long Snood (فرع سفلي 150 سم، خفيف) – حركة طبيعية للطعم"
+    return "مونتاج عادي (فرع 80-100 سم) – مرن للظروف المتوسطة"
+
+def casting_angle_correction(wind_dir, orient):
+    """زاوية تصحيح الرمي لتعويض الرياح الجانبية (بالدرجات، + لليسار)"""
+    diff = signed_angle_diff(wind_dir, orient)
+    if abs(diff) < 30:
+        return 0
+    return round(-diff * 0.3)
+
+def calculate_comfort_index(temp, wind_speed, humidity=None):
+    """مؤشر الراحة (0-100)، أعلى = أفضل"""
+    if humidity is None:
+        humidity = 50  # افتراضي
+    # Heat Index مبسط
+    hi = temp + 0.5 * (humidity - 50) if humidity > 40 else temp
+    # Wind Chill (إذا كانت الحرارة منخفضة)
+    wc = temp - wind_speed * 1.5 if temp < 18 else temp
+    base = 100 - abs(24 - temp) * 2 - wind_speed * 0.5 - abs(humidity - 50) * 0.2
+    return max(0, min(100, int(base)))
+
+def get_confidence_label(confidence):
+    if confidence >= 90:
+        return "ذروة ملكية"
+    if confidence >= 80:
+        return "ممتازة"
+    if confidence >= 70:
+        return "جيدة جداً"
+    if confidence >= 60:
+        return "جيدة"
+    if confidence >= 50:
+        return "مقبولة"
+    return "ضعيفة"
 
 # ---------- Analysis Helpers ----------
 def analyze_weed_risk(sea_memory):
@@ -624,8 +684,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     wh = pick("wave_height"); wp = pick("wave_period"); swh = pick("swell_wave_height")
     swp = pick("swell_wave_period"); swd = pick("swell_wave_direction"); wd_wave = pick("wave_direction")
     sst = pick("sea_surface_temperature"); ws = pick("wind_speed_10m"); wd = pick("wind_direction_10m")
-    wg = pick("wind_gusts_10m"); pr = pick("pressure_msl"); ta = pick("temperature_2m"); prec = pick("precipitation")
-    vis = pick("visibility"); wcode = [int(v) if v else 0 for v in pick("weather_code")]
+    wg = pick("wind_gusts_10m"); pr = pick("pressure_msl"); ta = pick("temperature_2m"); rh = pick("relative_humidity_2m")
+    prec = pick("precipitation"); vis = pick("visibility"); wcode = [int(v) if v else 0 for v in pick("weather_code")]
 
     wave_power = [0.49*(h**2)*p for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) for d in wd]
@@ -815,7 +875,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         h = all_times[i].hour
         if 4 <= h <= 11: periods["morning"].append(idx)
         elif 12 <= h <= 17: periods["afternoon"].append(idx)
-        else: periods["night"].append(idx)
+        else:
+            # تقسيم الليل: غسق (قبل منتصف الليل) وسحر (بعد منتصف الليل)
+            if h >= 18: periods["evening"].append(idx)
+            else: periods["late_night"].append(idx)
 
     def parse_tidal_time(t_str):
         parts = t_str.split(":")
@@ -829,7 +892,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     slack_info = slack_info.rstrip("; ")
 
     blocks = []
-    for key in ["morning", "afternoon", "night"]:
+    for key in ["morning", "afternoon", "evening", "late_night"]:
         idxs = periods[key]
         if not idxs: continue
         avg_h = sum(wh[i] for i in idxs)/len(idxs)
@@ -854,13 +917,15 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wd_b = circular_mean(angles_wd_b) if angles_wd_b else 0.0
 
         avg_air = sum(ta[i] for i in idxs)/len(idxs) if ta else 0
+        avg_rh = sum(rh[i] for i in idxs)/len(idxs) if rh else 50.0
         gust_vals = [wg[i] for i in idxs if i < len(wg)]
         max_gust_b = max(gust_vals) if gust_vals else 0.0
         avg_press_b = sum(pr[i] for i in idxs)/len(idxs) if pr else 0
         avg_vis_b = sum(vis[i] for i in idxs)/len(idxs) if vis else 0
         avg_wp_b = sum(wp[i] for i in idxs)/len(idxs) if wp else 0
 
-        if max_h < 0.4:
+        # حالة البحر
+        if max_h < 0.3 and max_gust_b < 15:  # إضافة شرط الهبات للمرآوي
             sea = "بحر مرآوي"
         elif max_h < 0.9:
             sea = "هادئ"
@@ -897,13 +962,14 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if diff_sw > 40: swell_wave_interaction = "متقاطعان بشدة"
             elif diff_sw > 25: swell_wave_interaction = "متقاطعان بسيط"
 
-        wind_effect_dist = 0
-        if "بحرية" in wc_dom: wind_effect_dist = avg_w * 1.2
-        elif "برية" in wc_dom: wind_effect_dist = -avg_w * 1.0
+        # حساب تأثير الرياح (باستخدام الإسقاط)
+        wind_dir_rad = math.radians(avg_wd_b)
+        orient_rad = math.radians(orient)
+        wind_effect_dist = avg_w * math.cos(wind_dir_rad - orient_rad)
 
         block_wind_ok = (avg_w < 20 and wc_dom.startswith("بحرية")) or (wc_dom.startswith("برية") and avg_w <= 15)
         block_wave_ok = 0.6 <= avg_h <= 1.2
-        is_night = (key == "night")
+        is_night = key in ("evening", "late_night")
         is_night_with_tide = is_night and is_close(parse_tidal_time(tidal_windows["HW2"]), safe_parse_time(sunset), 1.5)
         period_flags = {"is_spring_tide": 1 if is_spring_tide else 0, "is_pressure_dropping": 1 if is_pressure_dropping_fast else 0}
         confidence = calculate_confidence_index(period_flags, is_mirror_sea, has_golden_window, len(nogo_reasons), len(warnings),
@@ -913,27 +979,26 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if avg_h > 0.8: base_dist = 40
         elif avg_h > 0.5: base_dist = 50
         else: base_dist = 60
-        recommended_dist = max(20, min(80, base_dist + wind_effect_dist * 2))
+        recommended_dist = max(20, min(100, base_dist + wind_effect_dist * 2))
 
-        # بناء نطاق الوقت الحقيقي
+        # زاوية التصحيح
+        corr_angle = casting_angle_correction(avg_wd_b, orient)
+
+        # عكارة الماء
+        water_clarity = get_water_clarity(avg_w, avg_h, is_murky, is_weedy, haml_info["status"])
+
+        # المونتاج
+        rig = suggest_rig(haml_info["status"], lateral_current, avg_w, is_mirror_sea)
+
+        # الراحة
+        comfort = calculate_comfort_index(avg_air, avg_w, avg_rh)
+
         start_time = all_times[target_idx[idxs[0]]].strftime('%H:%M')
         end_time = all_times[target_idx[idxs[-1]]].strftime('%H:%M')
-        if is_night:
-            night_times = [all_times[target_idx[i]] for i in idxs]
-            if night_times:
-                start_dt = min(night_times)
-                end_dt = max(night_times)
-                # نضمن ظهور النطاق الحقيقي
-                time_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
-                if start_dt.date() != end_dt.date():
-                    time_range += " (بعد منتصف الليل)"
-            else:
-                time_range = f"{start_time} - {end_time}"
-        else:
-            time_range = f"{start_time} - {end_time}"
+        time_range = f"{start_time} - {end_time}"
 
         block_data = {
-            "name":{"morning":"الصباح","afternoon":"الظهيرة","night":"الليل"}[key],
+            "name": {"morning":"الصباح","afternoon":"الظهيرة","evening":"الغسق","late_night":"السحر"}[key],
             "time_range": time_range,
             "sea_state":sea,"wave_height":f"أقصى {max_h:.2f}م",
             "swell_dir": deg_to_compass(final_swd) if final_swd else ("معدوم" if not actual_swell_exists else "غير معروف"),
@@ -945,7 +1010,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             "wind_gust_peak":round(max_gust_b,1),
             "wind_dir":wc_dom, "air_temp":round(avg_air,1), "weather":weather_desc(most_code),
             "confidence": confidence,
+            "confidence_label": get_confidence_label(confidence),
             "recommended_cast_distance": round(recommended_dist, 0),
+            "casting_angle_correction": corr_angle,
+            "water_clarity": water_clarity,
+            "suggested_rig": rig,
+            "comfort_index": comfort,
             "backwash": backwash,
             "debris": debris,
             "_raw": {
@@ -957,6 +1027,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 "visibility": round(avg_vis_b, 0),
                 "has_swell": actual_swell_exists,
                 "wave_period": round(avg_wp_b, 1),
+                "wind_dir_deg": round(avg_wd_b, 0),
                 "wind_effect_dist": round(wind_effect_dist, 0),
                 "recommended_cast_distance": round(recommended_dist, 0)
             }
@@ -982,7 +1053,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "past_rain_accumulated_48h": round(accumulated_rain_48h, 1),
         "max_rain_hourly": round(max_rain_hourly, 1),
         "pressure_change": round(press_change, 1),
-        "pressure_note": pressure_note,          # إضافة حالة الضغط
+        "pressure_note": pressure_note,
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"],
         "haml_phase": haml_info["phase"],
@@ -1090,12 +1161,17 @@ def calculate_interactions(agg: dict) -> List[str]:
     for b in blocks:
         name = b['name']; time_range = b['time_range']; raw = b.get("_raw", {})
         interactions.append(f"[{name} ({time_range})]")
-        interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}%")
+        interactions.append(f"  📊 حالة البحر والثقة: {b['sea_state']} | نسبة الثقة: {b.get('confidence',0)}% ({b.get('confidence_label','')})")
         sign = '+' if raw.get('wind_effect_dist', 0) >= 0 else ''
-        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (الهبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{raw.get('wind_effect_dist',0):.0f}م")
+        interactions.append(f"  💨 الرياح والرمي: {b['wind_dir']} {raw.get('avg_wind',0):.1f} كم/س (هبات {raw.get('max_gust',0)} كم/س) | تأثير: {sign}{raw.get('wind_effect_dist',0):.0f}م")
         wp_val = raw.get('wave_period', 0)
         wp_text = f"{wp_val:.1f}" if wp_val > 0 else "غير متوفر"
         interactions.append(f"  🌊 الموج والمسافة: {wp_text} ث | المسافة: {raw.get('recommended_cast_distance',0):.0f}م")
+        if 'casting_angle_correction' in b and b['casting_angle_correction'] != 0:
+            interactions.append(f"  🎯 تصحيح الرمي: {b['casting_angle_correction']}°")
+        interactions.append(f"  💧 عكارة الماء: {b.get('water_clarity','غير معروف')}")
+        interactions.append(f"  🛠️ المونتاج: {b.get('suggested_rig','عادي')}")
+        interactions.append(f"  😌 مؤشر الراحة: {b.get('comfort_index',50)}%")
         active_fish = [f for f, d in bio_matrix.items() if "نشط" in d['status']]
         inactive_fish = [f for f, d in bio_matrix.items() if "نشط" not in d['status']]
         interactions.append(f"  🐟 نشط: {', '.join(active_fish) if active_fish else 'لا يوجد'}")
@@ -1162,6 +1238,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
 🏖️ مؤشر الشاطئ (أيام الحياء والمات)
  * 🌊 الوضعية: (أدخل الحالة)
  * 📌 حالة البحر: (أدخل الوصف)
+🌡️ الضغط الجوي
+ * الوضع: (حالة الضغط)
 ⏳ فترات سولونار
  * 🎯 الفترات الرئيسية: (الوقت) | (الوقت)
  * 🎯 الفترات الثانوية: (الوقت) | (الوقت)
@@ -1174,12 +1252,18 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. تكتب �
  * 📊 حالة البحر والثقة: ...
  * 💨 الرياح والرمي: ...
  * 🌊 الموج والمسافة: ...
+ * 🎯 تصحيح الرمي: ...
+ * 💧 عكارة الماء: ...
+ * 🛠️ المونتاج: ...
+ * 😌 مؤشر الراحة: ...
  * 🐟 الأسماك النشطة: ...
  * 💤 الأسماك الخاملة: ...
  * 🔄 ربط العوامل الميدانية: ...
 ☀️ فترة الظهيرة (12:00 - 17:00)
 ... (نفس الهيكل)
-🌃 الفترة الليلية (00:00 - 23:00)
+🌆 فترة الغسق (من الغروب إلى منتصف الليل)
+... (نفس الهيكل)
+🌙 فترة السحر (من منتصف الليل إلى الشروق)
 ... (نفس الهيكل)
 
 ⚖️ 4. ميزان العوامل الميدانية
@@ -1270,7 +1354,7 @@ def enforce_line_breaks(text: str) -> str:
         if not stripped:
             new_lines.append('')
             continue
-        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌]', stripped):
+        if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🌆🌙🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌💧😌]', stripped):
             if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]):
                 new_lines.append('')
         new_lines.append(stripped)
@@ -1386,9 +1470,10 @@ async def generate_report(request: Request, req: RawDataReportRequest):
             r = b['_raw']
             sign = '+' if r['wind_effect_dist'] >= 0 else ''
             raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
-                            f"ثقة {b['confidence']}% | مسافة {b['recommended_cast_distance']}م | "
-                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س | "
-                            f"تأثير الرياح {sign}{r['wind_effect_dist']}م\n")
+                            f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
+                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
+                            f"تأثير الرياح {sign}{r['wind_effect_dist']}م | "
+                            f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%\n")
         raw_numbers += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         report += raw_numbers
 
