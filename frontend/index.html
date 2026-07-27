@@ -88,16 +88,6 @@
       </div>
     </div>
 
-    <!-- إصلاح: إضافة صفحة مسح الشواطئ لمنع الشاشة السوداء -->
-    <div id="panelScan" class="hidden">
-        <div class="card text-center text-gray-400 py-16">
-            <h2 class="text-3xl mb-6 text-neon">🔍 مسح الشواطئ القريبة</h2>
-            <p class="text-xl mb-2">هذه الميزة الاستراتيجية قيد التطوير حالياً.</p>
-            <p class="text-sm text-gray-500 mb-8">ستسمح لك باختيار ولاية، ومن ثم تقوم الأداة بتحليل جميع الشواطئ المسجلة فيها وترتيبها حسب نسبة النجاح لتختار الأسهل.</p>
-            <button onclick="document.getElementById('tabSingle').click()" class="btn-primary text-lg px-8 py-3">العودة للتقرير الفردي</button>
-        </div>
-    </div>
-
     <div id="loadingOverlay" class="loading-overlay hidden">
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
@@ -274,6 +264,7 @@
       }
     }
 
+    // منع التحديث غير المقصود
     window.addEventListener('beforeunload', (e) => {
       if (isSubmitting) {
         e.preventDefault();
@@ -310,19 +301,16 @@
           fetchWeatherData(lat, lng, start, end)
         ]);
 
-        // إصلاح: إرسال الإحداثيات مع الطلب لتجنب استخدام قيم تونس العاصمة الافتراضية
         const payload = {
           beach_orientation: orient,
           beach_type: beachType,
           target_date: targetDate,
           marine_data: marineData,
-          weather_data: weatherData,
-          latitude: lat,
-          longitude: lng
+          weather_data: weatherData
         };
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 180000);
+        const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 دقائق
         const resp = await fetch(`${API_BASE}/generate-report`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
