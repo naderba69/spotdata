@@ -3,6 +3,7 @@ Surfcasting Analytics API – v20.3.16 (Production Ready)
 - Fixed Gemini Auth, CORS, Render IP extraction.
 - Fixed Surfcasting Physics (Tailwind, Sinker types, Real NOGO limits).
 - Preserved original report structure, Overpass logic, and Tide logic.
+- Backend instance named 'main' as requested.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
 from datetime import datetime, timedelta, date
@@ -39,7 +40,6 @@ OVERPASS_SERVERS = [
 USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
 _TIME_RE = re.compile(r'\d{2}:\d{2}')
 
-# --- إصلاح 1: استخراج IP الحقيقي خلف بروكسي Render ---
 def get_real_ip(request: Request) -> str:
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
@@ -64,24 +64,22 @@ class DetectBottomRequest(BaseModel):
     longitude: float = Field(..., ge=-180, le=180)
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(main: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.16", lifespan=lifespan)
-# --- إصلاح 2: ربط الـ Limiter بالـ IP الحقيقي ---
+main = FastAPI(title="Surfcasting Analytics", version="20.3.16", lifespan=lifespan)
 limiter = Limiter(key_func=get_real_ip)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+main.state.limiter = limiter
+main.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- إصلاح 3: حل تناقض CORS في المتصفحات ---
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"], max_age=600)
+main.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"], max_age=600)
 
-@app.exception_handler(Exception)
+@main.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
     return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
 
-@app.get("/health")
+@main.get("/health")
 async def health():
     overpass_ok = False
     try:
@@ -279,7 +277,7 @@ def _arabic_count(n: int, singular: str, dual: str, plural: str) -> str:
     if n == 1: return f"{singular}"
     elif n == 2: return f"{dual}"
     elif 3 <= n <= 10: return f"{n} {plural}"
-    else: return f"{n} {plural}" # إصلاح العدد الكبير
+    else: return f"{n} {plural}"
 
 def format_time_gap(hours_decimal: float) -> str:
     if hours_decimal <= 0: return "0 دقيقة"
@@ -408,7 +406,7 @@ def find_nearest_beach_info(lat: float, lon: float, max_dist: float = 20000) -> 
             nearest = {"orientation": b["orientation"], "type": b["type"], "distance": round(dist, 0)}
     return nearest
 
-# ---------- Overpass orientation (لا يتم تعديله ابداً) ----------
+# ---------- Overpass orientation ----------
 async def _overpass_orientation_inner(lat, lon):
     async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": USER_AGENT}) as client:
         for radius in [3000, 5000, 10000]:
@@ -453,7 +451,7 @@ async def get_auto_orientation_overpass(lat, lon):
         logger.warning("Overpass orientation global timeout (25s)")
         return None
 
-@app.post("/auto-orientation")
+@main.post("/auto-orientation")
 @limiter.limit("5/minute")
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
@@ -461,7 +459,7 @@ async def auto_orientation(request: Request, req: AutoOrientationRequest):
         raise HTTPException(status_code=502, detail="تعذر تحديد اتجاه الشاطئ من الخريطة. يرجى المحاولة لاحقاً أو إدخال الاتجاه يدوياً.")
     return {"orientation": orientation, "source": "overpass"}
 
-@app.post("/detect-bottom-type")
+@main.post("/detect-bottom-type")
 @limiter.limit("10/minute")
 async def detect_bottom_type(request: Request, req: DetectBottomRequest):
     info = find_nearest_beach_info(req.latitude, req.longitude)
@@ -522,7 +520,6 @@ def get_water_clarity(wind_speed, wave_height, is_murky, is_weedy, haml_status, 
     if wave_height < 0.3 and wind_speed < 10: return "صافي جداً"
     return "صافي"
 
-# --- إصلاح 4: دالة المونتاج والرصاص الواقعية ---
 def suggest_rig(haml_status: str, is_lateral_strong: bool, wind_speed: float, is_mirror_sea: bool, max_gust: float = 0.0) -> str:
     if max_gust > 45: return "⚠️ لا يوجد مونتاج ينفع مع هبات تتجاوز 45 كم/س. الرمي خطر."
     strong_current = "الحياء" in haml_status or is_lateral_strong
@@ -537,7 +534,6 @@ def casting_angle_correction(wind_dir, orient):
     raw = round(-diff * 0.12)
     return max(-15, min(15, raw))
 
-# --- إصلاح 5: إضافة معامل الرياح للبرد الليلي ---
 def calculate_comfort_index(temp, wind_speed, humidity=None):
     if temp is None: return 50
     humidity = max(0.0, min(100.0, float(humidity))) if humidity is not None else 50.0
@@ -631,7 +627,7 @@ def apply_scoring(agg: dict) -> int:
 
     if not flags["has_golden_window"]: score -= 15
     if agg["avg_sst"] is not None:
-        if agg["avg_sst"] > 30.0: score -= 15 # رفعنا الحد ليتناسب مع صيف تونس
+        if agg["avg_sst"] > 30.0: score -= 15
         elif agg["avg_sst"] < 13.0: score -= 15
     if extra.get("sst_stability", "") == "صدمة حرارية": score -= 10
     for b in blocks:
@@ -674,14 +670,13 @@ def apply_scoring(agg: dict) -> int:
     return score
 
 # ---------- Physical Aggregation ----------
-# --- إصلاح 6: تصحيح سلوك الأسماك ---
 def get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea, lateral_force_ratio, water_clarity, seabass_sst_limit):
     if avg_sst is None: avg_sst = 20.0
     active, inactive = [], []
     seabass_active = (is_night or is_murky or lateral_force_ratio > 0.5) and avg_sst < seabass_sst_limit and not is_mirror_sea
     if seabass_active: active.append("قاروص")
     else: inactive.append("قاروص")
-    if avg_sst > 18: active.append("دنيس") # الدنيس يحب البحر المرآوي
+    if avg_sst > 18: active.append("دنيس")
     else: inactive.append("دنيس")
     if not is_murky and not is_weedy and not is_mirror_sea: active.append("بوري")
     else: inactive.append("بوري")
@@ -693,7 +688,7 @@ def get_period_fish_status(avg_sst, is_night, is_murky, is_weedy, is_mirror_sea,
     else: inactive.append("شلبة")
     if avg_sst > 18 and not is_murky: active.append("تريلية")
     else: inactive.append("تريلية")
-    if is_murky and not is_weedy: active.append("شعور / ميال") # بدل بغبغان
+    if is_murky and not is_weedy: active.append("شعور / ميال")
     else: inactive.append("شعور / ميال")
     if avg_sst > 18 and not is_mirror_sea and (is_night or "عكر" in water_clarity): active.append("سوبيا")
     else: inactive.append("سوبيا")
@@ -758,13 +753,12 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if past_sh > 0.8 and past_avg > 4.0: sea_memory += " | تحذير صوفة."
             if accumulated_rain_48h > 45.0 or max_rain_hourly > 15.0: sea_memory += " | سيول."
 
-    # --- إصلاح 7: حساب التيار الجانبي من الرياح وليس الموج ---
     day_lateral_fx, day_lateral_fy = 0.0, 0.0
     for i in range(len(wh)):
-        if wd[i] is not None: # تم التغيير من wd_wave إلى wd (الرياح)
+        if wd[i] is not None:
             w_dir = wd[i]
             signed_angle = math.radians(signed_angle_diff(w_dir, orient))
-            force = safe_float(ws[i]) ** 2 # تم التغيير من wh إلى ws
+            force = safe_float(ws[i]) ** 2
             day_lateral_fx += force * math.sin(signed_angle)
             day_lateral_fy += force * math.cos(signed_angle)
     day_total = math.sqrt(day_lateral_fx**2 + day_lateral_fy**2)
@@ -872,12 +866,11 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         pr_period = [safe_float(pr[i]) for i in idxs]; press_change_3h_period = pr_period[-1] - pr_period[0] if len(pr_period) >= 2 else 0.0
         period_hours = len(pr_period); press_rate = press_change_3h_period * (3.0 / max(1, period_hours)) if period_hours > 0 else 0.0
         
-        # --- إصلاح 8: حساب التيار الجانبي للفترة من الرياح ---
         period_lateral_fx, period_lateral_fy = 0.0, 0.0
         for i in idxs:
-            if wd[i] is not None: # تم التغيير من wd_wave إلى wd
+            if wd[i] is not None:
                 w_dir = wd[i]; signed_angle = math.radians(signed_angle_diff(w_dir, orient))
-                force = safe_float(ws[i]) ** 2 # تم التغيير من wh إلى ws
+                force = safe_float(ws[i]) ** 2
                 period_lateral_fx += force * math.sin(signed_angle); period_lateral_fy += force * math.cos(signed_angle)
         period_total_force = math.sqrt(period_lateral_fx**2 + period_lateral_fy**2)
         period_lateral_force_ratio = abs(period_lateral_fx) / period_total_force if period_total_force > 1e-9 else 0.0
@@ -891,7 +884,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         elif max_h < 1.3: sea = "متوسط الهيجان"
         else: sea = "هائج"
 
-        # --- إصلاح 9: شروط NOGO الدقيقة ميدانياً ---
         period_nogo = []
         if max_h > 1.8: period_nogo.append(f"بحر هائج (أمواج > 1.8م): الرمي مستحيل والخطر على السلامة كبير.")
         if avg_wp_b < 5.0 and avg_h > 0.6: period_nogo.append(f"موج محلي قصير وحاد (فترة {avg_wp_b:.1f}ث < 5ث): يكسر بقوة ويخلق تياراً عكسياً قاسياً.")
@@ -927,7 +919,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if diff_sw > 40: swell_wave_interaction = "متقاطعان بشدة"
             elif diff_sw > 25: swell_wave_interaction = "متقاطعان بسيط"
 
-        # --- إصلاح 10: فيزياء مسافة الرمي الصحيحة ---
         if avg_wd_b is not None:
             wind_dir_rad = math.radians(avg_wd_b); orient_rad = math.radians(orient)
             frontal = math.cos(wind_dir_rad - orient_rad); lateral = abs(math.sin(wind_dir_rad - orient_rad))
@@ -947,7 +938,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         confidence = calculate_confidence_index(period_flags_dict, period_is_mirror_sea, has_golden_window,
                                                 len(period_nogo), len(period_warnings), block_wind_ok, block_wave_ok, is_night_with_tide)
         
-        # --- إصلاح 11: إسقاط الثقة فوراً عند وجود NOGO ---
         if period_nogo:
             confidence = min(confidence, 10)
 
@@ -1159,7 +1149,6 @@ def build_context(req, agg, tz_name):
     lines = ["\n".join(facts), "", "=== التفاعلات ===", *chain_interactions]
     return "\n".join(lines)
 
-# --- إصلاح 12: تحسين الـ Prompt لمنع الهدر ---
 SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب تقريرًا بالدارجة التونسية باستخدام البيانات التالية.
 القرار النهائي ونسبة النجاح موجودان في [الحسم النهائي] و[نسبة النجاح]. لا تغيرهما.
 
@@ -1179,7 +1168,6 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 - لا تذكر المركب ولا تستخدم حروفًا لاتينية.
 """
 
-# --- إصلاح 13: طريقة إرسال Gemini الصحيحة ---
 async def call_gemini(ctx):
     MAX_CONTEXT_CHARS = 30000
     if len(ctx) > MAX_CONTEXT_CHARS:
@@ -1390,7 +1378,7 @@ def fix_broken_number_lines(text: str) -> str:
     return '\n'.join(fixed)
 
 # ---------- Main Endpoint ----------
-@app.post("/generate-report")
+@main.post("/generate-report")
 @limiter.limit("1/minute")
 async def generate_report(request: Request, req: RawDataReportRequest):
     try:
@@ -1405,7 +1393,6 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         raise HTTPException(500, detail="فشل إنشاء التقرير")
 
 async def _generate_report_inner(req: RawDataReportRequest):
-    # --- إصلاح 14: استخدام الإحداثيات الصحيحة دائماً ---
     lat = req.latitude if req.latitude is not None else 36.8
     lon = req.longitude if req.longitude is not None else 10.1
 
@@ -1451,7 +1438,6 @@ async def _generate_report_inner(req: RawDataReportRequest):
     if not all_times:
         raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
 
-    # تمرير الإحداثيات الصحيحة
     agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, lat, lon)
 
     HARD_NOGO_KEYWORDS = ["هائج", "صواعق", "ضباب كثيف", "عكارة طينية", "رياح عاتية", "موج محلي قصير", "تيار جانبي عنيف", "تيار راجع عنيف"]
@@ -1475,7 +1461,7 @@ async def _generate_report_inner(req: RawDataReportRequest):
         report = add_paragraph_spacing(report)
 
         flow_section = build_flow_section(agg["extra_info"]["tidal_windows"])
-        pattern = r'🕒\s*3\.' # التعديل هنا لأننا منعنا Gemini من كتابة القسم 2
+        pattern = r'🕒\s*3\.'
         report = report.replace(pattern, flow_section + '\n\n🕒 3.', 1)
 
         report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
@@ -1529,4 +1515,4 @@ async def _generate_report_inner(req: RawDataReportRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    uvicorn.run(main, host="0.0.0.0", port=10000)
