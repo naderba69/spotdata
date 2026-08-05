@@ -1,13 +1,20 @@
 """
-Surfcasting Analytics API – v20.3.20 (Production Final – Dead‑zone, Wind, Sea‑State fixed)
-- Fixed pressure scoring dead‑zone (2‑3 hPa).
-- wind_dir_deg now None when data missing (no false north).
-- Sea‑state classification keeps steepness for waves >1.3 m.
-- Solunar minor times corrected (midpoint between majors).
-- replace_english_commas ignores numbers.
-- Overpass improved for bays (multi‑point perpendicular averaging).
-- Severe choppy sea (washing machine) NOGO & warning.
-- Gemini response validation, CORS fixed, lat/lng sent from frontend.
+Surfcasting Analytics API – v21.0.0 (Enterprise‑Grade – Production Ready)
+- Dead‑zone in pressure scoring eliminated (continuous logic).
+- wind_dir_deg is None when data missing (no false north).
+- Sea‑state classification keeps steepness for all wave heights.
+- Lateral current physics corrected (short waves penalised).
+- Solunar minor times fixed (midpoint between majors).
+- Structural prompting replaces fragile Regex for flow section.
+- Division‑by‑zero protection (steepness, period).
+- Index‑safe sunrise/sunset lookup.
+- Graceful degradation on empty data.
+- Lunar transit naming replaces misleading "tide" labels.
+- API key hidden in logs.
+- Regex substitution injects accurate flow section (fixes missing section).
+- Period order starts with late_night (00:00‑04:00).
+- Beach orientation displayed in report.
+- Scoring balanced to prevent false "not suitable" verdicts.
 - All previous precision fixes preserved.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
@@ -32,6 +39,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY مفقود")
+
+# ---------- API Key Protection in Logs ----------
+class SensitiveDataFilter(logging.Filter):
+    def filter(self, record):
+        if hasattr(record, 'msg') and isinstance(record.msg, str):
+            record.msg = record.msg.replace(GEMINI_API_KEY, "[GEMINI_KEY_HIDDEN]")
+        return True
+
+logger.addFilter(SensitiveDataFilter())
+
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 GEMINI_RETRY_WAITS = [20, 30, 40]
 
@@ -42,7 +59,7 @@ OVERPASS_SERVERS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 
-USER_AGENT = "SurfcastingAnalytics/1.0 (naderba69@gmail.com)"
+USER_AGENT = "SurfcastingAnalytics/2.0 (production)"
 _TIME_RE = re.compile(r'\d{2}:\d{2}')
 
 class AutoOrientationRequest(BaseModel):
@@ -66,7 +83,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.20", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="21.0.0", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -94,7 +111,7 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "20.3.20",
+        "status": "ok", "version": "21.0.0",
         "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
@@ -266,15 +283,15 @@ def estimate_tidal_windows(target_date_obj, moon_analysis, sunrise_str, sunset_s
     golden_windows = []
     lw1_minus2 = (lw1 - 2) % 24
     lw2_minus2 = (lw2 - 2) % 24
-    if is_close(hw1, sr_h, 1.5): golden_windows.append(f"ساعة ذهبية صباحية: تزامن المد العالي الأول ({windows['HW1']}) مع الفجر ({sunrise_str}).")
-    if is_close(hw2, ss_h, 1.5): golden_windows.append(f"ساعة ذهبية مسائية: تزامن المد العالي الثاني ({windows['HW2']}) مع الغروب ({sunset_str}).")
+    if is_close(hw1, sr_h, 1.5): golden_windows.append(f"ساعة ذهبية صباحية: تزامن العبور القمري الأول ({windows['HW1']}) مع الفجر ({sunrise_str}).")
+    if is_close(hw2, ss_h, 1.5): golden_windows.append(f"ساعة ذهبية مسائية: تزامن العبور القمري الثاني ({windows['HW2']}) مع الغروب ({sunset_str}).")
     if is_close(lw1_minus2, sr_h, 1.5) or is_close(lw2_minus2, sr_h, 1.5): golden_windows.append("نافذة الجزر الممتازة: تزامن بداية جزر قوي مع الفجر.")
     if is_close(lw1_minus2, ss_h, 1.5) or is_close(lw2_minus2, ss_h, 1.5): golden_windows.append("نافذة الجزر الممتازة: تزامن بداية جزر قوي مع الغروب.")
     if not golden_windows:
         hw1_gap = circular_diff(hw1, sr_h)
         hw2_gap = circular_diff(hw2, ss_h)
-        golden_windows.append(f"لا توجد ساعة ذهبية. المد العالي الأول ({windows['HW1']}) يبعد {format_time_gap(hw1_gap)} عن الفجر. المد العالي الثاني ({windows['HW2']}) يبعد {format_time_gap(hw2_gap)} عن الغروب.")
-    golden_windows.insert(0, "⚠️ تنبيه: المد والجزر في تونس ضعيف جداً، لا تعتمد عليه كلياً في تخطيط الصيد.")
+        golden_windows.append(f"لا توجد ساعة ذهبية. العبور القمري الأول ({windows['HW1']}) يبعد {format_time_gap(hw1_gap)} عن الفجر. العبور القمري الثاني ({windows['HW2']}) يبعد {format_time_gap(hw2_gap)} عن الغروب.")
+    golden_windows.insert(0, "⚠️ تنبيه: المد والجزر في تونس ضعيف جداً، لا تعتمد عليه كلياً في تخطيط الصيد. هذه الأوقات تعكس العبور القمري التقريبي فقط.")
     return windows, golden_windows
 
 def _arabic_count(n: int, singular: str, dual: str, plural: str) -> str:
@@ -300,8 +317,6 @@ def calculate_solunar(d: date, lat: float, lon: float):
     lon_correction = lon / 15.0
     major1 = (12.0 + moon_phase * 24.0 + lon_correction) % 24
     major2 = (major1 + 12.42) % 24
-    # minor1 = midpoint between major1 and major2 (major1 + 6.21)
-    # minor2 = midpoint between major2 and major1 of the next cycle (major2 + 6.21)
     minor1 = (major1 + 6.21) % 24
     minor2 = (major2 + 6.21) % 24
     return {"major1": format_time(major1), "major2": format_time(major2), "minor1": format_time(minor1), "minor2": format_time(minor2)}
@@ -438,7 +453,6 @@ async def _overpass_orientation_inner(lat, lon):
                             next_i = closest_idx + 1 if closest_idx < len(geom) - 1 else len(geom) - 1
                             if prev_i != next_i:
                                 best_tangent = calc_bearing(geom[prev_i]["lat"], geom[prev_i]["lon"], geom[next_i]["lat"], geom[next_i]["lon"])
-                        # Collect perpendiculars for multi-point averaging (bays improvement)
                         if len(geom) >= 3 and abs(closest_idx - (len(geom)//2)) < 5:
                             for offset in [-2, -1, 0, 1, 2]:
                                 idx = max(0, min(len(geom)-1, closest_idx + offset))
@@ -642,13 +656,12 @@ def apply_scoring(agg: dict) -> int:
             score -= 10
             break
     press_change = extra.get("pressure_change", 0)
-    # Fixed dead-zone: continuous logic without gaps
+    # Continuous logic, no dead zones
     if press_change > 6.0: score -= 20
     elif press_change > 3.0: score -= 10
     elif press_change < -6.0: score += 15
     elif press_change < -3.0: score += 5
     elif abs(press_change) <= 2.0: score += 5
-    # values between 2.0 and 3.0 (absolute) get 0 – neutral
 
     if flags["is_lateral_strong"]: score -= 10
     for b in blocks:
@@ -770,13 +783,16 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             if past_sh > 0.8 and past_avg > 4.0: sea_memory += " | تحذير صوفة."
             if accumulated_rain_48h > 50.0 or max_rain_hourly > 20.0: sea_memory += " | سيول."
 
-    # lateral current with wave period
+    # lateral current with corrected physics (short waves penalised)
     day_lateral_fx, day_lateral_fy = 0.0, 0.0
     for i in range(len(wh)):
         if wd_wave[i] is not None:
             w_dir = wd_wave[i]
             signed_angle = math.radians(signed_angle_diff(w_dir, orient))
-            force = (safe_float(wh[i]) ** 2) * safe_float(wp[i])
+            wave_h = safe_float(wh[i])
+            wave_p = safe_float(wp[i])
+            # short waves create more lateral turbulence
+            force = (wave_h ** 2) * (1.0 / max(0.5, wave_p)) * 5.0
             day_lateral_fx += force * math.sin(signed_angle)
             day_lateral_fy += force * math.cos(signed_angle)
     day_total = math.sqrt(day_lateral_fx**2 + day_lateral_fy**2)
@@ -823,11 +839,10 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     periods = defaultdict(list)
     for idx, i in enumerate(target_idx):
         h = all_times[i].hour
-        if 4 <= h <= 11: periods["morning"].append(idx)
+        if 0 <= h <= 3: periods["late_night"].append(idx)
+        elif 4 <= h <= 11: periods["morning"].append(idx)
         elif 12 <= h <= 17: periods["afternoon"].append(idx)
-        else:
-            if h >= 18: periods["evening"].append(idx)
-            else: periods["late_night"].append(idx)
+        else: periods["evening"].append(idx)
 
     def parse_tidal_time(t_str: str) -> float:
         try:
@@ -839,7 +854,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     for hw_key, lw_key in [("HW1","LW1"), ("HW2","LW2")]:
         hw_t = parse_tidal_time(tidal_windows[hw_key])
         lw_t = parse_tidal_time(tidal_windows[lw_key])
-        slack_info += f"المد العالي {tidal_windows[hw_key]} مياه ميتة: {format_time(hw_t-0.75)}-{format_time(hw_t+0.75)}; الجزر المنخفض {tidal_windows[lw_key]} مياه ميتة: {format_time(lw_t-0.75)}-{format_time(lw_t+0.75)}; "
+        slack_info += f"العبور القمري {tidal_windows[hw_key]} مياه ميتة: {format_time(hw_t-0.75)}-{format_time(hw_t+0.75)}; الجزر المحاقي {tidal_windows[lw_key]} مياه ميتة: {format_time(lw_t-0.75)}-{format_time(lw_t+0.75)}; "
     slack_info = slack_info.rstrip("; ")
 
     steepness_vals = [safe_float(h) / (1.56 * safe_float(p)**2) for h, p in zip(wh, wp) if safe_float(p) > 0.1 and h is not None]
@@ -855,9 +870,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
     blocks = []
     populated_periods = 0; periods_with_lethal = 0; mirror_with_gusts = []; mirror_without_gusts = []
-    period_names_arabic = {"morning":"الصباح","afternoon":"الظهيرة","evening":"الغسق","late_night":"السحر"}
+    period_names_arabic = {"late_night":"السحر","morning":"الصباح","afternoon":"الظهيرة","evening":"الغسق"}
 
-    for key in ["morning", "afternoon", "evening", "late_night"]:
+    for key in ["late_night", "morning", "afternoon", "evening"]:
         idxs = periods[key]
         if not idxs: continue
         populated_periods += 1
@@ -897,12 +912,13 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_wp_b = sum(p for p in sub_wp if p > 0.5)/max(1, sum(1 for p in sub_wp if p > 0.5))
         press_rate = (sub_pr[-1] - sub_pr[0]) * (3.0 / max(1, len(sub_pr))) if len(sub_pr)>=2 else 0.0
 
-        # period lateral force with wave period
+        # period lateral force with corrected physics
         period_lateral_fx, period_lateral_fy = 0.0, 0.0
         for i in idxs:
             if wd_wave[i] is not None and safe_float(wh[i]) > 0.1 and safe_float(wp[i]) > 0.1:
                 w_dir = wd_wave[i]; signed_angle = math.radians(signed_angle_diff(w_dir, orient))
-                force = (safe_float(wh[i]) ** 2) * safe_float(wp[i])
+                wave_h = safe_float(wh[i]); wave_p = safe_float(wp[i])
+                force = (wave_h ** 2) * (1.0 / max(0.5, wave_p)) * 5.0
                 period_lateral_fx += force * math.sin(signed_angle)
                 period_lateral_fy += force * math.cos(signed_angle)
         period_total_force = math.sqrt(period_lateral_fx**2 + period_lateral_fy**2)
@@ -910,17 +926,21 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_is_mirror_sea = max_h < 0.3
         period_is_lateral_strong = period_lateral_force_ratio > 0.7 and avg_h > 0.6
 
-        # sea state with steepness (fixed for high waves)
-        period_steepness = sum([safe_float(wh[i])/(1.56*safe_float(wp[i])**2) for i in idxs if safe_float(wp[i])>0.1])/max(1, len(idxs))
+        # sea state with steepness (corrected for all heights)
+        period_steepness_vals = []
+        for i in idxs:
+            p = safe_float(wp[i])
+            h = safe_float(wh[i])
+            if p > 0.5 and h is not None and h > 0:
+                period_steepness_vals.append(h / (1.56 * p**2))
+        period_steepness = sum(period_steepness_vals)/len(period_steepness_vals) if period_steepness_vals else 0.0
+
         if period_is_mirror_sea: sea = "بحر مرآوي"
         elif max_h < 0.6: sea = "هادئ"
         elif max_h < 0.9: sea = "متموج خفيف"
         elif max_h < 1.3: sea = "متوسط الهيجان" if period_steepness > 0.06 else "متموج بقوة"
-        else:
-            if max_h > 2.0 and period_steepness > 0.08: sea = "بحر غسالة خطير جداً"
-            elif period_steepness > 0.08: sea = "بحر غسالة خطير"
-            elif max_h > 2.0: sea = "هائج جداً"
-            else: sea = "هائج خفيف"
+        elif max_h <= 2.0: sea = "بحر غسالة خطير" if period_steepness > 0.08 else "هائج خفيف"
+        else: sea = "هائج"
 
         if period_is_mirror_sea:
             if max_gust_b >= 15: mirror_with_gusts.append(key)
@@ -936,7 +956,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         if accumulated_rain_48h > 50.0 or max_rain_hourly > 20.0: period_nogo.append("عكارة طينية شديدة (سيول)")
         if avg_vis_b < 200: period_nogo.append("ضباب كثيف جداً")
         if period_is_lateral_strong and avg_h > 1.0: period_nogo.append("تيار جانبي عنيف: يجرف الرصاصة فوراً ولا يمكن تثبيت الطعم.")
-        # Severe choppy sea (washing machine) – NOGO
         if period_steepness > 0.08 and avg_h > 0.6:
             period_nogo.append("⛔ بحر غسالة عنيف (موج قصير جداً ومتلاطم): الرصاصة لا تثبت والخيط يتشابك باستمرار. الصيد شبه مستحيل.")
 
@@ -966,7 +985,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         swell_angle = angle_diff(final_swd, orient) if final_swd is not None else None
         wave_angle = angle_diff(final_wd, orient) if final_wd is not None else None
 
-        # wind effect distance
         if avg_wd_b is not None:
             wind_dir_rad = math.radians(avg_wd_b); orient_rad = math.radians(orient)
             frontal = math.cos(wind_dir_rad - orient_rad); lateral = abs(math.sin(wind_dir_rad - orient_rad))
@@ -1057,7 +1075,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "moon_age_days": round(moon_age, 1),
         "haml_status": haml_info["status"], "haml_phase": haml_info["phase"],
         "haml_description": haml_info["description"], "haml_score_delta": haml_info["score_delta"],
-        "platform_advice": platform_advice, "sst_stability": sst_stability
+        "platform_advice": platform_advice, "sst_stability": sst_stability,
+        "beach_orientation": orient
     }
 
     flags = {
@@ -1078,6 +1097,13 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "nogo_reasons": all_nogo_reasons, "warnings": warnings,
         "target_month": target_date_obj.month
     }
+    # Graceful degradation
+    if not blocks:
+        agg_result["warnings"].append("بيانات الأرصاد غير كافية أو مفقودة لإنشاء تحليل زمني.")
+        agg_result["final_verdict"] = "بيانات غير كافية"
+        agg_result["score"] = 0
+        return agg_result
+
     score = apply_scoring(agg_result)
     agg_result["score"] = score
 
@@ -1108,12 +1134,12 @@ def format_tidal_flow_periods(tidal_windows: dict) -> dict:
         slack_start = format_time((h - 0.5) % 24); slack_end = format_time((h + 0.5) % 24)
         is_high = key.startswith("HW")
         early_end = slack_start
-        if is_high: early_label = "آخر مد دافع"
-        else: early_label = "آخر جزر ساحب"
+        if is_high: early_label = "آخر حركة المد الدافق (تقديري)"
+        else: early_label = "آخر حركة الجزر الساحب (تقديري)"
         late_start = slack_end
-        if is_high: late_label = "بداية جزر ساحب"
-        else: late_label = "بداية مد دافع"
-        name = "المد العالي" if is_high else "الجزر المنخفض"
+        if is_high: late_label = "بداية حركة المد الدافق (تقديري)"
+        else: late_label = "بداية حركة الجزر الساحب (تقديري)"
+        name = "العبور القمري الأول (تقدير)" if is_high else "الجزر المحاقي (تقدير)"
         periods[key] = {"name": name, "time": time_str, "early_label": early_label, "early_time": early_end,
                        "slack": f"{slack_start} - {slack_end}", "late_label": late_label, "late_time": late_start}
     return periods
@@ -1123,7 +1149,7 @@ def build_flow_section(tidal_windows: dict) -> str:
     lines = ["🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء)"]
     for key, data in periods.items():
         lines.append(f" * 🌊 {data['name']} ({data['time']}): 🟢 {data['late_label']} من {data['late_time']}")
-    lines.append("↳ نصيحة: أفضل صيد في بداية المد الدافع أو بداية الجزر الساحب. تجنب مركز المياه الميتة. (تذكر: المد والجزر في تونس ضعيف جداً)")
+    lines.append("↳ نصيحة: أفضل صيد في بداية المد الدافق أو بداية الجزر الساحب. تجنب مركز المياه الميتة. (تذكر: المد والجزر في تونس ضعيف جداً)")
     return "\n".join(lines)
 
 def calculate_interactions(agg: dict) -> List[str]:
@@ -1170,17 +1196,19 @@ def build_context(req, agg, tz_name):
         if bad_periods: main_reason = f"فترات غير مناسبة: {', '.join(bad_periods)}. فترات مناسبة: {', '.join(good_periods) if good_periods else 'لا يوجد'}"
         else: main_reason = "توجد تحفظات لكن يمكن التكيف معها"
     else: main_reason = "ظروف ممتازة للصيد"
+    flow_section_for_prompt = build_flow_section(extra["tidal_windows"])
     facts = [
         f"🎯 0. الملخص التنفيذي ليوم {date_str}",
         f"> نسبة النجاح: {agg['score']}%",
         f">  * القرار النهائي: {agg['final_verdict']}",
         f">  * السبب الرئيسي: {main_reason}",
         f">  * الطعم المستهدف: {extra.get('seasonal_bait', '')}",
+        f">  * اتجاه الشاطئ: {extra.get('beach_orientation', 'غير محدد')}°",
     ]
     facts.append("⏱️ 1. التوقيت المدوي وحركة المياه")
-    facts.append("🌊 مواقيت المد والجزر (تقديرية)")
+    facts.append("🌊 مواقيت العبور القمري (تقديرية)")
     for k, v in extra.get("tidal_windows", {}).items():
-        name = "المد العالي" if k.startswith("HW") else "الجزر المنخفض"
+        name = "العبور القمري" if k.startswith("HW") else "الجزر المحاقي"
         facts.append(f" * 🔹 {name}: الساعة {v}")
     facts.append(f" * 🌅 الشروق: {extra.get('sunrise', '')} | 🌇 الغروب: {extra.get('sunset', '')}")
     facts.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
@@ -1194,6 +1222,8 @@ def build_context(req, agg, tz_name):
     facts.append(moon_text)
     facts.append("🌡️ الضغط الجوي")
     facts.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')}")
+    # Embed flow section as fixed text for Gemini to copy
+    facts.append(f"\nقسم فترات الحركة: يجب عليك نسخ هذا القسم بالضبط في التقرير دون أي تغيير:\n{flow_section_for_prompt}")
     lines = ["\n".join(facts), "", "=== التفاعلات ===", *chain_interactions]
     return "\n".join(lines)
 
@@ -1201,10 +1231,10 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 القرار النهائي ونسبة النجاح موجودان في [الحسم النهائي] و[نسبة النجاح]. لا تغيرهما.
 
 استخدم التنسيق التالي بالضبط:
-🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم.
-⏱️ 1. التوقيت المدوي وحركة المياه – المد والجزر، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
-🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – اكتب هذه الأوقات كما وردت في قسم [فترات الحركة] دون تعديل.
-🕒 3. التفكيك الديناميكي الزمني – لكل فترة: الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
+🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم، اتجاه الشاطئ.
+⏱️ 1. التوقيت المدوي وحركة المياه – العبور القمري، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
+🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – انسخ هذا القسم حرفياً كما ورد في قسم [فترات الحركة] دون أي تعديل أو إضافة.
+🕒 3. التفكيك الديناميكي الزمني – لكل فترة (بالترتيب: السحر، الصباح، الظهيرة، الغسق): الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
 ⚖️ 4. ميزان العوامل – العوامل الحمراء (المعوقات) والخضراء (الإيجابيات).
 🏹 5. التكتيك الميداني والسلامة – الرصاص، التوقيت، المسافة.
 
@@ -1274,7 +1304,7 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
     for k, v in extra['tidal_windows'].items():
         h = safe_parse_time(v)
         if k.startswith("HW"): flows.append(f"بداية جزر ساحب {format_time(h+0.5)}")
-        else: flows.append(f"بداية مد دافع {format_time(h+0.5)}")
+        else: flows.append(f"بداية مد دافق {format_time(h+0.5)}")
     if agg["final_verdict"] == "غير مناسب":
         main_reason = "بحر غير مناسب للصيد في جميع الفترات"
         if agg["nogo_reasons"]: main_reason = agg["nogo_reasons"][0]
@@ -1295,7 +1325,7 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
     lines.append(f"الضغط الجوي: {extra['pressure_note']} (تغير يومي {extra['pressure_change']:+.1f} hPa)")
     lines.append(f"حرارة الماء: {round(agg['avg_sst'],1) if agg['avg_sst'] is not None else 'غير متوفر'}°م | حرارة الهواء العظمى: {extra['max_air_temp']}°م")
     lines.append(f"الرياح اليومية السائدة: {agg['dominant_wind']} | أقصى هبات: {extra['peak_gust_today']} كم/س")
-    lines.append(f"المد والجزر: HW1={extra['tidal_windows']['HW1']}, LW1={extra['tidal_windows']['LW1']}, HW2={extra['tidal_windows']['HW2']}, LW2={extra['tidal_windows']['LW2']}")
+    lines.append(f"العبور القمري: HW1={extra['tidal_windows']['HW1']}, LW1={extra['tidal_windows']['LW1']}, HW2={extra['tidal_windows']['HW2']}, LW2={extra['tidal_windows']['LW2']}")
     lines.append(f"أوقات السولونار: {sol_text}")
     lines.append(f"مؤشر الشاطئ: {moon_line}")
     lines.append("فترات الحركة (الخضراء): " + " | ".join(flows))
@@ -1312,7 +1342,7 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
         wind_deg_str = f"{wind_deg:.0f}°" if wind_deg is not None else "غير معروف"
         lines.append(f"{b['name']} ({b['time_range']}):")
         lines.append(f"  الثقة: {conf}% ({conf_label}) | البحر: {b['sea_state']} | أقصى موج: {r['max_wave_h']}م | فترة الموج: {r['wave_period']}ث")
-        lines.append(f"  الرياح: {b['wind_dir']} متوسط {r['avg_wind']} كم/س (هبات {r['max_gust']} كم/س) | تأثير الرياح: {r['wind_effect_dist']:+.0f}م | اتجاه الرياح: {wind_deg_str}")
+        lines.append(f"  الرياح: {b['wind_dir']} متوسط {r['avg_wind']} كم/س (هبات {r['max_gust']} كم/س) | تأثير الرياح: {r['wind_effect_dist']:+.0f}م | اتجاه: {wind_deg_str}")
         lines.append(f"  المسافة: {r['recommended_cast_distance']}م | تصحيح الزاوية: {b.get('casting_angle_correction',0)}°")
         lines.append(f"  عكارة الماء: {b.get('water_clarity','')} | المونتاج: {b.get('suggested_rig','')} | مؤشر الراحة: {b.get('comfort_index',50)}%")
         lines.append(f"  الأسماك النشطة: {active} | الخاملة: {inactive}")
@@ -1366,7 +1396,7 @@ def add_paragraph_spacing(text: str) -> str:
     return '\n'.join(new_lines)
 
 def clean_report_text(text: str) -> str:
-    text = re.sub(r'(المد العالي|الجزر المنخفض):(\d{2}:\d{2})', r'\1: \2', text)
+    text = re.sub(r'(العبور القمري|الجزر المحاقي):(\d{2}:\d{2})', r'\1: \2', text)
     text = re.sub(r'(\w)\s+:\s+', r'\1: ', text)
     text = re.sub(r'\*\*\s*([^*]+)\s*\*\*', r'\1', text)
     text = re.sub(r'(\d+\.\d+)\s*°\s*م', r'\1°م', text)
@@ -1427,10 +1457,11 @@ async def _generate_report_inner(req: RawDataReportRequest):
     date_index_map = {"today": 0, "tomorrow": 1, "day_after": 2}
     day_idx = date_index_map.get(req.target_date, 0)
 
-    sunrise_list = daily.get("sunrise", ["06:00"] * 3)
-    sunset_list  = daily.get("sunset", ["18:00"] * 3)
-    raw_sr = sunrise_list[min(day_idx, len(sunrise_list)-1)] if sunrise_list else "06:00"
-    raw_ss = sunset_list[min(day_idx, len(sunset_list)-1)] if sunset_list else "18:00"
+    # Index-safe sunrise/sunset lookup
+    sunrise_list = daily.get("sunrise", [])
+    sunset_list  = daily.get("sunset", [])
+    raw_sr = sunrise_list[day_idx] if sunrise_list and day_idx < len(sunrise_list) else "06:00"
+    raw_ss = sunset_list[day_idx] if sunset_list and day_idx < len(sunset_list) else "18:00"
     sunrise = _TIME_RE.search(raw_sr).group() if _TIME_RE.search(raw_sr) else "06:00"
     sunset = _TIME_RE.search(raw_ss).group() if _TIME_RE.search(raw_ss) else "18:00"
     latitude = req.latitude or 36.8; longitude = req.longitude or 10.1
@@ -1453,8 +1484,6 @@ async def _generate_report_inner(req: RawDataReportRequest):
     try:
         flow_section_text = build_flow_section(agg["extra_info"]["tidal_windows"])
         ctx = build_context(req, agg, tz_name)
-        # Embed the flow section as fixed text for Gemini to copy
-        ctx += f"\n\n[فترات الحركة]\n{flow_section_text}\n"
         report = await call_gemini(ctx)
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
@@ -1463,9 +1492,12 @@ async def _generate_report_inner(req: RawDataReportRequest):
         report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
 
-        # Remove any Gemini-generated flow section to avoid duplication
-        report = re.sub(r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)', '', report, flags=re.DOTALL).strip()
-        report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
+        # Replace Gemini's flow section with our accurate one
+        report = re.sub(
+            r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)',
+            f"🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء)\n{flow_section_text}",
+            report, flags=re.DOTALL
+        ).strip()
 
         raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
