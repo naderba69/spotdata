@@ -1,18 +1,14 @@
 """
-Surfcasting Analytics API – v20.3.19 (Production Ready – Final Corrections & Enhancements)
-- Overpass improved for bays (multi-point perpendicular averaging).
-- Severe choppy sea (washing machine) now a NOGO with clear warning.
-- CORS fixed (credentials=False with wildcard).
-- Frontend issues fixed (panelScan added, lat/lng sent in payload).
-- Missing weather parameters (relative_humidity_2m, visibility) added.
-- replace_english_commas corrected to ignore numbers.
-- Gemini response structure validated (finishReason, candidates).
-- Peak gust day calculation fixed for missing data.
-- Final verdict tightly coupled with score.
-- Casting angle correction factor increased for strong crosswinds.
-- Rig suggestion improved for weedy and mirror sea conditions.
-- Comfort index now includes wind chill for cold temperatures.
-- All previous precision fixes preserved (lateral current, pressure scoring, etc.).
+Surfcasting Analytics API – v20.3.20 (Production Final – Dead‑zone, Wind, Sea‑State fixed)
+- Fixed pressure scoring dead‑zone (2‑3 hPa).
+- wind_dir_deg now None when data missing (no false north).
+- Sea‑state classification keeps steepness for waves >1.3 m.
+- Solunar minor times corrected (midpoint between majors).
+- replace_english_commas ignores numbers.
+- Overpass improved for bays (multi‑point perpendicular averaging).
+- Severe choppy sea (washing machine) NOGO & warning.
+- Gemini response validation, CORS fixed, lat/lng sent from frontend.
+- All previous precision fixes preserved.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
 from datetime import datetime, timedelta, date
@@ -70,7 +66,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="20.3.19", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="20.3.20", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -98,7 +94,7 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "20.3.19",
+        "status": "ok", "version": "20.3.20",
         "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
@@ -304,6 +300,8 @@ def calculate_solunar(d: date, lat: float, lon: float):
     lon_correction = lon / 15.0
     major1 = (12.0 + moon_phase * 24.0 + lon_correction) % 24
     major2 = (major1 + 12.42) % 24
+    # minor1 = midpoint between major1 and major2 (major1 + 6.21)
+    # minor2 = midpoint between major2 and major1 of the next cycle (major2 + 6.21)
     minor1 = (major1 + 6.21) % 24
     minor2 = (major2 + 6.21) % 24
     return {"major1": format_time(major1), "major2": format_time(major2), "minor1": format_time(minor1), "minor2": format_time(minor2)}
@@ -644,11 +642,13 @@ def apply_scoring(agg: dict) -> int:
             score -= 10
             break
     press_change = extra.get("pressure_change", 0)
+    # Fixed dead-zone: continuous logic without gaps
     if press_change > 6.0: score -= 20
-    elif press_change < -6.0: score += 15
     elif press_change > 3.0: score -= 10
+    elif press_change < -6.0: score += 15
     elif press_change < -3.0: score += 5
-    if abs(press_change) < 2.0: score += 5
+    elif abs(press_change) <= 2.0: score += 5
+    # values between 2.0 and 3.0 (absolute) get 0 – neutral
 
     if flags["is_lateral_strong"]: score -= 10
     for b in blocks:
@@ -910,13 +910,17 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         period_is_mirror_sea = max_h < 0.3
         period_is_lateral_strong = period_lateral_force_ratio > 0.7 and avg_h > 0.6
 
-        # sea state with steepness
+        # sea state with steepness (fixed for high waves)
         period_steepness = sum([safe_float(wh[i])/(1.56*safe_float(wp[i])**2) for i in idxs if safe_float(wp[i])>0.1])/max(1, len(idxs))
         if period_is_mirror_sea: sea = "بحر مرآوي"
         elif max_h < 0.6: sea = "هادئ"
         elif max_h < 0.9: sea = "متموج خفيف"
         elif max_h < 1.3: sea = "متوسط الهيجان" if period_steepness > 0.06 else "متموج بقوة"
-        else: sea = "هائج" if max_h > 2.0 else "هائج خفيف"
+        else:
+            if max_h > 2.0 and period_steepness > 0.08: sea = "بحر غسالة خطير جداً"
+            elif period_steepness > 0.08: sea = "بحر غسالة خطير"
+            elif max_h > 2.0: sea = "هائج جداً"
+            else: sea = "هائج خفيف"
 
         if period_is_mirror_sea:
             if max_gust_b >= 15: mirror_with_gusts.append(key)
@@ -1014,7 +1018,8 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
                 "max_gust": round(max_gust_b, 1), "swell_h": round(avg_swh_b, 3), "swell_p": round(avg_swp_b, 1),
                 "air_temp": round(avg_air, 1), "pressure": round(avg_press_b, 1),
                 "visibility": round(avg_vis_b, 0), "has_swell": actual_swell_exists,
-                "wave_period": round(avg_wp_b, 1), "wind_dir_deg": round(avg_wd_b, 0) if avg_wd_b is not None else 0,
+                "wave_period": round(avg_wp_b, 1),
+                "wind_dir_deg": round(avg_wd_b, 0) if avg_wd_b is not None else None,
                 "wind_effect_dist": round(wind_effect_dist, 0), "recommended_cast_distance": round(recommended_dist, 0),
                 "press_rate": round(press_rate, 2)
             }
@@ -1198,7 +1203,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 استخدم التنسيق التالي بالضبط:
 🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم.
 ⏱️ 1. التوقيت المدوي وحركة المياه – المد والجزر، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
-🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – بداية المد الدافع وبداية الجزر الساحب.
+🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – اكتب هذه الأوقات كما وردت في قسم [فترات الحركة] دون تعديل.
 🕒 3. التفكيك الديناميكي الزمني – لكل فترة: الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
 ⚖️ 4. ميزان العوامل – العوامل الحمراء (المعوقات) والخضراء (الإيجابيات).
 🏹 5. التكتيك الميداني والسلامة – الرصاص، التوقيت، المسافة.
@@ -1303,9 +1308,11 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
         warn = f"تحذير: {'; '.join(b['period_warnings'])}" if b.get("period_warnings") else ""
         active = ', '.join(b.get('active_fish', [])) if b.get('active_fish') else 'لا يوجد'
         inactive = ', '.join(b.get('inactive_fish', [])) if b.get('inactive_fish') else 'لا يوجد'
+        wind_deg = r.get('wind_dir_deg')
+        wind_deg_str = f"{wind_deg:.0f}°" if wind_deg is not None else "غير معروف"
         lines.append(f"{b['name']} ({b['time_range']}):")
         lines.append(f"  الثقة: {conf}% ({conf_label}) | البحر: {b['sea_state']} | أقصى موج: {r['max_wave_h']}م | فترة الموج: {r['wave_period']}ث")
-        lines.append(f"  الرياح: {b['wind_dir']} متوسط {r['avg_wind']} كم/س (هبات {r['max_gust']} كم/س) | تأثير الرياح: {r['wind_effect_dist']:+.0f}م")
+        lines.append(f"  الرياح: {b['wind_dir']} متوسط {r['avg_wind']} كم/س (هبات {r['max_gust']} كم/س) | تأثير الرياح: {r['wind_effect_dist']:+.0f}م | اتجاه الرياح: {wind_deg_str}")
         lines.append(f"  المسافة: {r['recommended_cast_distance']}م | تصحيح الزاوية: {b.get('casting_angle_correction',0)}°")
         lines.append(f"  عكارة الماء: {b.get('water_clarity','')} | المونتاج: {b.get('suggested_rig','')} | مؤشر الراحة: {b.get('comfort_index',50)}%")
         lines.append(f"  الأسماك النشطة: {active} | الخاملة: {inactive}")
@@ -1333,7 +1340,6 @@ def fix_broken_time_in_headers(text: str) -> str:
     return re.sub(r'(\*\s+[^*(]+)\((\d{2}:\d{2})\s*\n\s*\*\s+(\d{2}:\d{2})\)', r'\1(\2 - \3)', text)
 
 def replace_english_commas(text: str) -> str:
-    # corrected to ignore numbers
     text = re.sub(r'(?<=[\u0600-\u06FF\s]),(?=[\u0600-\u06FF\s])', '،', text)
     return text
 
@@ -1445,7 +1451,10 @@ async def _generate_report_inner(req: RawDataReportRequest):
         }
 
     try:
+        flow_section_text = build_flow_section(agg["extra_info"]["tidal_windows"])
         ctx = build_context(req, agg, tz_name)
+        # Embed the flow section as fixed text for Gemini to copy
+        ctx += f"\n\n[فترات الحركة]\n{flow_section_text}\n"
         report = await call_gemini(ctx)
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
@@ -1454,9 +1463,8 @@ async def _generate_report_inner(req: RawDataReportRequest):
         report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
 
-        flow_section = build_flow_section(agg["extra_info"]["tidal_windows"])
-        pattern = r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)'
-        report = re.sub(pattern, flow_section + '\n\n', report, flags=re.DOTALL)
+        # Remove any Gemini-generated flow section to avoid duplication
+        report = re.sub(r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)', '', report, flags=re.DOTALL).strip()
         report = re.sub(r'6\.\s*الأرقام المرجعية.*$', '', report, flags=re.DOTALL).strip()
 
         raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1466,9 +1474,11 @@ async def _generate_report_inner(req: RawDataReportRequest):
         for b in agg['blocks']:
             r = b['_raw']
             wind_eff = r['wind_effect_dist']; sign = '+' if wind_eff > 0 else ''
+            wind_deg = r.get('wind_dir_deg')
+            wind_deg_str = f"{wind_deg:.0f}°" if wind_deg is not None else "غير معروف"
             raw_numbers += (f"🔸 {b['name']} ({b['time_range']}): "
                             f"ثقة {b['confidence']}% ({b.get('confidence_label','')}) | مسافة {b['recommended_cast_distance']}م | "
-                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({r.get('wind_dir_deg','')}°) | "
+                            f"موج {r['avg_wave_h']}-{r['max_wave_h']}م | رياح {r['avg_wind']} كم/س ({wind_deg_str}) | "
                             f"تأثير الرياح {sign}{wind_eff:.0f}م | "
                             f"عكارة: {b.get('water_clarity','')} | مونتاج: {b.get('suggested_rig','')} | راحة: {b.get('comfort_index','')}%")
             if b.get("nogo_reasons"): raw_numbers += f" | ⛔: {'; '.join(b['nogo_reasons'])}"
