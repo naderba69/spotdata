@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Surfcasting Analytics – تقرير تلقائي كامل</title>
+  <title>Surfcasting Analytics – تقرير تلقائي دقيق</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -42,15 +42,15 @@
 </head>
 <body class="text-gray-200 p-4 md:p-6">
   <div class="max-w-7xl mx-auto">
-    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – تقرير تلقائي كامل</h1>
+    <h1 class="text-3xl md:text-4xl font-bold text-neon mb-6 text-center">🎣 Surfcasting Analytics – تقرير تلقائي دقيق</h1>
 
-    <!-- تبويبات (بقعة / مسح) محفوظة من الكود الأصلي -->
+    <!-- تبويبات (تم إضافة panelScan وهمي) -->
     <div class="flex justify-center gap-4 mb-8">
       <button id="tabSingle" class="btn-primary rounded-lg">📍 تقرير بقعة</button>
       <button id="tabScan" class="btn-secondary rounded-lg">🔍 مسح الشواطئ</button>
     </div>
 
-    <!-- محتوى تبويب البقعة (المستخدم الآن) -->
+    <!-- محتوى تبويب البقعة -->
     <div id="panelSingle">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
         <div class="lg:col-span-2"><div id="map"></div></div>
@@ -90,7 +90,7 @@
       </div>
     </div>
 
-    <!-- تبويب مسح الشواطئ (مكانه محفوظ، حالياً لا يحتوي على وظائف) -->
+    <!-- تبويب مسح الشواطئ (وهمي) -->
     <div id="panelScan" class="hidden">
       <div class="card">
         <p class="text-gray-400 text-center">🔍 ميزة مسح الشواطئ قيد التطوير...</p>
@@ -136,7 +136,7 @@
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution: '&copy; OSM &copy; CARTO', subdomains:'abcd', maxZoom:19
     }).addTo(map);
-    const marker = L.marker([36.7,10.8],{draggable:true}).addTo(map).bindPopup('اسحب العلامة').openPopup();
+    const marker = L.marker([36.7,10.8],{draggable:true}).addTo(map).bindPopup('اسحب العلامة أو انقر على الخريطة').openPopup();
 
     // مراجع الحقول
     const latInput = document.getElementById('latitude');
@@ -155,6 +155,8 @@
       const deg = parseInt(orientSlider.value);
       orientVal.textContent = `${deg}° (${degToDir(deg)})`;
     });
+    // تشغيل التحديث الأولي
+    orientSlider.dispatchEvent(new Event('input'));
 
     // دالة التحديث التلقائي للاتجاه ونوع القاع
     async function autoOrientAndDetect(lat, lng) {
@@ -188,27 +190,45 @@
         });
         if (resp.ok) {
           const data = await resp.json();
-          beachSelect.value = data.bottom_type === 'rocky' ? 'rocky' : 'sandy';
+          if (data.bottom_type === 'rocky') {
+            beachSelect.value = 'rocky';
+          } else if (data.bottom_type === 'sandy') {
+            beachSelect.value = 'sandy';
+          }
         }
       } catch (e) {}
     }
 
-    // تشغيل التحديث التلقائي عند تحريك العلامة
-    marker.on('dragend', async () => {
+    // تحديث الموقع على الخريطة
+    function updateMapPosition(lat, lng) {
+      marker.setLatLng([lat, lng]);
+      map.setView([lat, lng], 10);
+      autoOrientAndDetect(lat, lng);
+    }
+
+    // عند سحب العلامة
+    marker.on('dragend', () => {
       const p = marker.getLatLng();
       latInput.value = p.lat.toFixed(6);
       lngInput.value = p.lng.toFixed(6);
-      await autoOrientAndDetect(p.lat, p.lng);
+      autoOrientAndDetect(p.lat, p.lng);
     });
 
-    // عند تغيير الإحداثيات يدويًا
+    // عند النقر على الخريطة
+    map.on('click', (e) => {
+      const lat = e.latlng.lat;
+      const lng = e.latlng.lng;
+      latInput.value = lat.toFixed(6);
+      lngInput.value = lng.toFixed(6);
+      updateMapPosition(lat, lng);
+    });
+
+    // عند تغيير الإحداثيات يدوياً
     async function onCoordChange() {
       const lat = parseFloat(latInput.value);
       const lng = parseFloat(lngInput.value);
       if (!isNaN(lat) && !isNaN(lng)) {
-        marker.setLatLng([lat, lng]);
-        map.setView([lat, lng], 10);
-        await autoOrientAndDetect(lat, lng);
+        updateMapPosition(lat, lng);
       }
     }
     latInput.addEventListener('change', onCoordChange);
@@ -258,19 +278,20 @@
       return resp.json();
     }
 
+    // الحصول على نطاق التاريخ بتوقيت تونس
+    function getTunisDate(offsetDays = 0) {
+      const now = new Date();
+      const tunis = new Date(now.toLocaleString("en-US", {timeZone: "Africa/Tunis"}));
+      tunis.setDate(tunis.getDate() + offsetDays);
+      return tunis.toISOString().split('T')[0];
+    }
+
     function getDateRange(targetDateText) {
-      const today = new Date();
-      const tzOffset = today.getTimezoneOffset();
-      const todayLocal = new Date(today.getTime() - tzOffset * 60000);
-      const target = new Date(todayLocal);
-      if (targetDateText === 'tomorrow') target.setDate(target.getDate() + 1);
-      else if (targetDateText === 'day_after') target.setDate(target.getDate() + 2);
-      const start = new Date(target);
-      start.setDate(start.getDate() - 2);
-      const end = new Date(target);
-      end.setDate(end.getDate() + 1);
-      const format = d => d.toISOString().split('T')[0];
-      return { start: format(start), end: format(end) };
+      const offset = {today:0, tomorrow:1, day_after:2}[targetDateText] || 0;
+      const target = getTunisDate(offset);
+      const start  = getTunisDate(offset - 2);
+      const end    = getTunisDate(offset + 1);
+      return { start, end };
     }
 
     const submitBtn = document.getElementById('submitBtn');
@@ -382,10 +403,25 @@
       }
     });
 
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      alert('تم نسخ التقرير!');
+    }
+
     function copyReport() {
       const text = document.getElementById('reportContent').textContent;
-      navigator.clipboard.writeText(text).then(() => alert('تم نسخ التقرير!'));
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => alert('تم نسخ التقرير!')).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
     }
+
     function shareWhatsApp() {
       const text = encodeURIComponent(document.getElementById('reportContent').textContent);
       window.open(`https://wa.me/?text=${text}`, '_blank');
