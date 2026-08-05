@@ -1,20 +1,19 @@
 """
-Surfcasting Analytics API – v21.0.0 (Enterprise‑Grade – Production Ready)
+Surfcasting Analytics API – v21.0.1 (Enterprise‑Grade – Production Ready)
 - Dead‑zone in pressure scoring eliminated (continuous logic).
 - wind_dir_deg is None when data missing (no false north).
 - Sea‑state classification keeps steepness for all wave heights.
 - Lateral current physics corrected (short waves penalised).
 - Solunar minor times fixed (midpoint between majors).
-- Structural prompting replaces fragile Regex for flow section.
+- Flow section injected at correct position (before section 3).
 - Division‑by‑zero protection (steepness, period).
 - Index‑safe sunrise/sunset lookup.
 - Graceful degradation on empty data.
 - Lunar transit naming replaces misleading "tide" labels.
 - API key hidden in logs.
-- Regex substitution injects accurate flow section (fixes missing section).
 - Period order starts with late_night (00:00‑04:00).
 - Beach orientation displayed in report.
-- Scoring balanced to prevent false "not suitable" verdicts.
+- Scoring balanced (mat penalty reduced, not‑suitable threshold lowered).
 - All previous precision fixes preserved.
 """
 import os, math, asyncio, logging, traceback, zoneinfo, re, random
@@ -83,7 +82,7 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="21.0.0", lifespan=lifespan)
+app = FastAPI(title="Surfcasting Analytics", version="21.0.1", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -111,7 +110,7 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "21.0.0",
+        "status": "ok", "version": "21.0.1",
         "gemini_configured": bool(GEMINI_API_KEY),
         "overpass_reachable": overpass_ok,
         "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
@@ -258,7 +257,7 @@ def get_haml_mat_status(age_days: float) -> dict:
     elif 7 <= age_days <= 9 or 21 <= age_days <= 23:
         phase_name = "التربيع الأول" if age_days <= 9 else "التربيع الثاني"
         day_in = int(age_days - 7) + 1 if age_days <= 9 else int(age_days - 21) + 1
-        return {"status":"أيام المات","phase":phase_name,"days":day_in,"description":f"اليوم {day_in} في {phase_name}. البحر مْيِّت، الماء راكد، الصيد أصعب من الشاطئ.","score_delta":-15}
+        return {"status":"أيام المات","phase":phase_name,"days":day_in,"description":f"اليوم {day_in} في {phase_name}. البحر مْيِّت، الماء راكد، الصيد أصعب من الشاطئ.","score_delta":-8}
     else:
         return {"status":"أيام عادية","phase":"","days":0,"description":"لا توجد مؤشرات حيائية أو مات قوية. الصيد من الشاطئ ممكن.","score_delta":0}
 
@@ -656,7 +655,6 @@ def apply_scoring(agg: dict) -> int:
             score -= 10
             break
     press_change = extra.get("pressure_change", 0)
-    # Continuous logic, no dead zones
     if press_change > 6.0: score -= 20
     elif press_change > 3.0: score -= 10
     elif press_change < -6.0: score += 15
@@ -791,7 +789,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
             signed_angle = math.radians(signed_angle_diff(w_dir, orient))
             wave_h = safe_float(wh[i])
             wave_p = safe_float(wp[i])
-            # short waves create more lateral turbulence
             force = (wave_h ** 2) * (1.0 / max(0.5, wave_p)) * 5.0
             day_lateral_fx += force * math.sin(signed_angle)
             day_lateral_fy += force * math.cos(signed_angle)
@@ -1097,7 +1094,6 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         "nogo_reasons": all_nogo_reasons, "warnings": warnings,
         "target_month": target_date_obj.month
     }
-    # Graceful degradation
     if not blocks:
         agg_result["warnings"].append("بيانات الأرصاد غير كافية أو مفقودة لإنشاء تحليل زمني.")
         agg_result["final_verdict"] = "بيانات غير كافية"
@@ -1113,9 +1109,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         final_verdict = "بيانات غير كافية"
     elif lethal_blocks == total_blocks:
         final_verdict = "غير مناسب"
-    elif score < 25:
+    elif score < 15:
         final_verdict = "غير مناسب"
-    elif score < 45:
+    elif score < 40:
         final_verdict = "فرصة مع تحفظات"
     elif lethal_blocks > 0:
         final_verdict = "فرصة مع تحفظات"
@@ -1196,7 +1192,6 @@ def build_context(req, agg, tz_name):
         if bad_periods: main_reason = f"فترات غير مناسبة: {', '.join(bad_periods)}. فترات مناسبة: {', '.join(good_periods) if good_periods else 'لا يوجد'}"
         else: main_reason = "توجد تحفظات لكن يمكن التكيف معها"
     else: main_reason = "ظروف ممتازة للصيد"
-    flow_section_for_prompt = build_flow_section(extra["tidal_windows"])
     facts = [
         f"🎯 0. الملخص التنفيذي ليوم {date_str}",
         f"> نسبة النجاح: {agg['score']}%",
@@ -1222,8 +1217,6 @@ def build_context(req, agg, tz_name):
     facts.append(moon_text)
     facts.append("🌡️ الضغط الجوي")
     facts.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')}")
-    # Embed flow section as fixed text for Gemini to copy
-    facts.append(f"\nقسم فترات الحركة: يجب عليك نسخ هذا القسم بالضبط في التقرير دون أي تغيير:\n{flow_section_for_prompt}")
     lines = ["\n".join(facts), "", "=== التفاعلات ===", *chain_interactions]
     return "\n".join(lines)
 
@@ -1233,7 +1226,7 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 استخدم التنسيق التالي بالضبط:
 🎯 0. الملخص التنفيذي ليوم (التاريخ) – النسبة، القرار، السبب، الطعم، اتجاه الشاطئ.
 ⏱️ 1. التوقيت المدوي وحركة المياه – العبور القمري، الشروق/الغروب، مؤشر الشاطئ، الضغط، السولونار.
-🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – انسخ هذا القسم حرفياً كما ورد في قسم [فترات الحركة] دون أي تعديل أو إضافة.
+🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء) – لا تكتب هذا القسم مطلقاً. سيتم إضافته تلقائياً.
 🕒 3. التفكيك الديناميكي الزمني – لكل فترة (بالترتيب: السحر، الصباح، الظهيرة، الغسق): الحالة، الرياح، الموج، الموانع والتحذيرات (إن وجدت).
 ⚖️ 4. ميزان العوامل – العوامل الحمراء (المعوقات) والخضراء (الإيجابيات).
 🏹 5. التكتيك الميداني والسلامة – الرصاص، التوقيت، المسافة.
@@ -1457,7 +1450,6 @@ async def _generate_report_inner(req: RawDataReportRequest):
     date_index_map = {"today": 0, "tomorrow": 1, "day_after": 2}
     day_idx = date_index_map.get(req.target_date, 0)
 
-    # Index-safe sunrise/sunset lookup
     sunrise_list = daily.get("sunrise", [])
     sunset_list  = daily.get("sunset", [])
     raw_sr = sunrise_list[day_idx] if sunrise_list and day_idx < len(sunrise_list) else "06:00"
@@ -1492,12 +1484,8 @@ async def _generate_report_inner(req: RawDataReportRequest):
         report = enforce_line_breaks(report)
         report = add_paragraph_spacing(report)
 
-        # Replace Gemini's flow section with our accurate one
-        report = re.sub(
-            r'🏃‍♂️\s*2\.\s*فترات الحركة.*?(?=🕒\s*3\.|⚖️\s*4\.|$)',
-            f"🏃‍♂️ 2. فترات الحركة (الأوقات الخضراء)\n{flow_section_text}",
-            report, flags=re.DOTALL
-        ).strip()
+        # Inject flow section at the correct position (before section 3)
+        report = re.sub(r'(🕒\s*3\.|⚖️\s*4\.)', f"{flow_section_text}\n\n\\g<0>", report, count=1)
 
         raw_numbers = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 الأرقام المرجعية (للتحقق)\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         avg_sst_display = round(agg['avg_sst'], 1) if agg['avg_sst'] is not None else "غير متوفر"
