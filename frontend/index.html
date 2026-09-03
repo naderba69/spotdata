@@ -101,7 +101,7 @@
       <div class="text-center">
         <div class="spinner mx-auto mb-4"></div>
         <p class="text-neon text-lg font-semibold">جاري جلب البيانات وتحليلها...</p>
-        <p class="text-gray-400 text-sm mt-2" id="timerDisplay">الوقت المنقضي: 0 ثانية (الحد الأقصى 180)</p>
+        <p class="text-gray-400 text-sm mt-2" id="timerDisplay">الوقت المنقضي: 0 ثانية (الحد الأقصى 150)</p>
         <p class="text-gray-500 text-xs mt-4">لا تغلق الصفحة أو تضغط على زر التحديث</p>
       </div>
     </div>
@@ -109,7 +109,9 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const API_BASE = 'https://spotdata.onrender.com';
+    // Vercel can override this at deploy time with window.API_BASE.
+    // Keep the Render URL as the production default for the split deployment.
+    const API_BASE = window.API_BASE || 'https://spotdata.onrender.com';
     const MARINE_API = 'https://marine-api.open-meteo.com/v1/marine';
     const WEATHER_API = 'https://api.open-meteo.com/v1/forecast';
 
@@ -303,11 +305,11 @@
     function startTimer() {
       let elapsed = 0;
       if (timerInterval) clearInterval(timerInterval);
-      timerDisplay.textContent = `الوقت المنقضي: 0 ثانية (الحد الأقصى 180)`;
+      timerDisplay.textContent = `الوقت المنقضي: 0 ثانية (الحد الأقصى 150)`;
       timerInterval = setInterval(() => {
         elapsed++;
-        timerDisplay.textContent = `الوقت المنقضي: ${elapsed} ثانية (الحد الأقصى 180)`;
-        if (elapsed >= 180) {
+        timerDisplay.textContent = `الوقت المنقضي: ${elapsed} ثانية (الحد الأقصى 150)`;
+        if (elapsed >= 150) {
           clearInterval(timerInterval);
           timerDisplay.textContent = 'انتهت المهلة القصوى.';
         }
@@ -378,7 +380,10 @@
         });
         clearTimeout(timeoutId);
 
-        const data = await resp.json();
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.detail || `HTTP ${resp.status}`);
+        }
 
         if (data.report) {
           reportContent.textContent = data.report;
@@ -424,6 +429,12 @@
 
     function shareWhatsApp() {
       const text = encodeURIComponent(document.getElementById('reportContent').textContent);
+      window.open(`https://wa.me/?text=${text}`, '_blank');
+    }
+  </script>
+</body>
+</html>
+ncodeURIComponent(document.getElementById('reportContent').textContent);
       window.open(`https://wa.me/?text=${text}`, '_blank');
     }
   </script>

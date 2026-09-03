@@ -36,8 +36,10 @@ logger = logging.getLogger("surfcasting")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Gemini is optional: the deterministic/manual report path must remain available
+# so Render health checks and degraded operation work without an API key.
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY مفقود")
+    logger.warning("GEMINI_API_KEY غير مضبوط؛ سيتم استخدام التقرير اليدوي عند الطلب")
 
 # ---------- API Key Protection in Logs ----------
 class SensitiveDataFilter(logging.Filter):
@@ -77,6 +79,24 @@ class RawDataReportRequest(BaseModel):
 class DetectBottomRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
+
+
+def validate_provider_payload(data: Any, name: str) -> None:
+    """Validate the small, required part of an Open-Meteo response.
+
+    The request accepts provider data for offline/replay use, so it must not
+    trust arbitrary nested JSON or silently interpret a malformed payload as
+    calm weather.
+    """
+    if not isinstance(data, dict):
+        raise HTTPException(422, f"بنية بيانات {name} غير صحيحة")
+    hourly = data.get("hourly", data if name == "البحر" else {})
+    if not isinstance(hourly, dict) or not isinstance(hourly.get("time"), list) or not hourly["time"]:
+        raise HTTPException(422, f"بيانات {name} الساعية مفقودة")
+    for key, values in hourly.items():
+        if key != "time" and values is not None and not isinstance(values, list):
+            raise HTTPException(422, f"المتغير {key} في بيانات {name} غير صالح")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -747,8 +767,9 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
     wave_power = [0.49*(safe_float(h)**2)*safe_float(p) for h,p in zip(wh,wp)]
     wind_cls = [wind_class_detailed(angle_diff(d, orient)) if d is not None else "غير معروف" for d in wd]
-    has_swell_data = len(swh) > 0 and not all(v == 0.0 for v in swh)
-    actual_swell_exists = has_swell_data and max(swh) > 0.05
+    valid_swell = [safe_float(v) for v in swh if v is not None]
+    has_swell_data = bool(valid_swell) and not all(v == 0.0 for v in valid_swell)
+    actual_swell_exists = has_swell_data and max(valid_swell) > 0.05
 
     sea_memory = "بحر صافي وهادئ"
     accumulated_rain_48h = 0.0; max_rain_hourly = 0.0
@@ -808,7 +829,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     has_golden_window = any("تزامن" in g for g in golden_windows)
     if not has_golden_window: warnings.append("لا توجد ساعة ذهبية: قد يقل نشاط الأسماك.")
 
-    valid_sst = [v for v in sst if v is not None and 8.0 <= v <= 35.0]
+    valid_sst = [safe_float(v) for v in sst if v is not None and 8.0 <= safe_float(v) <= 35.0]
     avg_sst = sum(valid_sst) / len(valid_sst) if valid_sst else None
     if avg_sst and avg_sst > 30: warnings.append(f"حرارة ماء مرتفعة جداً ({avg_sst:.1f}°م): قد تكون البيانات خاطئة.")
     sst_diff = max(valid_sst) - min(valid_sst) if len(valid_sst) > 1 else 0
@@ -888,7 +909,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         sub_swp = [safe_float(swp[i]) for i in idxs if swp[i] is not None]
         sub_swd = [swd[i] for i in idxs if swd[i] is not None]
         sub_wave_dir = [wd_wave[i] for i in idxs if wd_wave[i] is not None]
-        sub_sst = [sst[i] for i in idxs if sst[i] is not None and 8.0 <= sst[i] <= 35.0]
+        sub_sst = [safe_float(sst[i]) for i in idxs if sst[i] is not None and 8.0 <= safe_float(sst[i]) <= 35.0]
 
         avg_h = sum(sub_wh)/len(sub_wh) if sub_wh else 0.0
         max_h = max(sub_wh) if sub_wh else 0.0
@@ -907,7 +928,13 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
         avg_press_b = sum(sub_pr)/len(sub_pr) if sub_pr else 1013.0
         avg_vis_b = sum(sub_vis)/len(sub_vis) if sub_vis else 10000.0
         avg_wp_b = sum(p for p in sub_wp if p > 0.5)/max(1, sum(1 for p in sub_wp if p > 0.5))
-        press_rate = (sub_pr[-1] - sub_pr[0]) * (3.0 / max(1, len(sub_pr))) if len(sub_pr)>=2 else 0.0
+        if len(sub_pr) >= 2:
+            first_t = all_times[target_idx[idxs[0]]]
+            last_t = all_times[target_idx[idxs[-1]]]
+            elapsed_hours = (last_t - first_t).total_seconds() / 3600.0
+            press_rate = ((sub_pr[-1] - sub_pr[0]) / elapsed_hours * 3.0) if elapsed_hours > 0 else 0.0
+        else:
+            press_rate = 0.0
 
         # period lateral force with corrected physics
         period_lateral_fx, period_lateral_fy = 0.0, 0.0
@@ -1240,6 +1267,8 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 
 # ---------- Gemini caller with validation ----------
 async def call_gemini(ctx):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Gemini غير مهيأ")
     MAX_CONTEXT_CHARS = 30000
     if len(ctx) > MAX_CONTEXT_CHARS:
         ctx = ctx[:MAX_CONTEXT_CHARS]
@@ -1430,7 +1459,8 @@ async def _generate_report_inner(req: RawDataReportRequest):
         if req.marine_data and req.weather_data:
             marine_data, weather_data = req.marine_data, req.weather_data
         else:
-            lat = req.latitude or 36.8; lon = req.longitude or 10.1
+            lat = req.latitude if req.latitude is not None else 36.8
+            lon = req.longitude if req.longitude is not None else 10.1
             marine_data, weather_data = await asyncio.gather(
                 fetch_marine_data_from_openmeteo(client, lat, lon),
                 fetch_weather_data_from_openmeteo(client, lat, lon),
@@ -1441,10 +1471,17 @@ async def _generate_report_inner(req: RawDataReportRequest):
             if not marine_data: raise HTTPException(502, "بيانات البحر فارغة")
             if not weather_data: raise HTTPException(502, "بيانات الطقس فارغة")
 
+    validate_provider_payload(marine_data, "البحر")
+    validate_provider_payload(weather_data, "الطقس")
     marine_hourly = marine_data.get("hourly", marine_data)
     weather_hourly = weather_data.get("hourly", {})
     daily = weather_data.get("daily", {})
     tz_name = marine_data.get("timezone", "Africa/Tunis")
+    try:
+        zoneinfo.ZoneInfo(tz_name)
+    except (TypeError, zoneinfo.ZoneInfoNotFoundError):
+        logger.warning("منطقة زمنية غير صالحة من المصدر: %r؛ سيتم استعمال Africa/Tunis", tz_name)
+        tz_name = "Africa/Tunis"
     now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
     target_dt = resolve_target_date(req.target_date, now_tn.date())
     date_index_map = {"today": 0, "tomorrow": 1, "day_after": 2}
@@ -1452,15 +1489,40 @@ async def _generate_report_inner(req: RawDataReportRequest):
 
     sunrise_list = daily.get("sunrise", [])
     sunset_list  = daily.get("sunset", [])
-    raw_sr = sunrise_list[day_idx] if sunrise_list and day_idx < len(sunrise_list) else "06:00"
-    raw_ss = sunset_list[day_idx] if sunset_list and day_idx < len(sunset_list) else "18:00"
+    daily_dates = daily.get("time", [])
+    # The frontend requests the preceding 48 hours as well. Never assume
+    # daily[0] is "today"; match sunrise/sunset by the actual target date.
+    target_date_str = target_dt.strftime("%Y-%m-%d")
+    if isinstance(daily_dates, list) and target_date_str in daily_dates:
+        day_idx = daily_dates.index(target_date_str)
+    raw_sr = sunrise_list[day_idx] if isinstance(sunrise_list, list) and day_idx < len(sunrise_list) else "06:00"
+    raw_ss = sunset_list[day_idx] if isinstance(sunset_list, list) and day_idx < len(sunset_list) else "18:00"
     sunrise = _TIME_RE.search(raw_sr).group() if _TIME_RE.search(raw_sr) else "06:00"
     sunset = _TIME_RE.search(raw_ss).group() if _TIME_RE.search(raw_ss) else "18:00"
-    latitude = req.latitude or 36.8; longitude = req.longitude or 10.1
+    latitude = req.latitude if req.latitude is not None else 36.8
+    longitude = req.longitude if req.longitude is not None else 10.1
     beach_type = req.beach_type or "sandy"
 
     all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
-    if not all_times: raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+    if not all_times:
+        raise HTTPException(422, "لا توجد بيانات ساعية متزامنة")
+    # Missing primary observations must not become zero-valued calm weather.
+    target_date_values = [
+        i for i, timestamp in enumerate(all_times)
+        if timestamp.date() == target_dt.date()
+    ]
+    if not target_date_values:
+        raise HTTPException(422, "البيانات لا تغطي التاريخ المطلوب")
+    has_wave = any(
+        aligned.get("wave_height", [])[i] is not None
+        for i in target_date_values if i < len(aligned.get("wave_height", []))
+    )
+    has_wind = any(
+        aligned.get("wind_speed_10m", [])[i] is not None
+        for i in target_date_values if i < len(aligned.get("wind_speed_10m", []))
+    )
+    if not has_wave or not has_wind:
+        raise HTTPException(422, "بيانات الموج أو الرياح الأساسية مفقودة للتاريخ المطلوب")
 
     agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude, longitude, beach_type)
 
