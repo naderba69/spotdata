@@ -1,5 +1,7 @@
 """
-Surfcasting Analytics API – v21.0.1 (Enterprise‑Grade – Production Ready)
+Surfcasting Analytics API – v22.0.0 (Enterprise‑Grade – Production Ready)
+
+الإرث (v21.0.1):
 - Dead‑zone in pressure scoring eliminated (continuous logic).
 - wind_dir_deg is None when data missing (no false north).
 - Sea‑state classification keeps steepness for all wave heights.
@@ -14,11 +16,22 @@ Surfcasting Analytics API – v21.0.1 (Enterprise‑Grade – Production Ready)
 - Period order starts with late_night (00:00‑04:00).
 - Beach orientation displayed in report.
 - Scoring balanced (mat penalty reduced, not‑suitable threshold lowered).
-- All previous precision fixes preserved.
+
+جديد v22.0.0 (الأداء والجودة):
+- إعدادات مركزية من متغيّرات البيئة (backend/config.py).
+- كاش ذاكري TTL + Single‑flight (backend/cache.py): تقارير، Open‑Meteo، Overpass،
+  وتذكّر الفشل (negative caching) مع تقديم قيمة قديمة عند تعذّر المصدر.
+- Gemini: إيقاف «التفكير العميق» افتراضياً (thinking budget = 0) لتقليل الزمن،
+  مهلة قراءة قابلة للضبط، إعادة محاولة أقصر وأذكى (لا إعادة محاولة على 4xx).
+- معرّف طلب (X‑Request‑ID) في كل ردّ وسجل، وقياس زمن المعالجة (X‑Response‑Time).
+- تحقّق من حمولة البيانات قبل المعالجة: رسالة 400 واضحة بدل خطأ 500 مبهم.
+- /health يعرض حالة الخدمات وإحصاءات الكاش (مخبّأ 30 ثانية).
+- إصلاحات دقة: max(air temp) مع قيم None، فحص None لحرارة الماء،
+  واستقرار المنطقة الزمنية عند اسم غير معروف.
 """
-import os, math, asyncio, logging, traceback, zoneinfo, re, random
+import os, math, asyncio, logging, traceback, zoneinfo, re, random, time, uuid, hashlib, json
 from datetime import datetime, timedelta, date
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -31,25 +44,60 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+try:  # يعمل عند التشغيل من داخل مجلد backend (uvicorn main:app)
+    from config import settings
+    from cache import TTLCache
+except ImportError:  # أو كحزمة (uvicorn backend.main:app)
+    from backend.config import settings
+    from backend.cache import TTLCache
+
+logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("surfcasting")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = settings.GEMINI_API_KEY
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY مفقود")
+    logger.warning("GEMINI_API_KEY غير مضبوط: التطبيق يعمل لكن توليد التقارير سيفشل حتى يُضبط المفتاح.")
 
 # ---------- API Key Protection in Logs ----------
 class SensitiveDataFilter(logging.Filter):
+    def __init__(self, secret: str):
+        super().__init__()
+        self.secret = secret
+
     def filter(self, record):
-        if hasattr(record, 'msg') and isinstance(record.msg, str):
-            record.msg = record.msg.replace(GEMINI_API_KEY, "[GEMINI_KEY_HIDDEN]")
+        if self.secret and hasattr(record, 'msg') and isinstance(record.msg, str):
+            record.msg = record.msg.replace(self.secret, "[GEMINI_KEY_HIDDEN]")
         return True
 
-logger.addFilter(SensitiveDataFilter())
+logger.addFilter(SensitiveDataFilter(GEMINI_API_KEY))
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-GEMINI_RETRY_WAITS = [20, 30, 40]
+GEMINI_URL = settings.GEMINI_URL
+GEMINI_RETRY_WAITS = settings.GEMINI_RETRY_WAITS
+
+# ---------- In-memory caches (TTL + single-flight) ----------
+CACHE_ENABLED = settings.CACHE_ENABLED
+report_cache = TTLCache("reports", ttl=settings.CACHE_TTL_REPORT_S,
+                        max_entries=max(16, settings.CACHE_MAX_ENTRIES // 4),
+                        enabled=CACHE_ENABLED)
+upstream_cache = TTLCache("openmeteo", ttl=settings.CACHE_TTL_UPSTREAM_S,
+                          max_entries=settings.CACHE_MAX_ENTRIES, enabled=CACHE_ENABLED)
+overpass_cache = TTLCache("overpass", ttl=settings.CACHE_TTL_OVERPASS_S,
+                          max_entries=settings.CACHE_MAX_ENTRIES, enabled=CACHE_ENABLED)
+failure_cache = TTLCache("failures", ttl=settings.CACHE_TTL_FAILURE_S,
+                         max_entries=settings.CACHE_MAX_ENTRIES, enabled=CACHE_ENABLED)
+health_cache = TTLCache("health", ttl=30.0, max_entries=4, enabled=CACHE_ENABLED)
+
+START_MONOTONIC = time.monotonic()
+
+def _hash_payload(payload: Any) -> str:
+    """بصمة خفيفة لحمولة البيانات (تُستخدم في مفتاح كاش التقارير)."""
+    try:
+        raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        raw = repr(payload)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
@@ -82,39 +130,80 @@ class DetectBottomRequest(BaseModel):
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Surfcasting Analytics", version="21.0.1", lifespan=lifespan)
-limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, lifespan=lifespan,
+              description="تحليل فيزيائي لحالات البحر والصيد الساحلي (سيرفكاستينغ) في تونس.")
+limiter = Limiter(key_func=get_remote_address, enabled=settings.RATE_LIMIT_ENABLED)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = settings.ALLOWED_ORIGINS
 if ALLOWED_ORIGINS == "*":
-    logger.warning("CORS is open to all origins. Restrict in production.")
+    logger.warning("CORS is open to all origins. Restrict in production with ALLOWED_ORIGINS.")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False, max_age=600)
 else:
-    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")]
+    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"], allow_credentials=True, max_age=600)
+
+# ---------- Request context: معرّف الطلب + زمن المعالجة ----------
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.error(f"[{request_id}] Unhandled middleware error\n{traceback.format_exc()}")
+        response = JSONResponse(status_code=500,
+                                content={"detail": "خطأ داخلي في الخادم", "request_id": request_id})
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Response-Time"] = f"{elapsed_ms:.0f}ms"
+    return response
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """توحيد شكل أخطاء HTTP مع إرفاق معرّف الطلب لتسهيل التشخيص."""
+    request_id = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": request_id},
+        headers=exc.headers,
+    )
 
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(status_code=500, content={"detail": "خطأ داخلي في الخادم"})
+    request_id = getattr(request.state, "request_id", None)
+    logger.error(f"[{request_id}] Unhandled: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(status_code=500,
+                        content={"detail": "خطأ داخلي في الخادم", "request_id": request_id})
 
 @app.get("/health")
 async def health():
-    overpass_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get(OVERPASS_SERVERS[0] + "?data=[out:json];node(1);out;")
-            overpass_ok = r.status_code == 200
-    except Exception:
-        pass
-    return {
-        "status": "ok", "version": "21.0.1",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "overpass_reachable": overpass_ok,
-        "timestamp": datetime.now(zoneinfo.ZoneInfo("Africa/Tunis")).isoformat()
-    }
+    """فحص صحة الخدمة + حالة الاعتماديات (مخبّأ 30 ثانية لتجنّب ضرب Overpass)."""
+
+    async def _probe() -> dict:
+        overpass_ok = False
+        try:
+            async with httpx.AsyncClient(timeout=5.0, headers={"User-Agent": USER_AGENT}) as c:
+                r = await c.get(OVERPASS_SERVERS[0], params={"data": "[out:json];node(1);out;"})
+                overpass_ok = r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Overpass health probe failed: {e}")
+        return {
+            "status": "ok",
+            "version": settings.VERSION,
+            "gemini_configured": settings.gemini_configured,
+            "gemini_model": settings.GEMINI_MODEL,
+            "overpass_reachable": overpass_ok,
+            "rate_limit_enabled": settings.RATE_LIMIT_ENABLED,
+            "uptime_seconds": round(time.monotonic() - START_MONOTONIC, 1),
+            "caches": {c.name: c.stats() for c in (report_cache, upstream_cache, overpass_cache, failure_cache)},
+            "timestamp": datetime.now(resolve_timezone(settings.DEFAULT_TZ)).isoformat(),
+        }
+
+    value, _ = await health_cache.get_or_set("health", _probe, ttl=30.0)
+    return value
 
 # ---------- Utility Helpers ----------
 def safe_float(v) -> float:
@@ -205,6 +294,27 @@ def resolve_target_date(txt, real_today):
     if txt == "tomorrow": return real_today + timedelta(days=1)
     return real_today + timedelta(days=2)
 
+def pick_daily_value(daily: dict, key: str, target_date: date, today: date, fallback: str) -> str:
+    """
+    يختار قيمة يومية (شروق/غروب) بالاعتماد على تواريخ daily.time وليس على موقع الفهرس.
+    (الفرونتند يرسل نطاقاً يبدأ قبل اليوم بيومين، لذا day_idx وحده يعطي يوماً خاطئاً.)
+    """
+    arr = daily.get(key) or []
+    if not arr: return fallback
+    times = [t[:10] if isinstance(t, str) else "" for t in (daily.get("time") or [])]
+    target_str = target_date.isoformat()
+    if target_str in times:
+        i = times.index(target_str)
+        if i < len(arr) and arr[i]:
+            return arr[i]
+    today_str = today.isoformat()
+    if today_str in times:
+        i = times.index(today_str) + (target_date - today).days
+        if 0 <= i < len(arr) and arr[i]:
+            return arr[i]
+    i = min(len(arr) - 1, max(0, (target_date - today).days))
+    return arr[i] if arr[i] else fallback
+
 def _julian_day(d: date) -> float:
     y, m, day = d.year, d.month, d.day
     if m < 3: y -= 1; m += 12
@@ -230,6 +340,18 @@ def safe_parse_time(time_str: str) -> float:
         m = float(parts[1]) if len(parts) > 1 else 0.0
         return h + m / 60.0
     except (ValueError, IndexError): return 6.0
+
+def resolve_timezone(tz_name: Optional[str]) -> zoneinfo.ZoneInfo:
+    """يرجع كائن المنطقة الزمنية، ويعود للمنطقة الافتراضية إن كان الاسم غير معروف."""
+    fallback = settings.DEFAULT_TZ
+    for candidate in (tz_name, fallback, "UTC"):
+        if not candidate:
+            continue
+        try:
+            return zoneinfo.ZoneInfo(candidate)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError) as e:
+            logger.warning(f"Unknown timezone '{candidate}' ({e}); trying next fallback.")
+    return zoneinfo.ZoneInfo("UTC")
 
 def safe_parse_iso(ts: str, tz: zoneinfo.ZoneInfo) -> Optional[datetime]:
     try:
@@ -321,7 +443,7 @@ def calculate_solunar(d: date, lat: float, lon: float):
     return {"major1": format_time(major1), "major2": format_time(major2), "minor1": format_time(minor1), "minor2": format_time(minor2)}
 
 def align_hourly_data(marine_hourly, weather_hourly, tz_name):
-    tz = zoneinfo.ZoneInfo(tz_name)
+    tz = resolve_timezone(tz_name)
     m_times = marine_hourly.get("time", [])
     w_times = weather_hourly.get("time", [])
     if not m_times or not w_times: return [], {}
@@ -476,35 +598,46 @@ async def _overpass_orientation_inner(lat, lon):
     return None
 
 async def get_auto_orientation_overpass(lat, lon):
-    try: return await asyncio.wait_for(_overpass_orientation_inner(lat, lon), timeout=25.0)
-    except asyncio.TimeoutError:
-        logger.warning("Overpass orientation global timeout (25s)")
+    """اتجاه الشاطئ من Overpass مع كاش (24 ساعة) وتذكّر الفشل (60 ثانية)."""
+    key = ("orientation", round(lat, 3), round(lon, 3))
+    hit, value = await overpass_cache.get(key)
+    if hit:
+        return value
+    failed, _ = await failure_cache.get(key)
+    if failed:
+        logger.info(f"Skipping Overpass orientation (recent failure) for {key}")
         return None
+    try:
+        value = await asyncio.wait_for(_overpass_orientation_inner(lat, lon), timeout=settings.OVERPASS_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning(f"Overpass orientation global timeout ({settings.OVERPASS_TIMEOUT_S}s)")
+        value = None
+    if value is None:
+        await failure_cache.set(key, True)
+        return None
+    await overpass_cache.set(key, value)
+    return value
 
 @app.post("/auto-orientation")
-@limiter.limit("5/minute")
+@limiter.limit(settings.RATE_LIMIT_ORIENTATION)
 async def auto_orientation(request: Request, req: AutoOrientationRequest):
     orientation = await get_auto_orientation_overpass(req.latitude, req.longitude)
     if orientation is None:
         return {"orientation": -1, "source": "none", "message": "تعذر تحديد اتجاه الشاطئ من الخريطة. يرجى المحاولة لاحقاً أو إدخال الاتجاه يدوياً."}
     return {"orientation": orientation, "source": "overpass"}
 
-@app.post("/detect-bottom-type")
-@limiter.limit("10/minute")
-async def detect_bottom_type(request: Request, req: DetectBottomRequest):
-    info = find_nearest_beach_info(req.latitude, req.longitude)
+async def _detect_bottom_type_uncached(lat: float, lon: float) -> dict:
+    info = find_nearest_beach_info(lat, lon)
     if info: return {"bottom_type": info["type"], "source": "nearby_beach", "confidence": "medium"}
-    query = f"""[out:json];(way(around:2000,{req.latitude},{req.longitude})["natural"="sand"];way(around:2000,{req.latitude},{req.longitude})["natural"="shingle"];way(around:2000,{req.latitude},{req.longitude})["natural"="bare_rock"];);out body;"""
+    query = f"""[out:json];(way(around:2000,{lat},{lon})["natural"="sand"];way(around:2000,{lat},{lon})["natural"="shingle"];way(around:2000,{lat},{lon})["natural"="bare_rock"];);out body;"""
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": USER_AGENT}) as client:
         for server in OVERPASS_SERVERS[:2]:
             try:
                 r = await client.get(server, params={"data": query})
                 r.raise_for_status()
-                data = r.json()
-                elements = data.get("elements", [])
+                elements = r.json().get("elements", [])
                 if elements:
-                    tags = elements[0].get("tags", {})
-                    nat = tags.get("natural", "")
+                    nat = elements[0].get("tags", {}).get("natural", "")
                     if nat == "sand": return {"bottom_type": "sandy", "source": "overpass", "confidence": "high"}
                     if nat in ["shingle", "bare_rock"]: return {"bottom_type": "rocky", "source": "overpass", "confidence": "high"}
                 break
@@ -513,18 +646,76 @@ async def detect_bottom_type(request: Request, req: DetectBottomRequest):
                 continue
     return {"bottom_type": "unknown", "source": "none", "confidence": "low"}
 
+async def get_bottom_type_cached(lat: float, lon: float) -> dict:
+    """نوع القاع مع كاش طويل، وتذكّر قصير للحالات التي تفشل (unknown)."""
+    key = ("bottom", round(lat, 3), round(lon, 3))
+    hit, value = await overpass_cache.get(key)
+    if hit:
+        return value
+    failed, _ = await failure_cache.get(key)
+    if failed:
+        return {"bottom_type": "unknown", "source": "cached_failure", "confidence": "low"}
+    value = await _detect_bottom_type_uncached(lat, lon)
+    if value.get("bottom_type") == "unknown":
+        await failure_cache.set(key, True)
+        return value
+    await overpass_cache.set(key, value)
+    return value
+
+@app.post("/detect-bottom-type")
+@limiter.limit(settings.RATE_LIMIT_BOTTOM)
+async def detect_bottom_type(request: Request, req: DetectBottomRequest):
+    return await get_bottom_type_cached(req.latitude, req.longitude)
+
 # ---------- Fetch data ----------
+MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+MARINE_HOURLY_VARS = "wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature"
+WEATHER_HOURLY_VARS = "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,relative_humidity_2m,precipitation,visibility,weather_code"
+# نحتاج 48 ساعة ماضية (ذاكرة البحر) + يوم الهدف + يوم بعده → past_days=2 و forecast_days=4
+PAST_DAYS = 2
+FORECAST_DAYS = 4
+
 async def fetch_marine_data_from_openmeteo(client: httpx.AsyncClient, lat: float, lon: float):
-    url = "https://marine-api.open-meteo.com/v1/marine"
-    params = {"latitude": lat, "longitude": lon, "hourly": "wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature", "timezone": "Africa/Tunis", "forecast_days": 3}
-    try: r = await client.get(url, params=params); r.raise_for_status(); return r.json()
-    except Exception as e: logger.error(f"Marine fetch failed: {e}"); return None
+    params = {"latitude": lat, "longitude": lon, "hourly": MARINE_HOURLY_VARS,
+              "timezone": settings.DEFAULT_TZ, "past_days": PAST_DAYS, "forecast_days": FORECAST_DAYS}
+    try:
+        r = await client.get(MARINE_URL, params=params, timeout=settings.UPSTREAM_TIMEOUT_S)
+        r.raise_for_status(); return r.json()
+    except Exception as e:
+        logger.error(f"Marine fetch failed: {e}"); return None
 
 async def fetch_weather_data_from_openmeteo(client: httpx.AsyncClient, lat: float, lon: float):
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {"latitude": lat, "longitude": lon, "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,temperature_2m,relative_humidity_2m,precipitation,visibility,weather_code", "daily": "sunrise,sunset", "timezone": "Africa/Tunis", "forecast_days": 3}
-    try: r = await client.get(url, params=params); r.raise_for_status(); return r.json()
-    except Exception as e: logger.error(f"Weather fetch failed: {e}"); return None
+    params = {"latitude": lat, "longitude": lon, "hourly": WEATHER_HOURLY_VARS, "daily": "sunrise,sunset",
+              "timezone": settings.DEFAULT_TZ, "past_days": PAST_DAYS, "forecast_days": FORECAST_DAYS}
+    try:
+        r = await client.get(WEATHER_URL, params=params, timeout=settings.UPSTREAM_TIMEOUT_S)
+        r.raise_for_status(); return r.json()
+    except Exception as e:
+        logger.error(f"Weather fetch failed: {e}"); return None
+
+def _upstream_key(kind: str, lat: float, lon: float):
+    """مفتاح كاش للإحداثيات (تقريب ~1 كم لأن بيانات النماذج شبكية أصلاً)."""
+    return (kind, round(lat, 2), round(lon, 2))
+
+async def _fetch_upstream_cached(kind: str, client: httpx.AsyncClient, lat: float, lon: float, fn) -> Optional[dict]:
+    """جلب مع كاش + تذكّر الفشل + رحلة واحدة للطلبات المتزامنة."""
+    key = _upstream_key(kind, lat, lon)
+    failed, _ = await failure_cache.get(key)
+    if failed:
+        logger.warning(f"Upstream {kind} marked as recently failed for {key[1:]}; serving degraded response.")
+        return None
+    value, _from_cache = await upstream_cache.get_or_set(key, lambda: fn(client, lat, lon))
+    if not value:
+        await failure_cache.set(key, True)
+        return None
+    return value
+
+async def fetch_marine_data_cached(client: httpx.AsyncClient, lat: float, lon: float):
+    return await _fetch_upstream_cached("marine", client, lat, lon, fetch_marine_data_from_openmeteo)
+
+async def fetch_weather_data_cached(client: httpx.AsyncClient, lat: float, lon: float):
+    return await _fetch_upstream_cached("weather", client, lat, lon, fetch_weather_data_from_openmeteo)
 
 # ---------- Tactical Helpers ----------
 def get_water_clarity(wind_speed, wave_height, is_murky, is_weedy, haml_status, avg_vis_b=10000):
@@ -589,6 +780,8 @@ def analyze_weed_risk(sea_memory):
 
 def analyze_backwash(wind_speed: float, wind_dir, orient: float, wave_height: float) -> dict:
     if wind_dir is None: return {"severity": "منخفض", "effect": ""}
+    wind_speed = safe_float(wind_speed)
+    wave_height = safe_float(wave_height)
     wind_diff = angle_diff(wind_dir, orient)
     is_onshore = wind_diff < 30
     severity = "منخفض"; effect = ""
@@ -601,6 +794,7 @@ def analyze_backwash(wind_speed: float, wind_dir, orient: float, wave_height: fl
     return {"severity": severity, "effect": effect}
 
 def analyze_debris_risk(sea_memory: str, wind_speed: float) -> dict:
+    wind_speed = safe_float(wind_speed)
     has_floods = "سيول" in sea_memory
     has_weed = "صوفة" in sea_memory or "أعشاب" in sea_memory
     is_windy = wind_speed > 20
@@ -727,7 +921,7 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
     past_idx = [i for i, t in enumerate(all_times) if past_start <= t < target_start]
     target_idx = [i for i, t in enumerate(all_times) if target_start <= t < target_end]
     warnings = []
-    empty_res = {"sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","avg_sst":None,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{},"transitions":[],"flags":{},"nogo_reasons":[],"warnings":[],"final_verdict":"غير مناسب","score":0}
+    empty_res = {"sea_memory":"غير معروف","lateral_current":"غير معروف","pressure_state":"مستقر","tide_analysis":{},"sst_stability":"مستقر","avg_sst":None,"hidden_factors":{},"blocks":[],"red_flags":[],"green_flags":[],"extra_info":{},"transitions":[],"flags":{},"nogo_reasons":[],"warnings":["لا توجد بيانات ساعية ليوم الهدف."],"final_verdict":"بيانات غير كافية","score":0}
     if not target_idx: return empty_res
 
     def pick(k, default=None):
@@ -810,14 +1004,15 @@ def aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, suns
 
     valid_sst = [v for v in sst if v is not None and 8.0 <= v <= 35.0]
     avg_sst = sum(valid_sst) / len(valid_sst) if valid_sst else None
-    if avg_sst and avg_sst > 30: warnings.append(f"حرارة ماء مرتفعة جداً ({avg_sst:.1f}°م): قد تكون البيانات خاطئة.")
+    if avg_sst is not None and avg_sst > 30: warnings.append(f"حرارة ماء مرتفعة جداً ({avg_sst:.1f}°م): قد تكون البيانات خاطئة.")
     sst_diff = max(valid_sst) - min(valid_sst) if len(valid_sst) > 1 else 0
     sst_stability = "صدمة حرارية" if sst_diff > 2.0 else "تغير بطيء" if sst_diff > 1.0 else "مستقر تماماً"
     is_murky = "عكر" in sea_memory or "خامر" in sea_memory
     is_weedy = "صوفة" in sea_memory
-    max_air_temp = max(ta) if any(v is not None for v in ta) else 20.0
+    valid_air_temps = [t for t in ta if t is not None]
+    max_air_temp = max(valid_air_temps) if valid_air_temps else 20.0
     seabass_sst_limit = 22.0 if target_date_obj.month in [6,7,8,9] else 20.0
-    if avg_sst and avg_sst > seabass_sst_limit: warnings.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص.")
+    if avg_sst is not None and avg_sst > seabass_sst_limit: warnings.append(f"حرارة ماء عالية ({avg_sst:.1f}°م): تتجاوز حد القاروص.")
     if is_weedy: warnings.append("صوفة محتملة.")
 
     avg_press = safe_mean(pr, 1013.0)
@@ -1181,7 +1376,7 @@ def calculate_interactions(agg: dict) -> List[str]:
 
 def build_context(req, agg, tz_name):
     extra = agg["extra_info"]; chain_interactions = calculate_interactions(agg)
-    target_date = resolve_target_date(req.target_date, datetime.now(zoneinfo.ZoneInfo(tz_name)).date())
+    target_date = resolve_target_date(req.target_date, datetime.now(resolve_timezone(tz_name)).date())
     date_str = target_date.strftime("%d/%m/%Y")
     if agg["final_verdict"] == "غير مناسب":
         main_reason = "بحر غير مناسب للصيد في جميع الفترات"
@@ -1239,53 +1434,215 @@ SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. اكتب �
 """
 
 # ---------- Gemini caller with validation ----------
+class GeminiNotConfigured(RuntimeError):
+    """يرمى عندما لا يكون مفتاح Gemini مضبوطاً على الخادم."""
+
+
+def build_gemini_payload(ctx: str, with_thinking_config: bool = True) -> dict:
+    """يبني حمولة الطلب. تعطيل «التفكير العميق» يقلّل زمن الرد بشكل ملحوظ."""
+    generation: Dict[str, Any] = {
+        "temperature": settings.GEMINI_TEMPERATURE,
+        "maxOutputTokens": settings.GEMINI_MAX_OUTPUT_TOKENS,
+        "candidateCount": 1,
+    }
+    if with_thinking_config and settings.GEMINI_THINKING_BUDGET >= 0:
+        generation["thinkingConfig"] = {"thinkingBudget": settings.GEMINI_THINKING_BUDGET}
+    return {"contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}], "generationConfig": generation}
+
+
+def parse_retry_after(response: httpx.Response) -> Optional[float]:
+    """يقرأ ترويسة Retry-After إن وجدت (ثوانٍ)."""
+    raw = response.headers.get("Retry-After") or response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 async def call_gemini(ctx):
-    MAX_CONTEXT_CHARS = 30000
-    if len(ctx) > MAX_CONTEXT_CHARS:
-        ctx = ctx[:MAX_CONTEXT_CHARS]
-        logger.warning(f"Context truncated to {MAX_CONTEXT_CHARS} chars")
-    url = GEMINI_URL
+    if not GEMINI_API_KEY:
+        raise GeminiNotConfigured("GEMINI_API_KEY غير مضبوط على الخادم.")
+    if len(ctx) > settings.GEMINI_MAX_CONTEXT_CHARS:
+        ctx = ctx[: settings.GEMINI_MAX_CONTEXT_CHARS]
+        logger.warning(f"Context truncated to {settings.GEMINI_MAX_CONTEXT_CHARS} chars")
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-    payload = {"contents": [{"parts": [{"text": SYSTEM_PROMPT + "\n\n" + ctx}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 15000}}
-    max_retries = 3
-    timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+    timeout = httpx.Timeout(connect=settings.GEMINI_CONNECT_TIMEOUT_S,
+                            read=settings.GEMINI_READ_TIMEOUT_S,
+                            write=10.0, pool=10.0)
+    max_attempts = max(1, settings.GEMINI_MAX_ATTEMPTS)
+    use_thinking_config = settings.GEMINI_THINKING_BUDGET >= 0
+    last_error: Optional[Exception] = None
+
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, max_attempts + 1):
+            payload = build_gemini_payload(ctx, with_thinking_config=use_thinking_config)
             try:
-                r = await client.post(url, json=payload, headers=headers)
+                r = await client.post(GEMINI_URL, json=payload, headers=headers)
                 if r.status_code == 429:
-                    wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)] + random.uniform(0, 5)
-                    logger.warning(f"Gemini rate limit, retrying in {wait:.1f}s...")
-                    await asyncio.sleep(wait); continue
+                    wait = parse_retry_after(r)
+                    if wait is None:
+                        base = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
+                        wait = base + random.uniform(0, 2)
+                    logger.warning(f"Gemini 429 – retrying in {wait:.1f}s (attempt {attempt}/{max_attempts})")
+                    await asyncio.sleep(min(wait, 30.0))
+                    continue
+                if r.status_code == 400 and use_thinking_config:
+                    # بعض نسخ النموذج لا تقبل thinkingConfig → نعيد بدونها فوراً
+                    logger.warning("Gemini rejected thinkingConfig; retrying without it.")
+                    use_thinking_config = False
+                    continue
                 r.raise_for_status()
                 data = r.json()
                 candidates = data.get("candidates", [])
                 if not candidates:
-                    raise Exception("Gemini أرجع استجابة فارغة (ربما فلتر أمان)")
-                if candidates[0].get("finishReason") == "SAFETY":
-                    raise Exception("Gemini حظر الاستجابة لأسباب أمان")
-                parts = candidates[0].get("content", {}).get("parts", [])
+                    raise RuntimeError("Gemini أرجع استجابة فارغة (ربما فلتر أمان)")
+                first = candidates[0]
+                if first.get("finishReason") == "SAFETY":
+                    raise RuntimeError("Gemini حظر الاستجابة لأسباب أمان")
+                parts = first.get("content", {}).get("parts", [])
                 if not parts or "text" not in parts[0]:
-                    raise Exception("بنية استجابة Gemini غير متوقعة")
+                    raise RuntimeError("بنية استجابة Gemini غير متوقعة")
                 return parts[0]["text"]
             except httpx.TimeoutException as e:
-                logger.warning(f"Gemini timeout (attempt {attempt}/{max_retries}): {e}")
-                if attempt == max_retries: raise
-                await asyncio.sleep(GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)])
-            except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-                logger.error(f"Gemini call failed: {e}")
-                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in [429, 500, 502, 503]: raise
-                if attempt == max_retries: raise
-                await asyncio.sleep(GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)])
+                last_error = e
+                logger.warning(f"Gemini timeout (attempt {attempt}/{max_attempts}): {e}")
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status = e.response.status_code if e.response is not None else 0
+                logger.error(f"Gemini HTTP {status}: {e}")
+                if status in (400, 401, 403, 404) and not (status == 400 and use_thinking_config):
+                    raise  # خطأ دائم: لا فائدة من إعادة المحاولة
+            except (KeyError, IndexError, ValueError) as e:
+                last_error = e
+                logger.error(f"Gemini malformed response: {e}")
             except Exception as e:
+                last_error = e
                 logger.error(f"Gemini unexpected error: {e}")
-                if attempt == max_retries: raise
-                await asyncio.sleep(GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)])
-    raise Exception("فشل الاتصال بـ Gemini")
+
+            if attempt < max_attempts:
+                wait = GEMINI_RETRY_WAITS[min(attempt - 1, len(GEMINI_RETRY_WAITS) - 1)]
+                await asyncio.sleep(wait)
+    raise RuntimeError("فشل الاتصال بـ Gemini") from last_error
+
+def generate_offline_report(req: RawDataReportRequest, agg: dict, tz_name: str) -> str:
+    """
+    تقرير احتياطي يُبنى محلياً من نتائج التحليل عند تعذّر الوصول إلى Gemini
+    (ضغط API، نفاد الحصة، أو غياب المفتاح). بنفس بنية الأقسام المتوقعة.
+    """
+    extra = agg.get("extra_info", {})
+    blocks = agg.get("blocks", [])
+    target_date = resolve_target_date(req.target_date, datetime.now(resolve_timezone(tz_name)).date())
+    lines = []
+
+    lines.append(f"🎯 0. الملخص التنفيذي ليوم {target_date.strftime('%d/%m/%Y')}")
+    lines.append(f"> نسبة النجاح: {agg.get('score', 0)}%")
+    lines.append(f">  * القرار النهائي: {agg.get('final_verdict', '')}")
+    reason = agg.get("nogo_reasons", []) or agg.get("warnings", []) or ["ظروف متوسطة"]
+    lines.append(f">  * السبب الرئيسي: {reason[0]}")
+    lines.append(f">  * الطعم المستهدف: {extra.get('seasonal_bait', '')}")
+    lines.append(f">  * اتجاه الشاطئ: {extra.get('beach_orientation', req.beach_orientation)}° "
+                 f"({deg_to_compass(extra.get('beach_orientation', req.beach_orientation))})")
+    lines.append("")
+
+    lines.append("⏱️ 1. التوقيت المدوي وحركة المياه")
+    lines.append("🌊 مواقيت العبور القمري (تقديرية)")
+    for key, value in (extra.get("tidal_windows") or {}).items():
+        label = "العبور القمري" if key.startswith("HW") else "الجزر المحاقي"
+        lines.append(f" * 🔹 {label}: الساعة {value}")
+    lines.append(f" * 🌅 الشروق: {extra.get('sunrise', 'غير متوفر')} | 🌇 الغروب: {extra.get('sunset', 'غير متوفر')}")
+    lines.append("🏖️ مؤشر الشاطئ (أيام الحياء والمات)")
+    haml_status = extra.get("haml_status", "")
+    haml_phase = extra.get("haml_phase", "")
+    haml_title = f"{haml_status} ({haml_phase})" if haml_phase else haml_status
+    lines.append(f" * 🌊 الوضعية: {haml_title}. {extra.get('haml_description', '')} "
+                 f"{extra.get('platform_advice', '')}")
+    sol = extra.get("solunar") or {}
+    lines.append(f"🎯 أوقات سولونار — الرئيسية: {sol.get('major1', '-')} و {sol.get('major2', '-')} | "
+                 f"الثانوية: {sol.get('minor1', '-')} و {sol.get('minor2', '-')}")
+    lines.append("🌡️ الضغط الجوي")
+    press_change = extra.get("pressure_change", 0) or 0
+    press_text = "0.0" if abs(press_change) < 0.05 else f"{press_change:+.1f}"
+    lines.append(f" * الوضع: {extra.get('pressure_note', 'مستقر')} (تغير يومي {press_text} hPa)")
+    lines.append(f"🌡️ حرارة الماء: {round(agg['avg_sst'], 1) if agg.get('avg_sst') is not None else 'غير متوفر'}°م | "
+                 f"حرارة الهواء العظمى: {extra.get('max_air_temp', 'غير متوفر')}°م")
+    lines.append("")
+
+    lines.append(build_flow_section(extra.get("tidal_windows") or {}))
+    lines.append("")
+
+    lines.append("🕒 3. التفكيك الديناميكي الزمني")
+    for b in blocks:
+        raw = b.get("_raw", {})
+        lines.append(f" * {b.get('name', '')} ({b.get('time_range', '')}):")
+        lines.append(f"   - حالة البحر: {b.get('sea_state', '')} | الثقة: {b.get('confidence', 0)}% "
+                     f"({b.get('confidence_label', '')})")
+        wind_eff = raw.get("wind_effect_dist", 0)
+        sign = "+" if wind_eff > 0 else ""
+        lines.append(f"   - الرياح: {b.get('wind_dir', '')} متوسط {raw.get('avg_wind', 0)} كم/س "
+                     f"(هبات {raw.get('max_gust', 0)} كم/س) | تأثير على الرمية: {sign}{wind_eff:.0f}م")
+        lines.append(f"   - الموج: أقصى {raw.get('max_wave_h', 0)}م | الفترة: {raw.get('wave_period', 0)}ث | "
+                     f"المسافة المقترحة: {raw.get('recommended_cast_distance', 0):.0f}م")
+        lines.append(f"   - عكارة الماء: {b.get('water_clarity', '')} | المونتاج: {b.get('suggested_rig', '')} | "
+                     f"راحة: {b.get('comfort_index', 0)}%")
+        active = "، ".join(b.get("active_fish", [])) or "لا شيء مؤكد"
+        lines.append(f"   - الأسماك الأكثر نشاطاً: {active}")
+        for item in b.get("nogo_reasons", []):
+            lines.append(f"   - ⛔ مانع: {item}")
+        for item in b.get("period_warnings", []):
+            lines.append(f"   - ⚠️ تحذير: {item}")
+        lines.append("")
+
+    lines.append("⚖️ 4. ميزان العوامل")
+    reds = agg.get("nogo_reasons", []) + agg.get("warnings", [])
+    lines.append("🔴 العوامل الحمراء (المعوقات):")
+    if reds:
+        for item in reds[:8]:
+            lines.append(f" * {item}")
+    else:
+        lines.append(" * لا توجد معوقات مهمة.")
+    lines.append("🟢 العوامل الخضراء (الإيجابيات):")
+    greens = []
+    if agg.get("flags", {}).get("has_golden_window"):
+        greens += [g for g in (extra.get("golden_windows") or []) if "تنبيه" not in g]
+    if extra.get("haml_score_delta", 0) > 0:
+        greens.append("البحر في حمل حيوي (تيارات غذائية قوية).")
+    if any(0.6 <= b.get("_raw", {}).get("avg_wave_h", 0) <= 1.2 for b in blocks):
+        greens.append("ارتفاع موج مناسب (0.6 - 1.2م) في بعض الفترات.")
+    if extra.get("pressure_change", 0) <= -3:
+        greens.append("الضغط ينخفض: نشاط تغذية أفضل.")
+    best = max(blocks, key=lambda b: b.get("confidence", 0)) if blocks else None
+    if best:
+        greens.append(f"أفضل فترة: {best.get('name', '')} ({best.get('time_range', '')}) بثقة {best.get('confidence', 0)}%.")
+    for item in greens[:8]:
+        lines.append(f" * {item}")
+    lines.append("")
+
+    lines.append("🏹 5. التكتيك الميداني والسلامة")
+    best_block = best or (blocks[0] if blocks else None)
+    if best_block:
+        raw = best_block.get("_raw", {})
+        lines.append(f" * أفضل نافذة: {best_block.get('name', '')} ({best_block.get('time_range', '')})")
+        lines.append(f" * الرمي: مسافة {raw.get('recommended_cast_distance', 0):.0f}م، "
+                     f"تصحيح زاوية {best_block.get('casting_angle_correction', 0)}° حسب الرياح.")
+        lines.append(f" * المونتاج: {best_block.get('suggested_rig', '')}")
+        lines.append(f" * الطعم: {extra.get('seasonal_bait', '')}")
+    if agg.get("flags", {}).get("is_mirror_sea"):
+        lines.append(" * بحر مرآوي: خفّض سماكة الخيط والقماش (قلادة رفيعة) واستعمل خيطاً شفافاً.")
+    if agg.get("flags", {}).get("is_lateral_strong"):
+        lines.append(" * تيار جانبي قوي: زد وزن الرصاصة واستعمل رصاصاً مفلطحاً (Grip Lead).")
+    if agg.get("flags", {}).get("is_weedy"):
+        lines.append(" * صوفة متوقعة: استعمل صائدات مضادة للأعشاب ونظّف الخيط كل رميات قليلة.")
+    lines.append(" * السلامة: لا ترمِ في البحر الهائج، ولا تصعد على الصخور المبللة، ولا تصيد وحيداً ليلاً.")
+    lines.append("")
+    lines.append("ملاحظة: هذا التقرير أُنشئ آلياً من الحسابات المحلية (وضع احتياطي دون نموذج لغوي).")
+    return "\n".join(lines)
+
 
 def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) -> str:
     extra = agg["extra_info"]
-    target_date = resolve_target_date(req.target_date, datetime.now(zoneinfo.ZoneInfo(tz_name)).date())
+    target_date = resolve_target_date(req.target_date, datetime.now(resolve_timezone(tz_name)).date())
     date_str = target_date.strftime("%d/%m/%Y")
     moon_age = extra.get("moon_age_days", 0)
     haml_status = extra.get("haml_status", ""); haml_phase = extra.get("haml_phase", ""); haml_desc = extra.get("haml_description", "")
@@ -1294,7 +1651,7 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
     sol = extra.get("solunar", {})
     sol_text = f"الرئيسية: {sol.get('major1')} و {sol.get('major2')} | الثانوية: {sol.get('minor1')} و {sol.get('minor2')}"
     flows = []
-    for k, v in extra['tidal_windows'].items():
+    for k, v in (extra.get('tidal_windows') or {}).items():
         h = safe_parse_time(v)
         if k.startswith("HW"): flows.append(f"بداية جزر ساحب {format_time(h+0.5)}")
         else: flows.append(f"بداية مد دافق {format_time(h+0.5)}")
@@ -1314,11 +1671,12 @@ def generate_manual_context(req: RawDataReportRequest, agg: dict, tz_name: str) 
     lines.append(f"القرار النهائي: {agg['final_verdict']} | نسبة النجاح: {agg['score']}%")
     lines.append(f"السبب الرئيسي: {main_reason}")
     lines.append(f"الطعم المستهدف: {extra.get('seasonal_bait', '')}")
-    lines.append(f"الشروق: {extra['sunrise']} | الغروب: {extra['sunset']}")
-    lines.append(f"الضغط الجوي: {extra['pressure_note']} (تغير يومي {extra['pressure_change']:+.1f} hPa)")
-    lines.append(f"حرارة الماء: {round(agg['avg_sst'],1) if agg['avg_sst'] is not None else 'غير متوفر'}°م | حرارة الهواء العظمى: {extra['max_air_temp']}°م")
-    lines.append(f"الرياح اليومية السائدة: {agg['dominant_wind']} | أقصى هبات: {extra['peak_gust_today']} كم/س")
-    lines.append(f"العبور القمري: HW1={extra['tidal_windows']['HW1']}, LW1={extra['tidal_windows']['LW1']}, HW2={extra['tidal_windows']['HW2']}, LW2={extra['tidal_windows']['LW2']}")
+    lines.append(f"الشروق: {extra.get('sunrise', 'غير متوفر')} | الغروب: {extra.get('sunset', 'غير متوفر')}")
+    lines.append(f"الضغط الجوي: {extra.get('pressure_note', 'مستقر')} (تغير يومي {extra.get('pressure_change', 0):+.1f} hPa)")
+    lines.append(f"حرارة الماء: {round(agg['avg_sst'],1) if agg['avg_sst'] is not None else 'غير متوفر'}°م | حرارة الهواء العظمى: {extra.get('max_air_temp', 'غير متوفر')}°م")
+    lines.append(f"الرياح اليومية السائدة: {agg.get('dominant_wind', 'غير معروف')} | أقصى هبات: {extra.get('peak_gust_today', 'غير متوفر')} كم/س")
+    tw = extra.get('tidal_windows') or {}
+    lines.append(f"العبور القمري: HW1={tw.get('HW1', '-')}, LW1={tw.get('LW1', '-')}, HW2={tw.get('HW2', '-')}, LW2={tw.get('LW2', '-')}")
     lines.append(f"أوقات السولونار: {sol_text}")
     lines.append(f"مؤشر الشاطئ: {moon_line}")
     lines.append("فترات الحركة (الخضراء): " + " | ".join(flows))
@@ -1366,11 +1724,16 @@ def replace_english_commas(text: str) -> str:
     text = re.sub(r'(?<=[\u0600-\u06FF\s]),(?=[\u0600-\u06FF\s])', '،', text)
     return text
 
+def _keep_indent(line: str) -> str:
+    """يحافظ على المسافة البادئة للأسطر الفرعية وينظّف نهايتها فقط."""
+    return line.rstrip() if line[:1].isspace() else line.strip()
+
+
 def enforce_line_breaks(text: str) -> str:
     lines = text.split('\n')
     new_lines = []
     for line in lines:
-        stripped = line.strip()
+        stripped = _keep_indent(line)
         if not stripped: new_lines.append(''); continue
         if re.match(r'^[*-] ', stripped) or re.match(r'^[🔹🔸🌊🟢🔴🎯⏱️🏖️⏳🏃‍♂️🕒⚖️🏹📊🌅☀️🌃🌆🌙🐟💤🔄💨📊📐🌡️🛠️⏱️🎯🦐⚠️📌💧😌⛔]', stripped):
             if new_lines and new_lines[-1] != '' and not re.match(r'^[*-] ', new_lines[-1]): new_lines.append('')
@@ -1381,7 +1744,7 @@ def add_paragraph_spacing(text: str) -> str:
     lines = text.split('\n')
     new_lines = []
     for line in lines:
-        stripped = line.strip()
+        stripped = _keep_indent(line)
         if not stripped: new_lines.append(''); continue
         if re.match(r'^(🎯|⏱️|🏃‍♂️|🕒|⚖️|🏹|📊|\d\.)', stripped):
             if new_lines and new_lines[-1] != '': new_lines.append('')
@@ -1413,11 +1776,48 @@ def fix_broken_number_lines(text: str) -> str:
     return '\n'.join(fixed)
 
 # ---------- Main Endpoint ----------
+def validate_report_payload(req: RawDataReportRequest) -> None:
+    """يتحقّق من الحمولة قبل المعالجة: رسالة 400 واضحة بدل خطأ 500 مبهم."""
+    if req.marine_data is not None:
+        if not isinstance(req.marine_data, dict):
+            raise HTTPException(400, detail="حقل marine_data يجب أن يكون كائناً JSON.")
+        hourly = req.marine_data.get("hourly") or {}
+        if not isinstance(hourly, dict) or not hourly.get("time"):
+            raise HTTPException(400, detail="بيانات البحر (marine_data) لا تحتوي على سلسلة زمنية صالحة (hourly.time).")
+    if req.weather_data is not None:
+        if not isinstance(req.weather_data, dict):
+            raise HTTPException(400, detail="حقل weather_data يجب أن يكون كائناً JSON.")
+        hourly = req.weather_data.get("hourly") or {}
+        if not isinstance(hourly, dict) or not hourly.get("time"):
+            raise HTTPException(400, detail="بيانات الطقس (weather_data) لا تحتوي على سلسلة زمنية صالحة (hourly.time).")
+        daily = req.weather_data.get("daily") or {}
+        if not isinstance(daily, dict) or not daily.get("sunrise") or not daily.get("sunset"):
+            raise HTTPException(400, detail="بيانات الطقس (weather_data) لا تحتوي على أوقات الشروق والغروب (daily).")
+
+def report_cache_key(req: RawDataReportRequest) -> Tuple:
+    """مفتاح الكاش: الموقع + الإعدادات + بصمة البيانات حتى لا نقدّم تقريراً قديماً لبيانات جديدة."""
+    lat = round(req.latitude or 0.0, 3)
+    lon = round(req.longitude or 0.0, 3)
+    return (lat, lon, req.beach_orientation, req.beach_type or "", req.target_date,
+            _hash_payload(req.marine_data), _hash_payload(req.weather_data))
+
 @app.post("/generate-report")
-@limiter.limit("1/minute")
+@limiter.limit(settings.RATE_LIMIT_REPORT)
 async def generate_report(request: Request, req: RawDataReportRequest):
+    validate_report_payload(req)
+    key = report_cache_key(req)
+    hit, cached = await report_cache.get(key)
+    if hit and isinstance(cached, dict) and cached.get("report"):
+        result = dict(cached)
+        meta = dict(result.get("meta") or {})
+        meta["cached"] = True
+        result["meta"] = meta
+        response = JSONResponse(content=result)
+        response.headers["X-Cache"] = "HIT"
+        return response
+
     try:
-        return await asyncio.wait_for(_generate_report_inner(req), timeout=150.0)
+        result = await asyncio.wait_for(_generate_report_inner(req), timeout=settings.REPORT_TIMEOUT_S)
     except asyncio.TimeoutError:
         raise HTTPException(504, detail="انتهت مهلة إنشاء التقرير. حاول مرة أخرى.")
     except HTTPException: raise
@@ -1425,15 +1825,24 @@ async def generate_report(request: Request, req: RawDataReportRequest):
         logger.error(f"generate-report error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, detail="فشل إنشاء التقرير")
 
+    if isinstance(result, dict):
+        meta = dict(result.get("meta") or {})
+        meta["cached"] = False
+        result["meta"] = meta
+        await report_cache.set(key, result)
+    response = JSONResponse(content=result)
+    response.headers["X-Cache"] = "MISS"
+    return response
+
 async def _generate_report_inner(req: RawDataReportRequest):
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=settings.UPSTREAM_TIMEOUT_S) as client:
         if req.marine_data and req.weather_data:
             marine_data, weather_data = req.marine_data, req.weather_data
         else:
             lat = req.latitude or 36.8; lon = req.longitude or 10.1
             marine_data, weather_data = await asyncio.gather(
-                fetch_marine_data_from_openmeteo(client, lat, lon),
-                fetch_weather_data_from_openmeteo(client, lat, lon),
+                fetch_marine_data_cached(client, lat, lon),
+                fetch_weather_data_cached(client, lat, lon),
                 return_exceptions=True
             )
             if isinstance(marine_data, Exception): raise HTTPException(502, "تعذر جلب بيانات البحر من المصدر")
@@ -1444,25 +1853,30 @@ async def _generate_report_inner(req: RawDataReportRequest):
     marine_hourly = marine_data.get("hourly", marine_data)
     weather_hourly = weather_data.get("hourly", {})
     daily = weather_data.get("daily", {})
-    tz_name = marine_data.get("timezone", "Africa/Tunis")
-    now_tn = datetime.now(zoneinfo.ZoneInfo("Africa/Tunis"))
+    tz_name = marine_data.get("timezone", settings.DEFAULT_TZ)
+    tz = resolve_timezone(tz_name)
+    now_tn = datetime.now(tz)
     target_dt = resolve_target_date(req.target_date, now_tn.date())
-    date_index_map = {"today": 0, "tomorrow": 1, "day_after": 2}
-    day_idx = date_index_map.get(req.target_date, 0)
 
-    sunrise_list = daily.get("sunrise", [])
-    sunset_list  = daily.get("sunset", [])
-    raw_sr = sunrise_list[day_idx] if sunrise_list and day_idx < len(sunrise_list) else "06:00"
-    raw_ss = sunset_list[day_idx] if sunset_list and day_idx < len(sunset_list) else "18:00"
-    sunrise = _TIME_RE.search(raw_sr).group() if _TIME_RE.search(raw_sr) else "06:00"
-    sunset = _TIME_RE.search(raw_ss).group() if _TIME_RE.search(raw_ss) else "18:00"
+    raw_sr = pick_daily_value(daily, "sunrise", target_dt, now_tn.date(), "06:00")
+    raw_ss = pick_daily_value(daily, "sunset", target_dt, now_tn.date(), "18:00")
+    sr_match = _TIME_RE.search(str(raw_sr)); ss_match = _TIME_RE.search(str(raw_ss))
+    sunrise = sr_match.group() if sr_match else "06:00"
+    sunset = ss_match.group() if ss_match else "18:00"
     latitude = req.latitude or 36.8; longitude = req.longitude or 10.1
     beach_type = req.beach_type or "sandy"
 
     all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
-    if not all_times: raise HTTPException(500, "لا توجد بيانات ساعية متزامنة")
+    if not all_times:
+        detail = ("تعذّر مزامنة البيانات الساعية بين البحر والطقس (لا توجد ساعات مشتركة). "
+                  "تحقّق من أنّ marine_data و weather_data يغطيان نفس الفترة.")
+        raise HTTPException(400 if (req.marine_data and req.weather_data) else 502, detail=detail)
 
     agg = aggregate_physics(all_times, aligned, req.beach_orientation, target_dt, sunrise, sunset, latitude, longitude, beach_type)
+
+    if not agg.get("blocks") or agg.get("final_verdict") == "بيانات غير كافية":
+        raise HTTPException(422, detail=("لا توجد بيانات أرصاد كافية لليوم المطلوب. "
+                                         "جرّب تاريخاً أقرب (اليوم أو الغد) أو بقعة ساحلية أخرى."))
 
     HARD_NOGO_KEYWORDS = ["هائج", "صواعق", "ضباب كثيف", "عكارة طينية", "رياح عاتية", "أمواج أرضية", "تيار جانبي عنيف", "تيار راجع عنيف"]
     if (agg["final_verdict"] == "غير مناسب" and
@@ -1470,13 +1884,43 @@ async def _generate_report_inner(req: RawDataReportRequest):
         any(any(kw in r for kw in HARD_NOGO_KEYWORDS) for r in agg["nogo_reasons"])):
         return {
             "report": f"❌ غير مناسب ({agg['score']}%) – {agg['nogo_reasons'][0]}",
-            "meta": {"score": agg['score'], "hard_nogo": True}
+            "meta": {"score": agg['score'], "hard_nogo": True, "generated_by": "rules"}
+        }
+
+    def offline_response(error: Exception) -> dict:
+        """يردّ بتقرير محلي مكتمل عند تعذّر النموذج اللغوي."""
+        logger.error(f"Falling back to offline report: {error}")
+        manual = generate_manual_context(req, agg, tz_name)
+        report_text = generate_offline_report(req, agg, tz_name)
+        for cleanup in (clean_report_text, fix_broken_number_lines, fix_broken_time_in_headers,
+                        replace_english_commas, enforce_line_breaks, add_paragraph_spacing):
+            report_text = cleanup(report_text)
+        extra_info = agg.get("extra_info", {})
+        return {
+            "report": report_text,
+            "manual_context": manual,
+            "meta": {
+                "score": agg["score"],
+                "final_verdict": agg["final_verdict"],
+                "generated_by": "offline",
+                "gemini_configured": bool(GEMINI_API_KEY),
+                "gemini_error": str(error)[:200],
+                "tidal_windows": extra_info.get("tidal_windows", {}),
+                "solunar": extra_info.get("solunar", {}),
+                "blocks": [{k: v for k, v in b.items() if k != "_raw"} for b in agg["blocks"]],
+            },
         }
 
     try:
         flow_section_text = build_flow_section(agg["extra_info"]["tidal_windows"])
         ctx = build_context(req, agg, tz_name)
-        report = await call_gemini(ctx)
+        try:
+            report = await call_gemini(ctx)
+        except GeminiNotConfigured as e:
+            logger.error(f"Gemini not configured: {e}")
+            if not settings.OFFLINE_FALLBACK:
+                raise HTTPException(503, detail="خدمة توليد التقارير غير مضبوطة على الخادم (مفتاح Gemini مفقود).")
+            return offline_response(e)
         report = clean_report_text(report)
         report = fix_broken_number_lines(report)
         report = fix_broken_time_in_headers(report)
@@ -1508,7 +1952,7 @@ async def _generate_report_inner(req: RawDataReportRequest):
 
         clean_blocks = [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
         meta = {
-            "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False,
+            "timezone": tz_name, "target_date": target_dt.isoformat(), "hard_nogo": False, "generated_by": "gemini",
             "score": agg["score"],
             "tidal_estimation": agg["extra_info"]["tidal_windows"],
             "golden_windows": agg["extra_info"]["golden_windows"],
@@ -1519,20 +1963,27 @@ async def _generate_report_inner(req: RawDataReportRequest):
             "blocks": clean_blocks
         }
         return {"report": report, "meta": meta}
+    except HTTPException:
+        raise  # أخطاء HTTP مقصودة (503 مثلًا) لا تُستبدل بسياق يدوي
+    except HTTPException:
+        raise  # أخطاء HTTP مقصودة لا تُستبدل بتقرير احتياطي
     except Exception as e:
-        logger.error(f"Gemini failed, embedding manual context: {e}")
-        manual = generate_manual_context(req, agg, tz_name)
-        return {
-            "report": "❌ تعذر توليد التقرير تلقائياً بسبب ضغط API. استخدم النص التالي مع Gemini:\n\n" + manual,
-            "manual_context": manual,
-            "meta": {
-                "score": agg["score"],
-                "final_verdict": agg["final_verdict"],
-                "tidal_windows": agg["extra_info"]["tidal_windows"],
-                "solunar": agg["extra_info"]["solunar"],
-                "blocks": [{k:v for k,v in b.items() if k != "_raw"} for b in agg["blocks"]]
-            }
-        }
+        logger.error(f"Gemini failed: {e}")
+        if not settings.OFFLINE_FALLBACK:
+            raise HTTPException(502, detail="تعذّر توليد التقرير من نموذج اللغة. حاول مجدداً.")
+        return offline_response(e)
+
+# ---------- خدمة الواجهة الثابتة (نشر موحّد: واجهة + API على نفس الأصل) ----------
+try:
+    from fastapi.staticfiles import StaticFiles
+    from pathlib import Path as _Path
+
+    FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
+    if FRONTEND_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+        logger.info(f"Serving frontend from {FRONTEND_DIR}")
+except Exception as e:  # لا يمنع تشغيل الـ API إن تعذّر تركيب الملفات الثابتة
+    logger.warning(f"Static frontend not mounted: {e}")
 
 if __name__ == "__main__":
     import uvicorn

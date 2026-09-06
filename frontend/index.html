@@ -81,10 +81,16 @@
           <p class="text-xs text-gray-500 text-center mt-2">يتم انتظار الرد حتى 3 دقائق. لا تغلق الصفحة.</p>
         </div>
       </div>
+      <div id="errorCard" class="card hidden border-amber-500/60">
+        <p class="font-bold text-amber mb-1">⚠️ تعذّر توليد التقرير</p>
+        <p id="errorContent" class="text-gray-300 text-sm whitespace-pre-line"></p>
+      </div>
       <div id="reportCard" class="card hidden">
+        <div id="reportHeader" class="mb-4 flex flex-wrap items-center gap-3"></div>
         <div id="reportContent" class="text-gray-300 whitespace-pre-line leading-loose text-base"></div>
-        <div class="flex gap-2 mt-4">
+        <div class="flex flex-wrap gap-2 mt-4">
           <button onclick="copyReport()" class="btn-secondary text-sm">📋 نسخ التقرير</button>
+          <button onclick="downloadReport()" class="btn-secondary text-sm">⬇️ تنزيل TXT</button>
           <button onclick="shareWhatsApp()" class="btn-secondary text-sm">💬 مشاركة واتساب</button>
         </div>
       </div>
@@ -109,9 +115,45 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const API_BASE = 'https://spotdata.onrender.com';
+    // عنوان الـ API: ?api=... للتجاوز، أو نفس الأصل عند الاستضافة المشتركة، وإلا الخادم الافتراضي
+    const API_BASE = (() => {
+      const override = new URLSearchParams(location.search).get('api');
+      if (override) return override.replace(/\/$/, '');
+      if (location.hostname.endsWith('.e2b.app') || location.hostname === 'localhost') return '';
+      return 'https://spotdata.onrender.com';
+    })();
     const MARINE_API = 'https://marine-api.open-meteo.com/v1/marine';
     const WEATHER_API = 'https://api.open-meteo.com/v1/forecast';
+
+    let lastReportText = '';
+
+    function showError(message) {
+      const card = document.getElementById('errorCard');
+      document.getElementById('errorContent').textContent = message;
+      card.classList.remove('hidden');
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function clearError() { document.getElementById('errorCard').classList.add('hidden'); }
+
+    function verdictColor(verdict) {
+      if (verdict === 'مناسب') return 'bg-emerald-500/20 text-emerald-300 border-emerald-400/40';
+      if (verdict === 'فرصة مع تحفظات') return 'bg-amber-500/20 text-amber-300 border-amber-400/40';
+      return 'bg-rose-500/20 text-rose-300 border-rose-400/40';
+    }
+
+    function renderReportHeader(resp, meta) {
+      const header = document.getElementById('reportHeader');
+      const verdict = meta?.final_verdict || '';
+      const score = meta?.score;
+      const parts = [];
+      parts.push(`<span class="px-3 py-1 rounded-full border text-sm font-bold ${verdictColor(verdict)}">${verdict || 'تقرير'}</span>`);
+      if (score !== undefined && score !== null) {
+        parts.push(`<span class="px-3 py-1 rounded-full border border-neon/40 text-neon text-sm font-bold">نسبة النجاح: ${score}%</span>`);
+      }
+      if (meta?.cached) parts.push('<span class="px-3 py-1 rounded-full border border-sky-400/40 text-sky-300 text-sm">⚡ من الذاكرة المؤقتة</span>');
+      if (meta?.target_date) parts.push(`<span class="text-xs text-gray-400">اليوم المحلَّل: ${meta.target_date.slice(0, 10)}</span>`);
+      header.innerHTML = parts.join(' ');
+    }
 
     let isSubmitting = false;
     let timerInterval = null;
@@ -246,8 +288,9 @@
       autoOrientBtn.textContent = '📍 تحديد الاتجاه تلقائياً';
     });
 
-    // تحميل أولي
+    // تحميل أولي: استعادة آخر إعدادات ثم تحديد الاتجاه تلقائياً
     window.addEventListener('load', () => {
+      restoreInputs();
       const lat = parseFloat(latInput.value) || 36.7;
       const lng = parseFloat(lngInput.value) || 10.8;
       autoOrientAndDetect(lat, lng);
@@ -347,8 +390,10 @@
       isSubmitting = true;
       loadingOverlay.classList.remove('hidden');
       reportCard.classList.add('hidden');
+      clearError();
       submitBtn.disabled = true;
       startTimer();
+      saveInputs({ lat, lng, orient: orientSlider.value, beachType, targetDate });
 
       try {
         const { start, end } = getDateRange(targetDate);
@@ -378,20 +423,29 @@
         });
         clearTimeout(timeoutId);
 
-        const data = await resp.json();
+        const data = await resp.json().catch(() => ({}));
 
+        if (!resp.ok) {
+          showError(explainHttpError(resp.status, data));
+          return;
+        }
         if (data.report) {
+          lastReportText = data.report;
           reportContent.textContent = data.report;
+          renderReportHeader(data, data.meta || {});
           reportCard.classList.remove('hidden');
           reportCard.scrollIntoView({ behavior: 'smooth' });
+          if (data.meta && data.meta.hard_nogo) {
+            showError('البحر غير مناسب في كل الفترات لهذا اليوم. جرّب يوماً آخر أو بقعة محمية.');
+          }
         } else {
-          alert('❌ لم يتم استلام تقرير.');
+          showError('❌ لم يتم استلام تقرير من الخادم.');
         }
       } catch (e) {
         if (e.name === 'AbortError') {
-          alert('❌ انتهت مهلة الانتظار (3 دقائق). حاول مجدداً.');
+          showError('❌ انتهت مهلة الانتظار (3 دقائق). الخادم مشغول أو الشبكة بطيئة — حاول مجدداً.');
         } else {
-          alert('❌ فشل جلب التقرير:\n' + e.message);
+          showError('❌ فشل جلب التقرير:\n' + e.message);
         }
       } finally {
         stopTimer();
@@ -402,6 +456,56 @@
         }, 1000);
       }
     });
+
+    // ترجمة رموز الخطأ إلى رسائل عربية مفهومة للمستخدم
+    function explainHttpError(status, data) {
+      const detail = (data && (data.detail || data.message)) ? String(data.detail || data.message) : '';
+      const rid = data && data.request_id ? `\n🧾 رقم الطلب: ${data.request_id}` : '';
+      const base = {
+        400: 'البيانات المرسلة غير مكتملة (بيانات البحر أو الطقس ناقصة). حدّث الصفحة وحاول مجدداً.',
+        422: 'لا توجد بيانات أرصاد كافية لليوم المطلوب. جرّب اليوم أو الغد، أو بقعة ساحلية أخرى.',
+        429: 'لقد تجاوزت عدد الطلبات المسموح في الدقيقة. انتظر قليلاً ثم أعد المحاولة.',
+        502: 'تعذّر جلب بيانات الأرصاد من المصدر (Open-Meteo). حاول بعد دقائق.',
+        503: 'خدمة توليد التقارير غير مضبوطة على الخادم حالياً (مفتاح Gemini). راجع الإعدادات.',
+        504: 'استغرق التقرير وقتاً أطول من المسموح. أعد المحاولة.'
+      }[status];
+      return (base || `خطأ غير متوقع من الخادم (${status}).`) + (detail && !base ? `\n${detail}` : '') + rid;
+    }
+
+    // حفظ واستعادة آخر إعدادات المستخدم
+    const INPUT_KEY = 'spotdata.inputs.v1';
+    function saveInputs(values) {
+      try { localStorage.setItem(INPUT_KEY, JSON.stringify(values)); } catch (e) {}
+    }
+    function restoreInputs() {
+      try {
+        const raw = localStorage.getItem(INPUT_KEY);
+        if (!raw) return false;
+        const v = JSON.parse(raw);
+        if (v.lat) latInput.value = v.lat;
+        if (v.lng) lngInput.value = v.lng;
+        if (v.orient !== undefined) { orientSlider.value = v.orient; orientSlider.dispatchEvent(new Event('input')); }
+        if (v.beachType) beachSelect.value = v.beachType;
+        if (v.targetDate) {
+          document.getElementById('targetDate').value = v.targetDate;
+          document.querySelectorAll('.segmented-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.date === v.targetDate);
+          });
+        }
+        return true;
+      } catch (e) { return false; }
+    }
+
+    function downloadReport() {
+      if (!lastReportText) return;
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      const blob = new Blob([lastReportText], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `spotdata-report-${stamp}.txt`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
 
     function fallbackCopy(text) {
       const ta = document.createElement('textarea');

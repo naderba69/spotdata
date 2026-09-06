@@ -1,1 +1,80 @@
-# spotdata
+# 🎣 spotdata – Surfcasting Analytics
+
+تحليل فيزيائي لحالة البحر والصيد الساحلي (سيرفكاستينغ) في تونس: يجمع بيانات
+Open‑Meteo (بحر + طقس)، يحسب التيارات الجانبية، انحدار الموج، الضغط، السولونار
+والعبور القمري، ثم يولّد تقريراً بالدارجة التونسية عبر Gemini.
+
+```
+frontend/index.html   واجهة RTL (خريطة Leaflet + إعدادات البقعة)
+backend/main.py       تطبيق FastAPI (كل نقاط النهاية وخط التحليل)
+backend/config.py     إعدادات مركزية من متغيّرات البيئة
+backend/cache.py      كاش TTL ذاكري + single-flight
+backend/tests/        اختبارات pytest (بدون شبكة)
+```
+
+## التشغيل محلياً
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements.txt
+cp .env.example .env          # ثم ضع GEMINI_API_KEY الحقيقي
+export $(grep -v '^#' .env | xargs)   # أو استخدم أداتك المفضلة
+cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 10000
+```
+
+ثم افتح: <http://localhost:10000> (الواجهة تُخدَّم من نفس الأصل).
+الوثائق التفاعلية: `/docs` · فحص الصحة: `/health`.
+
+## نقاط النهاية
+
+| الطريقة | المسار | الوصف |
+|---|---|---|
+| GET | `/health` | حالة الخدمة والاعتماديات + إحصاءات الكاش (مخبّأ 30 ثانية) |
+| POST | `/generate-report` | توليد التقرير (يُخبّأ 10 دقائق) |
+| POST | `/auto-orientation` | اتجاه الشاطئ من Overpass (يُخبّأ 24 ساعة) |
+| POST | `/detect-bottom-type` | نوع القاع (رملي/صخري) |
+
+ترويسات مفيدة في الردود: `X-Request-ID`، `X-Response-Time`، `X-Cache` (HIT/MISS).
+
+## الاختبارات
+
+```bash
+pip install -r backend/requirements-dev.txt
+pytest -q           # 97 اختباراً، بدون أي اتصال شبكي
+```
+
+> ملخّص المشروع وقراراته محفوظة في [`docs/CONTEXT.md`](docs/CONTEXT.md) — اقرأه
+> قبل أي تعديل كبير.
+
+## الإعدادات (متغيّرات البيئة)
+
+راجع `.env.example` للقائمة الكاملة. أهمها:
+
+| المتغيّر | الافتراضي | الأثر |
+|---|---|---|
+| `GEMINI_API_KEY` | – | بدون مفتاح يعمل الـ API لكن `/generate-report` يردّ 503 واضح |
+| `GEMINI_THINKING_BUDGET` | `0` | إيقاف التفكير العميق = ردّ أسرع وأرخص |
+| `CACHE_ENABLED` / `CACHE_TTL_REPORT_S` | `1` / `600` | تخزين التقارير لتقليل الزمن والتكلفة |
+| `RATE_LIMIT_ENABLED` | `1` | عطّله في الاختبارات |
+| `ALLOWED_ORIGINS` | `*` | قيّدها في الإنتاج |
+
+## تحسينات الأداء والجودة (v22)
+
+- **كاش ذاكري** للتقارير وبيانات Open‑Meteo ونتائج Overpass، مع **single‑flight**
+  (الطلبات المتزامنة المتطابقة تنتظر نداءً واحداً) و**تذكّر الفشل** المؤقت.
+- **تقليل زمن Gemini**: تعطيل التفكير العميق، مهلة قراءة قابلة للضبط،
+  إعادة محاولة أقصر وأذكى (لا إعادة محاولة على أخطاء 4xx الدائمة).
+- **شفافية**: `X-Request-ID` و`X-Response-Time` و`X-Cache`، وإحصاءات كاش في `/health`.
+- **رسائل خطأ واضحة**: 400 لحمولة ناقصة، 422 لعدم كفاية بيانات اليوم، 502 لفشل
+  المصدر، 503 عند غياب مفتاح Gemini، 504 عند تجاوز المهلة.
+- **دقة**: اختيار الشروق/الغروب بالتاريخ لا بالفهرس (نطاق الفرونتند يبدأ قبل
+  اليوم بيومين)، معالجة القيم المفقودة (`None`) في الحرارة والرياح، استقرار
+  المنطقة الزمنية، و`past_days=2 / forecast_days=4` عند جلب البيانات داخلياً.
+- **اختبارات**: 95 اختباراً تغطّي الحسابات، خط التحليل، الكاش، تنظيف النص، والـ API.
+
+## النشر على Render
+
+- Build Command: `pip install -r backend/requirements.txt`
+- Start Command: `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Environment: انسخ المتغيّرات من `.env.example` (وخاصة `GEMINI_API_KEY`
+  و`ALLOWED_ORIGINS`).
