@@ -114,11 +114,16 @@ class Settings:
     REPORT_TIMEOUT_S = env_float("REPORT_TIMEOUT_S", 140.0)
     UPSTREAM_TIMEOUT_S = env_float("UPSTREAM_TIMEOUT_S", 20.0)
     OVERPASS_TIMEOUT_S = env_float("OVERPASS_TIMEOUT_S", 25.0)
+    # مسح الشواطئ: أقصى عدد بقاع، وأقصى نداءات متزامنة لمصدر الأرصاد
+    SCAN_MAX_SPOTS = env_int("SCAN_MAX_SPOTS", 12)
+    SCAN_CONCURRENCY = env_int("SCAN_CONCURRENCY", 6)
+    SCAN_TIMEOUT_S = env_float("SCAN_TIMEOUT_S", 120.0)
 
     # ---------- الكاش ----------
     CACHE_ENABLED = env_bool("CACHE_ENABLED", True)
     CACHE_TTL_REPORT_S = env_float("CACHE_TTL_REPORT_S", 600.0)
     CACHE_TTL_UPSTREAM_S = env_float("CACHE_TTL_UPSTREAM_S", 900.0)
+    CACHE_TTL_SCAN_S = env_float("CACHE_TTL_SCAN_S", 600.0)
     CACHE_TTL_OVERPASS_S = env_float("CACHE_TTL_OVERPASS_S", 86400.0)
     CACHE_TTL_FAILURE_S = env_float("CACHE_TTL_FAILURE_S", 60.0)
     CACHE_MAX_ENTRIES = env_int("CACHE_MAX_ENTRIES", 512)
@@ -129,6 +134,7 @@ class Settings:
     RATE_LIMIT_REPORT = env_str("RATE_LIMIT_REPORT", "6/minute")
     RATE_LIMIT_ORIENTATION = env_str("RATE_LIMIT_ORIENTATION", "5/minute")
     RATE_LIMIT_BOTTOM = env_str("RATE_LIMIT_BOTTOM", "10/minute")
+    RATE_LIMIT_SCAN = env_str("RATE_LIMIT_SCAN", "6/minute")
 
     # ---------- متفرقات ----------
     ALLOWED_ORIGINS = env_str("ALLOWED_ORIGINS", "*")

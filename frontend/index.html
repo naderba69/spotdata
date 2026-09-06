@@ -96,10 +96,75 @@
       </div>
     </div>
 
-    <!-- تبويب مسح الشواطئ (وهمي) -->
+    <!-- تبويب مسح الشواطئ -->
     <div id="panelScan" class="hidden">
-      <div class="card">
-        <p class="text-gray-400 text-center">🔍 ميزة مسح الشواطئ قيد التطوير...</p>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+        <div class="lg:col-span-2"><div id="scanMap"></div></div>
+        <div class="card space-y-4">
+          <h2 class="text-xl font-bold text-neon mb-2">🔍 إعدادات المسح</h2>
+          <div class="grid grid-cols-2 gap-3">
+            <div><label class="block text-sm text-gray-400 mb-1">خط العرض</label>
+              <input type="number" id="scanLat" step="any" class="input-field" value="36.8500"></div>
+            <div><label class="block text-sm text-gray-400 mb-1">خط الطول</label>
+              <input type="number" id="scanLng" step="any" class="input-field" value="10.3300"></div>
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-1">نطاق البحث: <span id="scanRadiusVal" class="text-neon">60 كم</span></label>
+            <input type="range" id="scanRadius" min="10" max="200" step="5" value="60" class="w-full accent-neon">
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-1">عدد البقاع (الأقرب أولاً)</label>
+            <select id="scanMax" class="input-field">
+              <option value="5">5 بقاع</option>
+              <option value="8" selected>8 بقاع</option>
+              <option value="12">12 بقعة</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-1">نوع القاع</label>
+            <select id="scanType" class="input-field">
+              <option value="">الكل</option>
+              <option value="sandy">رملي</option>
+              <option value="rocky">صخري</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm text-gray-400 mb-2">التاريخ</label>
+            <div class="flex rounded-md overflow-hidden border border-[#2a3a5a]">
+              <button class="segmented-btn" data-scandate="today">اليوم</button>
+              <button class="segmented-btn active" data-scandate="tomorrow">غداً</button>
+              <button class="segmented-btn" data-scandate="day_after">بعد غد</button>
+            </div>
+            <input type="hidden" id="scanDate" value="tomorrow">
+          </div>
+          <button id="scanBtn" class="btn-primary w-full">🔍 ابدأ المسح</button>
+          <p class="text-xs text-gray-500 text-center">يتم ترتيب الشواطئ بالحسابات الفيزيائية (بدون ذكاء اصطناعي) — سريع ومخبّأ 10 دقائق.</p>
+        </div>
+      </div>
+
+      <div id="scanStatus" class="card hidden mb-6 text-center text-neon font-semibold"></div>
+
+      <div id="scanResults" class="hidden">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <h2 class="text-xl font-bold text-neon">📊 نتائج المسح <span id="scanCount" class="text-sm text-gray-400"></span></h2>
+          <button id="scanSummaryBtn" class="btn-secondary text-sm">🧠 ملخّص مقارن</button>
+        </div>
+        <div id="scanSummaryCard" class="card hidden mb-6">
+          <div id="scanSummaryText" class="text-gray-300 whitespace-pre-line leading-loose"></div>
+        </div>
+        <div id="scanList" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"></div>
+      </div>
+
+      <div id="scanReportCard" class="card hidden mt-6">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="text-lg font-bold text-neon" id="scanReportTitle">تقرير البقعة</h3>
+          <button onclick="document.getElementById('scanReportCard').classList.add('hidden')" class="text-gray-400 hover:text-white">✕</button>
+        </div>
+        <div id="scanReportContent" class="text-gray-300 whitespace-pre-line leading-loose text-base"></div>
+        <div class="flex flex-wrap gap-2 mt-4">
+          <button onclick="copyScanReport()" class="btn-secondary text-sm">📋 نسخ التقرير</button>
+          <button onclick="downloadScanReport()" class="btn-secondary text-sm">⬇️ تنزيل TXT</button>
+        </div>
       </div>
     </div>
 
@@ -171,6 +236,7 @@
     tabScan.addEventListener('click', ()=>{
       tabScan.className='btn-primary rounded-lg'; tabSingle.className='btn-secondary rounded-lg';
       panelScan.classList.remove('hidden'); panelSingle.classList.add('hidden');
+      setTimeout(initScanMap, 50);
     });
 
     // الخريطة
@@ -505,6 +571,236 @@
       a.href = url; a.download = `spotdata-report-${stamp}.txt`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       URL.revokeObjectURL(url);
+    }
+
+    // ═══════════════ مسح الشواطئ ═══════════════
+    let scanMap = null, scanMarker = null, scanLayer = null, scanData = null, scanBusy = false, scanReportText = '';
+
+    const scanBtn = document.getElementById('scanBtn');
+    const scanStatus = document.getElementById('scanStatus');
+    const scanResults = document.getElementById('scanResults');
+    const scanList = document.getElementById('scanList');
+    const scanSummaryCard = document.getElementById('scanSummaryCard');
+    const scanSummaryText = document.getElementById('scanSummaryText');
+    const scanReportCard = document.getElementById('scanReportCard');
+    const scanReportContent = document.getElementById('scanReportContent');
+
+    function esc(value) {
+      return String(value === undefined || value === null ? '' : value)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function scoreColor(score) { return score >= 70 ? '#10b981' : (score >= 45 ? '#f59e0b' : '#f43f5e'); }
+    function scoreCardClass(score) {
+      return score >= 70 ? 'border-emerald-400/50 bg-emerald-500/10'
+        : (score >= 45 ? 'border-amber-400/50 bg-amber-500/10' : 'border-rose-400/50 bg-rose-500/10');
+    }
+
+    function initScanMap() {
+      if (scanMap) { scanMap.invalidateSize(); return; }
+      const lat = parseFloat(document.getElementById('scanLat').value) || 36.85;
+      const lng = parseFloat(document.getElementById('scanLng').value) || 10.33;
+      scanMap = L.map('scanMap').setView([lat, lng], 9);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+        { attribution: '© OpenStreetMap', maxZoom: 18 }).addTo(scanMap);
+      scanMarker = L.marker([lat, lng], { draggable: true }).addTo(scanMap);
+      scanLayer = L.layerGroup().addTo(scanMap);
+      scanMarker.on('dragend', () => {
+        const p = scanMarker.getLatLng();
+        setScanCenter(p.lat, p.lng);
+      });
+      scanMap.on('click', (e) => setScanCenter(e.latlng.lat, e.latlng.lng));
+    }
+
+    function setScanCenter(lat, lng) {
+      document.getElementById('scanLat').value = lat.toFixed(6);
+      document.getElementById('scanLng').value = lng.toFixed(6);
+      if (scanMarker) scanMarker.setLatLng([lat, lng]);
+    }
+
+    // أزرار التاريخ + النطاق + الإحداثيات
+    document.querySelectorAll('[data-scandate]').forEach(b => {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('[data-scandate]').forEach(x => x.classList.remove('active'));
+        this.classList.add('active');
+        document.getElementById('scanDate').value = this.dataset.scandate;
+      });
+    });
+    const scanRadius = document.getElementById('scanRadius');
+    const scanRadiusVal = document.getElementById('scanRadiusVal');
+    scanRadius.addEventListener('input', () => { scanRadiusVal.textContent = scanRadius.value + ' كم'; });
+    ['scanLat', 'scanLng'].forEach(id => {
+      document.getElementById(id).addEventListener('change', () => {
+        const lat = parseFloat(document.getElementById('scanLat').value);
+        const lng = parseFloat(document.getElementById('scanLng').value);
+        if (!isNaN(lat) && !isNaN(lng)) setScanCenter(lat, lng);
+      });
+    });
+
+    async function runScan() {
+      if (scanBusy) return;
+      const lat = parseFloat(document.getElementById('scanLat').value);
+      const lng = parseFloat(document.getElementById('scanLng').value);
+      if (isNaN(lat) || isNaN(lng)) { alert('الإحداثيات غير صحيحة'); return; }
+
+      const payload = {
+        latitude: lat, longitude: lng,
+        radius_km: parseInt(scanRadius.value, 10),
+        target_date: document.getElementById('scanDate').value,
+        max_spots: parseInt(document.getElementById('scanMax').value, 10)
+      };
+      const type = document.getElementById('scanType').value;
+      if (type) payload.beach_type = type;
+
+      scanBusy = true; scanBtn.disabled = true; scanBtn.textContent = '⏳ جاري المسح...';
+      scanStatus.textContent = `جاري مسح الشواطئ داخل ${payload.radius_km} كم...`;
+      scanStatus.classList.remove('hidden');
+      scanResults.classList.add('hidden');
+      scanSummaryCard.classList.add('hidden');
+      scanReportCard.classList.add('hidden');
+
+      try {
+        const resp = await fetch(`${API_BASE}/scan-spots`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { alert(explainHttpError(resp.status, data)); return; }
+        scanData = data;
+        renderScan(data);
+      } catch (e) {
+        alert('❌ فشل المسح:\n' + e.message);
+      } finally {
+        scanBusy = false; scanBtn.disabled = false; scanBtn.textContent = '🔍 ابدأ المسح';
+        scanStatus.classList.add('hidden');
+      }
+    }
+    scanBtn.addEventListener('click', runScan);
+
+    function renderScan(data) {
+      scanResults.classList.remove('hidden');
+      scanList.innerHTML = '';
+      if (scanLayer) scanLayer.clearLayers();
+      document.getElementById('scanCount').textContent =
+        `(${data.count} بقعة${data.cached ? ' · ⚡ من الذاكرة المؤقتة' : ''}${data.failed ? ` · تعذّر ${data.failed}` : ''})`;
+
+      if (!data.count) {
+        const emptyMsg = data.message
+          || (data.failed ? `تعذّر جلب بيانات الأرصاد لـ ${data.failed} بقعة. أعد المحاولة بعد قليل أو قلّل عدد البقاع.` : 'لا توجد نتائج.');
+        scanList.innerHTML = `<div class="card md:col-span-2 xl:col-span-3 text-center text-gray-400">${esc(emptyMsg)}</div>`;
+        document.getElementById('scanSummaryBtn').classList.add('hidden');
+        return;
+      }
+      document.getElementById('scanSummaryBtn').classList.remove('hidden');
+
+      const bounds = [];
+      data.spots.forEach((s, idx) => {
+        const best = s.best_period || {};
+        const typeAr = s.beach_type === 'rocky' ? 'صخري' : 'رملي';
+        const warnings = (s.warnings || []).slice(0, 2)
+          .map(w => `<li class="text-xs text-amber-300">⚠️ ${esc(w)}</li>`).join('');
+        const nogos = (s.nogo_reasons || []).slice(0, 2)
+          .map(w => `<li class="text-xs text-rose-300">⛔ ${esc(w)}</li>`).join('');
+        const card = document.createElement('div');
+        card.className = `card ${scoreCardClass(s.score)} hover:shadow-lg`;
+        card.innerHTML = `
+          <div class="flex justify-between items-start gap-2">
+            <div>
+              <p class="font-bold text-lg">${idx + 1}. ${esc(s.name)}</p>
+              <p class="text-xs text-gray-400">📏 ${esc(s.distance_km)} كم · 🧭 ${esc(s.orientation)}° · ${typeAr}</p>
+            </div>
+            <span class="px-2 py-1 rounded-full text-sm font-bold" style="color:${scoreColor(s.score)}">${esc(s.score)}%</span>
+          </div>
+          <p class="text-sm mt-2">الحسم: <b>${esc(s.final_verdict)}</b></p>
+          <p class="text-sm">أفضل فترة: <b>${esc(best.name || '')}</b> (${esc(best.time_range || '')}) · ثقة ${esc(best.confidence || 0)}%</p>
+          <p class="text-sm text-gray-300">${esc(best.sea_state || '')} · رياح ${esc(best.wind_dir || '')} · مسافة ${esc(best.recommended_cast_distance || 0)}م</p>
+          <ul class="mt-2 space-y-1">${warnings}${nogos}</ul>
+          <button class="btn-secondary text-sm mt-3 w-full" onclick="loadSpotReport(${idx})">📄 تقرير مفصّل</button>
+        `;
+        scanList.appendChild(card);
+
+        if (scanLayer && scanMap) {
+          bounds.push([s.latitude, s.longitude]);
+          const marker = L.circleMarker([s.latitude, s.longitude], {
+            radius: 8, color: scoreColor(s.score), weight: 2, fillColor: scoreColor(s.score), fillOpacity: 0.5
+          }).addTo(scanLayer);
+          marker.bindPopup(`<b>${esc(s.name)}</b><br>${esc(s.score)}% · ${esc(s.final_verdict)}<br>أفضل فترة: ${esc(best.name || '')}`);
+          marker.on('click', () => card.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+        }
+      });
+
+      if (bounds.length && scanMap) {
+        bounds.push([data.center.latitude, data.center.longitude]);
+        scanMap.fitBounds(bounds, { padding: [30, 30] });
+      }
+    }
+
+    async function loadSpotReport(index) {
+      if (!scanData || !scanData.spots || !scanData.spots[index]) return;
+      const s = scanData.spots[index];
+      const targetDate = document.getElementById('scanDate').value;
+      document.getElementById('scanReportTitle').textContent = `📄 تقرير ${s.name}`;
+      scanReportContent.textContent = '⏳ جاري تحليل البقعة...';
+      scanReportCard.classList.remove('hidden');
+      scanReportCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      try {
+        const { start, end } = getDateRange(targetDate);
+        const [marineData, weatherData] = await Promise.all([
+          fetchMarineData(s.latitude, s.longitude, start, end),
+          fetchWeatherData(s.latitude, s.longitude, start, end)
+        ]);
+        const resp = await fetch(`${API_BASE}/generate-report`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            beach_orientation: s.orientation, beach_type: s.beach_type, target_date: targetDate,
+            latitude: s.latitude, longitude: s.longitude,
+            marine_data: marineData, weather_data: weatherData
+          })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { scanReportContent.textContent = explainHttpError(resp.status, data); return; }
+        scanReportText = data.report || '';
+        scanReportContent.textContent = scanReportText;
+      } catch (e) {
+        scanReportContent.textContent = '❌ تعذّر توليد التقرير:\n' + e.message;
+      }
+    }
+
+    document.getElementById('scanSummaryBtn').addEventListener('click', async () => {
+      if (!scanData || !scanData.spots || !scanData.spots.length) return;
+      const btn = document.getElementById('scanSummaryBtn');
+      btn.disabled = true; btn.textContent = '⏳ جاري إعداد الملخّص...';
+      scanSummaryCard.classList.remove('hidden');
+      scanSummaryText.textContent = 'جاري المقارنة بين البقاع...';
+      try {
+        const resp = await fetch(`${API_BASE}/scan-summary`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ spots: scanData.spots, target_date: document.getElementById('scanDate').value })
+        });
+        const data = await resp.json().catch(() => ({}));
+        scanSummaryText.textContent = resp.ok ? (data.summary || 'لم يرد ملخّص.')
+          : explainHttpError(resp.status, data);
+      } catch (e) {
+        scanSummaryText.textContent = '❌ تعذّر إنتاج الملخّص:\n' + e.message;
+      } finally {
+        btn.disabled = false; btn.textContent = '🧠 ملخّص مقارن';
+      }
+    });
+
+    function copyScanReport() {
+      if (!scanReportText) return;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(scanReportText).then(() => alert('تم نسخ التقرير!')).catch(() => fallbackCopy(scanReportText));
+      } else { fallbackCopy(scanReportText); }
+    }
+
+    function downloadScanReport() {
+      if (!scanReportText) return;
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      const blob = new Blob([scanReportText], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `spotdata-scan-${stamp}.txt`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
     }
 
     function fallbackCopy(text) {

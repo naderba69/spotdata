@@ -87,6 +87,8 @@ overpass_cache = TTLCache("overpass", ttl=settings.CACHE_TTL_OVERPASS_S,
                           max_entries=settings.CACHE_MAX_ENTRIES, enabled=CACHE_ENABLED)
 failure_cache = TTLCache("failures", ttl=settings.CACHE_TTL_FAILURE_S,
                          max_entries=settings.CACHE_MAX_ENTRIES, enabled=CACHE_ENABLED)
+scan_cache = TTLCache("scan", ttl=settings.CACHE_TTL_SCAN_S,
+                      max_entries=max(8, settings.CACHE_MAX_ENTRIES // 8), enabled=CACHE_ENABLED)
 health_cache = TTLCache("health", ttl=30.0, max_entries=4, enabled=CACHE_ENABLED)
 
 START_MONOTONIC = time.monotonic()
@@ -125,6 +127,22 @@ class RawDataReportRequest(BaseModel):
 class DetectBottomRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
+
+class ScanSpotsRequest(BaseModel):
+    """مسح الشواطئ المعروفة حول نقطة مركزية وترتيبها حسب الحسابات الفيزيائية."""
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    radius_km: float = Field(40.0, ge=5, le=300)
+    target_date: str = Field(..., pattern="^(today|tomorrow|day_after)$")
+    max_spots: int = Field(8, ge=1, le=25)
+    beach_type: Optional[str] = Field(None, pattern="^(sandy|rocky)$")
+
+class ScanSummaryRequest(BaseModel):
+    """ملخّص مقارن (نداء Gemini واحد) لقائمة بقاع ناتجة عن المسح."""
+    spots: List[Dict[str, Any]] = Field(default_factory=list)
+    target_date: str = Field("tomorrow", pattern="^(today|tomorrow|day_after)$")
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -198,7 +216,7 @@ async def health():
             "overpass_reachable": overpass_ok,
             "rate_limit_enabled": settings.RATE_LIMIT_ENABLED,
             "uptime_seconds": round(time.monotonic() - START_MONOTONIC, 1),
-            "caches": {c.name: c.stats() for c in (report_cache, upstream_cache, overpass_cache, failure_cache)},
+            "caches": {c.name: c.stats() for c in (report_cache, upstream_cache, overpass_cache, failure_cache, scan_cache)},
             "timestamp": datetime.now(resolve_timezone(settings.DEFAULT_TZ)).isoformat(),
         }
 
@@ -1972,6 +1990,302 @@ async def _generate_report_inner(req: RawDataReportRequest):
         if not settings.OFFLINE_FALLBACK:
             raise HTTPException(502, detail="تعذّر توليد التقرير من نموذج اللغة. حاول مجدداً.")
         return offline_response(e)
+
+# ---------- مسح الشواطئ (Scan) ----------
+def candidate_beaches(lat: float, lon: float, radius_km: float,
+                      beach_type: Optional[str] = None) -> List[dict]:
+    """يرجع الشواطئ التونسية المعروفة داخل النطاق، مرتّبة حسب القرب."""
+    radius_m = radius_km * 1000.0
+    found = []
+    for b in TUNISIAN_BEACHES:
+        if beach_type and b.get("type") != beach_type:
+            continue
+        dist = calc_distance(b["lat"], b["lon"], lat, lon)
+        if dist <= radius_m:
+            item = dict(b)
+            item["distance_km"] = round(dist / 1000.0, 1)
+            found.append(item)
+    found.sort(key=lambda x: x["distance_km"])
+    return found
+
+
+def summarize_spot_block(b: dict) -> dict:
+    """يلخّص فترة زمنية من كتلة التحليل (بدون الحقول الداخلية)."""
+    return {
+        "name": b.get("name"), "time_range": b.get("time_range"),
+        "confidence": b.get("confidence"), "confidence_label": b.get("confidence_label"),
+        "sea_state": b.get("sea_state"), "wind_dir": b.get("wind_dir"),
+        "recommended_cast_distance": b.get("recommended_cast_distance"),
+        "water_clarity": b.get("water_clarity"), "suggested_rig": b.get("suggested_rig"),
+        "active_fish": b.get("active_fish", []),
+        "has_lethal_nogo": b.get("has_lethal_nogo", False),
+        "nogo_reasons": b.get("nogo_reasons", [])[:2],
+        "period_warnings": b.get("period_warnings", [])[:2],
+    }
+
+
+async def score_spot(client: httpx.AsyncClient, beach: dict, target_date_obj: date,
+                     today: date, tz_name: str, semaphore: asyncio.Semaphore) -> dict:
+    """
+    يحسب درجة بقعة واحدة: جلب (من الكاش) → مزامنة → aggregate_physics.
+    لا نداء Gemini هنا: المسح يعتمد على الحسابات فقط (سريع ورخيص).
+    """
+    lat, lon = beach["lat"], beach["lon"]
+    orient = beach.get("orientation", 90)
+    beach_type = beach.get("type", "sandy")
+    base = {"name": beach["name"], "latitude": lat, "longitude": lon,
+            "orientation": orient, "beach_type": beach_type,
+            "distance_km": beach.get("distance_km", 0.0)}
+
+    async with semaphore:
+        marine, weather = await asyncio.gather(
+            fetch_marine_data_cached(client, lat, lon),
+            fetch_weather_data_cached(client, lat, lon),
+            return_exceptions=True,
+        )
+    if isinstance(marine, Exception) or isinstance(weather, Exception) or not marine or not weather:
+        base["error"] = "تعذّر جلب بيانات الأرصاد لهذه البقعة."
+        return base
+
+    marine_hourly = marine.get("hourly", marine)
+    weather_hourly = weather.get("hourly", {})
+    daily = weather.get("daily", {})
+    all_times, aligned = align_hourly_data(marine_hourly, weather_hourly, tz_name)
+    if not all_times:
+        base["error"] = "لا توجد ساعات مشتركة بين بيانات البحر والطقس."
+        return base
+
+    sr_match = _TIME_RE.search(str(pick_daily_value(daily, "sunrise", target_date_obj, today, "06:00")))
+    ss_match = _TIME_RE.search(str(pick_daily_value(daily, "sunset", target_date_obj, today, "18:00")))
+    sunrise = sr_match.group() if sr_match else "06:00"
+    sunset = ss_match.group() if ss_match else "18:00"
+
+    try:
+        agg = aggregate_physics(all_times, aligned, orient, target_date_obj, sunrise, sunset,
+                                lat, lon, beach_type)
+    except Exception as e:
+        logger.error(f"aggregate_physics failed for {beach['name']}: {e}")
+        base["error"] = "تعذّر تحليل بيانات هذه البقعة."
+        return base
+
+    blocks = agg.get("blocks") or []
+    if not blocks:
+        base["error"] = "لا توجد بيانات كافية لليوم المطلوب في هذه البقعة."
+        return base
+
+    best = max(blocks, key=lambda b: (b.get("confidence", 0), not b.get("has_lethal_nogo", False)))
+    extra = agg.get("extra_info", {})
+    base.update({
+        "score": agg["score"],
+        "final_verdict": agg["final_verdict"],
+        "avg_sst": round(agg["avg_sst"], 1) if agg.get("avg_sst") is not None else None,
+        "sunrise": sunrise, "sunset": sunset,
+        "dominant_wind": agg.get("dominant_wind", ""),
+        "solunar": extra.get("solunar", {}),
+        "tidal_windows": extra.get("tidal_windows", {}),
+        "seasonal_bait": extra.get("seasonal_bait", ""),
+        "haml_status": extra.get("haml_status", ""),
+        "pressure_note": extra.get("pressure_note", ""),
+        "best_period": summarize_spot_block(best),
+        "blocks": [summarize_spot_block(b) for b in blocks],
+        "warnings": agg.get("warnings", [])[:3],
+        "nogo_reasons": agg.get("nogo_reasons", [])[:3],
+    })
+    return base
+
+
+@app.post("/scan-spots")
+@limiter.limit(settings.RATE_LIMIT_SCAN)
+async def scan_spots(request: Request, req: ScanSpotsRequest):
+    """يمسح الشواطئ القريبة ويرتّبها بالدرجة (الأعلى أولاً)."""
+    try:
+        return await asyncio.wait_for(_scan_spots_inner(req), timeout=settings.SCAN_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="انتهت مهلة المسح. قلّل نطاق البحث أو عدد البقاع.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"scan-spots error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail="فشل مسح الشواطئ")
+
+
+async def _scan_spots_inner(req: ScanSpotsRequest) -> dict:
+    key = ("scan", round(req.latitude, 2), round(req.longitude, 2), round(req.radius_km),
+           req.target_date, req.max_spots, req.beach_type or "")
+    hit, cached = await scan_cache.get(key)
+    if hit and isinstance(cached, dict):
+        result = dict(cached)
+        result["cached"] = True
+        return result
+
+    today = datetime.now(resolve_timezone(settings.DEFAULT_TZ)).date()
+    target_date_obj = resolve_target_date(req.target_date, today)
+    candidates = candidate_beaches(req.latitude, req.longitude, req.radius_km, req.beach_type)
+    if not candidates:
+        return {
+            "center": {"latitude": req.latitude, "longitude": req.longitude},
+            "radius_km": req.radius_km, "target_date": req.target_date,
+            "target_date_iso": target_date_obj.isoformat(),
+            "count": 0, "failed": 0, "spots": [], "best": None, "cached": False,
+            "message": "لا توجد شواطئ معروفة داخل هذا النطاق. وسّع نطاق البحث أو حرّك المركز.",
+        }
+
+    limit = min(req.max_spots, settings.SCAN_MAX_SPOTS, 25)
+    selected = candidates[:limit]
+    semaphore = asyncio.Semaphore(max(1, settings.SCAN_CONCURRENCY))
+
+    async with httpx.AsyncClient(timeout=settings.UPSTREAM_TIMEOUT_S) as client:
+        results = await asyncio.gather(
+            *(score_spot(client, beach, target_date_obj, today, settings.DEFAULT_TZ, semaphore)
+              for beach in selected),
+            return_exceptions=True,
+        )
+
+    spots, failed = [], 0
+    for beach, res in zip(selected, results):
+        if isinstance(res, Exception) or not res:
+            failed += 1
+            continue
+        if res.get("error"):
+            failed += 1
+            continue
+        spots.append(res)
+
+    spots.sort(key=lambda item: (-item["score"], item["distance_km"]))
+    message = None
+    if not spots and failed:
+        message = ("تعذّر جلب بيانات الأرصاد للبقاع المحددة (المصدر غير متاح حالياً). "
+                   "أعد المحاولة بعد قليل أو قلّل عدد البقاع.")
+    payload = {
+        "message": message,
+        "center": {"latitude": req.latitude, "longitude": req.longitude},
+        "radius_km": req.radius_km,
+        "target_date": req.target_date,
+        "target_date_iso": target_date_obj.isoformat(),
+        "count": len(spots),
+        "failed": failed,
+        "candidates": len(candidates),
+        "spots": spots,
+        "best": spots[0] if spots else None,
+        "cached": False,
+        "generated_at": datetime.now(resolve_timezone(settings.DEFAULT_TZ)).isoformat(),
+    }
+    await scan_cache.set(key, payload)
+    return payload
+
+
+SCAN_SYSTEM_PROMPT = """أنت خبير سيرفكاستينغ تونسي. استلمت نتائج حسابات فيزيائية لعدة شواطئ في نفس اليوم.
+اكتب بالدارجة التونسية ملخّصاً مقارناً قصيراً:
+1. الترتيب: أفضل 3 بقاع مع سبب اختيار كل واحدة (سطر أو سطرين).
+2. أفضل فترة زمنية لكل واحدة منها.
+3. بقعة واحدة يجب تجنّبها اليوم ولماذا.
+4. نصيحة تكتيكية واحدة مشتركة (رياح/موج/طعم).
+لا تخترع أرقاماً غير موجودة، ولا تذكر المركب، ولا تستخدم حروفاً لاتينية.
+"""
+
+
+def build_scan_summary_context(req: ScanSummaryRequest) -> str:
+    lines = [f"عدد البقاع: {len(req.spots)}", f"التاريخ المستهدف: {req.target_date}", ""]
+    for i, spot in enumerate(req.spots, 1):
+        lines.append(f"{i}) {spot.get('name', 'بقعة')} — الدرجة: {spot.get('score')}% — "
+                     f"الحسم: {spot.get('final_verdict')} — البعد: {spot.get('distance_km')} كم — "
+                     f"الاتجاه: {spot.get('orientation')}° — القاع: {spot.get('beach_type')}")
+        best = spot.get("best_period") or {}
+        if best:
+            lines.append(f"   أفضل فترة: {best.get('name')} ({best.get('time_range')}) "
+                         f"ثقة {best.get('confidence')}% — {best.get('sea_state')} — "
+                         f"رياح {best.get('wind_dir')} — مسافة {best.get('recommended_cast_distance')}م")
+        if spot.get("solunar"):
+            sol = spot["solunar"]
+            lines.append(f"   سولونار: {sol.get('major1')} و {sol.get('major2')}")
+        if spot.get("avg_sst") is not None:
+            lines.append(f"   حرارة الماء: {spot['avg_sst']}°م | الشروق {spot.get('sunrise')} | الغروب {spot.get('sunset')}")
+        for warning in (spot.get("warnings") or [])[:2]:
+            lines.append(f"   ⚠️ {warning}")
+        for reason in (spot.get("nogo_reasons") or [])[:2]:
+            lines.append(f"   ⛔ {reason}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def build_scan_summary_offline(req: ScanSummaryRequest) -> str:
+    """ملخّص مقارن محلي (بدون نموذج لغوي) عند تعذّر Gemini."""
+    spots = sorted(req.spots, key=lambda s: -(s.get("score") or 0))
+    lines = [f"🔍 ملخّص مسح الشواطئ ({len(spots)} بقاع)", ""]
+    if not spots:
+        return "لا توجد بقاع صالحة للمقارنة."
+    lines.append("🏆 أفضل البقاع:")
+    for i, spot in enumerate(spots[:3], 1):
+        best = spot.get("best_period") or {}
+        lines.append(f" {i}. {spot.get('name')} — {spot.get('score')}% ({spot.get('final_verdict')}): "
+                     f"أفضل فترة {best.get('name', '')} ({best.get('time_range', '')}) "
+                     f"بثقة {best.get('confidence', 0)}%.")
+        if best.get("suggested_rig"):
+            lines.append(f"    المونتاج المقترح: {best['suggested_rig']}")
+    worst = spots[-1]
+    if len(spots) > 1:
+        lines.append("")
+        lines.append(f"⛔ يُفضّل تجنّب: {worst.get('name')} ({worst.get('score')}% — {worst.get('final_verdict')}).")
+    lines.append("")
+    lines.append("🎣 نصيحة مشتركة: ابدأ في الفترة ذات الثقة الأعلى، وجهّز طعماً طازجاً "
+                 "ورصاصاً مناسباً لقوة الرياح، ولا تصعد على الصخور المبللة.")
+    lines.append("")
+    lines.append("ملاحظة: هذا الملخّص أُنشئ آلياً من الحسابات المحلية (وضع احتياطي دون نموذج لغوي).")
+    return "\n".join(lines)
+
+
+@app.post("/scan-summary")
+@limiter.limit(settings.RATE_LIMIT_SCAN)
+async def scan_summary(request: Request, req: ScanSummaryRequest):
+    """ملخّص مقارن لبقاع المسح — نداء Gemini واحد فقط (أو ملخّص محلي احتياطي)."""
+    if not req.spots:
+        raise HTTPException(400, detail="لا توجد بقاع لإنتاج الملخّص.")
+    ctx = build_scan_summary_context(req)
+    try:
+        text = await call_gemini_scan(ctx)
+        generated_by = "gemini"
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"scan-summary Gemini failed: {e}")
+        if not settings.OFFLINE_FALLBACK:
+            raise HTTPException(502, detail="تعذّر توليد الملخّص المقارن. حاول مجدداً.")
+        text = build_scan_summary_offline(req)
+        generated_by = "offline"
+    for cleanup in (clean_report_text, fix_broken_number_lines, fix_broken_time_in_headers,
+                    replace_english_commas, enforce_line_breaks, add_paragraph_spacing):
+        text = cleanup(text)
+    return {"summary": text, "meta": {"generated_by": generated_by, "spots": len(req.spots),
+                                      "target_date": req.target_date}}
+
+
+async def call_gemini_scan(ctx: str) -> str:
+    """نداء Gemini مخصّص لملخّص المسح (نفس آلية الإعادة والوقت)."""
+    if not GEMINI_API_KEY:
+        raise GeminiNotConfigured("GEMINI_API_KEY غير مضبوط على الخادم.")
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    timeout = httpx.Timeout(connect=settings.GEMINI_CONNECT_TIMEOUT_S,
+                            read=settings.GEMINI_READ_TIMEOUT_S, write=10.0, pool=10.0)
+    payload = {
+        "contents": [{"parts": [{"text": SCAN_SYSTEM_PROMPT + "\n\n" + ctx}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "candidateCount": 1},
+    }
+    if settings.GEMINI_THINKING_BUDGET >= 0:
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": settings.GEMINI_THINKING_BUDGET}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(GEMINI_URL, json=payload, headers=headers)
+        if r.status_code == 400 and "thinkingConfig" in payload["generationConfig"]:
+            payload["generationConfig"].pop("thinkingConfig", None)
+            r = await client.post(GEMINI_URL, json=payload, headers=headers)
+        r.raise_for_status()
+        candidates = r.json().get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini أرجع استجابة فارغة")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts or "text" not in parts[0]:
+            raise RuntimeError("بنية استجابة Gemini غير متوقعة")
+        return parts[0]["text"]
+
 
 # ---------- خدمة الواجهة الثابتة (نشر موحّد: واجهة + API على نفس الأصل) ----------
 try:
